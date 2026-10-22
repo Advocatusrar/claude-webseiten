@@ -19,7 +19,7 @@ ARG CHECK_LIVE=0
 ENV SITE_URL=$SITE_URL BASE_PATH=$BASE_PATH CHECK_LIVE=$CHECK_LIVE
 RUN npx astro build && node scripts/check-site.mjs
 
-FROM nginxinc/nginx-unprivileged:1.30-alpine-slim
+FROM nginxinc/nginx-unprivileged:1.31-alpine-slim
 COPY docker/nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /app/dist /usr/share/nginx/html
 EXPOSE 8080
