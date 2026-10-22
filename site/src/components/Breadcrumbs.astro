@@ -1,0 +1,25 @@
+---
+// Visible breadcrumb trail. The last entry is the current page (not linked).
+// The matching JSON-LD comes from breadcrumbLd() in src/lib/jsonld.ts.
+import type { Krume } from '../lib/jsonld';
+import { url } from '../lib/url';
+
+interface Props {
+  krumen: Krume[];
+}
+const { krumen } = Astro.props;
+---
+
+<nav class="krumen" aria-label="Brotkrumen">
+  <ol>
+    {krumen.map((k, i) =>
+      i === krumen.length - 1 ? (
+        <li aria-current="page">{k.name}</li>
+      ) : (
+        <li>
+          <a href={url(k.pfad)}>{k.name}</a>
+        </li>
+      ),
+    )}
+  </ol>
+</nav>

@@ -1,0 +1,174 @@
+---
+import type { GetStaticPaths } from 'astro';
+import { render } from 'astro:content';
+import Base from '../../layouts/Base.astro';
+import Breadcrumbs from '../../components/Breadcrumbs.astro';
+import Datum from '../../components/Datum.astro';
+import ZielgruppenTags from '../../components/ZielgruppenTags.astro';
+import Ueberschriften from '../../components/Ueberschriften.astro';
+import { SITE } from '../../site';
+import {
+  alleArtikel,
+  artikelSeiten,
+  hatMarkdownFassung,
+  verwandteArtikel,
+  zuletztGeaendert,
+  type Artikel,
+} from '../../lib/blog';
+import { THEMEN } from '../../lib/labels';
+import { absoluteUrl, pfade, url } from '../../lib/url';
+import { autorLd, breadcrumbLd, ORGANISATION, VORSCHAUBILD, type Krume } from '../../lib/jsonld';
+import { datumIso } from '../../lib/format';
+
+// Published articles; in `astro dev` also drafts (see artikelSeiten). Links, related
+// articles and lists only ever use published articles, as in the build.
+export const getStaticPaths = (async () => {
+  const artikel = await alleArtikel();
+  const ids = artikel.map((a) => a.id);
+  return (await artikelSeiten()).map((eintrag) => ({
+    params: { slug: eintrag.id },
+    props: { eintrag, verwandte: verwandteArtikel(eintrag, artikel), ids },
+  }));
+}) satisfies GetStaticPaths;
+
+interface Props {
+  eintrag: Artikel;
+  verwandte: Artikel[];
+  ids: string[];
+}
+
+const { eintrag, verwandte, ids } = Astro.props;
+const { data } = eintrag;
+const { Content } = await render(eintrag);
+
+const seitenUrl = absoluteUrl(pfade.artikel(eintrag.id));
+const entwurf = data.draft;
+const markdown = hatMarkdownFassung(eintrag) && !entwurf ? url(pfade.artikelMarkdown(eintrag.id)) : null;
+const krumen: Krume[] = [
+  { name: 'Basecamp', pfad: pfade.start },
+  { name: 'Blog', pfad: pfade.blog },
+  { name: data.title, pfad: pfade.artikel(eintrag.id) },
+];
+
+const jsonLd: Record<string, unknown>[] = [
+  {
+    '@context': 'https://schema.org',
+    '@type': 'Article',
+    headline: data.title,
+    description: data.description,
+    datePublished: datumIso(data.pubDate),
+    dateModified: datumIso(data.updatedDate ?? data.stand),
+    author: autorLd(data.autor),
+    publisher: ORGANISATION,
+    image: absoluteUrl(VORSCHAUBILD.pfad),
+    inLanguage: SITE.sprache,
+    mainEntityOfPage: seitenUrl,
+    url: seitenUrl,
+    keywords: data.themen.map((t) => THEMEN[t]?.name ?? t).join(', '),
+    citation: data.quellen.map((q) => q.url),
+  },
+];
+if (data.faq.length > 0) {
+  jsonLd.push({
+    '@context': 'https://schema.org',
+    '@type': 'FAQPage',
+    mainEntity: data.faq.map((f) => ({
+      '@type': 'Question',
+      name: f.frage,
+      acceptedAnswer: { '@type': 'Answer', text: f.antwort },
+    })),
+  });
+}
+jsonLd.push(breadcrumbLd(krumen));
+---
+
+<Base
+  title={data.title}
+  description={data.description}
+  jsonLd={jsonLd}
+  type="article"
+  stand={zuletztGeaendert(eintrag)}
+  veroeffentlicht={data.pubDate}
+  noindex={entwurf}
+>
+  {markdown && <link slot="head" rel="alternate" type="text/markdown" href={markdown} title="Markdown-Fassung" />}
+  <div class="container schmal">
+    {entwurf && (
+      <p class="box box-hinweis entwurf" role="note">
+        <strong>Entwurf:</strong> Diese Seite gibt es nur auf dem Entwicklungsserver. Sie wird nicht veröffentlicht,
+        solange im Frontmatter <code>draft: true</code> steht.
+      </p>
+    )}
+    <Breadcrumbs krumen={krumen} />
+    <article>
+      <header class="artikel-kopf">
+        <h1>{data.title}</h1>
+        <p class="meta">
+          Stand: <Datum datum={data.stand} /> · Autor: {data.autor}
+          {data.updatedDate && (
+            <>
+              {' '}
+              · Aktualisiert: <Datum datum={data.updatedDate} />
+            </>
+          )}
+        </p>
+        <ZielgruppenTags zielgruppen={data.zielgruppen} />
+        {data.testbasiert ? (
+          <p class="kennzeichnung getestet">Mit eigenen Testergebnissen</p>
+        ) : (
+          <p class="kennzeichnung">Grundlagenartikel, enthält keine eigenen Testergebnisse</p>
+        )}
+      </header>
+
+      <div class="prose">
+        <Ueberschriften ab={2} artikel={ids}>
+          <Content />
+        </Ueberschriften>
+      </div>
+
+      {data.faq.length > 0 && (
+        <section class="faq" aria-labelledby="artikel-faq">
+          <h2 id="artikel-faq">Häufige Fragen</h2>
+          {data.faq.map((f) => (
+            <div>
+              <h3>{f.frage}</h3>
+              <p>{f.antwort}</p>
+            </div>
+          ))}
+        </section>
+      )}
+
+      <section class="quellen" aria-labelledby="artikel-quellen">
+        <h2 id="artikel-quellen">Quellen</h2>
+        <ol>
+          {data.quellen.map((q) => (
+            <li>
+              <a href={q.url}>{q.titel}</a>, abgerufen am <Datum datum={q.abgerufen} />
+            </li>
+          ))}
+        </ol>
+      </section>
+
+      {markdown && (
+        <p class="klein">
+          Diesen Artikel gibt es auch als <a href={markdown}>Markdown-Fassung</a>, zum Beispiel für KI-Assistenten.
+        </p>
+      )}
+    </article>
+
+    {verwandte.length > 0 && (
+      <aside aria-labelledby="artikel-weiterlesen">
+        <h2 id="artikel-weiterlesen">Weiterlesen</h2>
+        <ul>
+          {verwandte.map((a) => (
+            <li>
+              <a href={url(pfade.artikel(a.id))}>{a.data.title}</a>
+              <br />
+              <span class="klein">{a.data.description}</span>
+            </li>
+          ))}
+        </ul>
+      </aside>
+    )}
+  </div>
+</Base>

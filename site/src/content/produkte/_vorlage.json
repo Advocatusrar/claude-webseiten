@@ -1,0 +1,37 @@
+{
+  "_hinweis": "VORLAGE, wird nicht gebaut (Dateiname beginnt mit _). Kopieren nach <hersteller>-<modell>.json, alle Werte in eckigen Klammern und alle 999-Werte ersetzen. Felder unter herstellerangaben nur aus Datenblatt oder Shopseite des Herstellers, mit quelle_url. Den Block eigenerTest erst nach einem eigenen Test einfügen, Werte nur aus eigenen Messungen. Ohne eigenen Test den Block eigenerTest komplett löschen. Dieses Feld _hinweis kann stehen bleiben, es wird ignoriert.",
+  "name": "[Produktname laut Hersteller]",
+  "hersteller": "[Hersteller]",
+  "kategorie": "feuerstahl",
+  "herstellerangaben": {
+    "laenge_mm": 999,
+    "durchmesser_mm": 999,
+    "gewicht_g": 999,
+    "material": "[Material laut Hersteller, z. B. Ferrocerium]",
+    "quelle_url": "https://example.org/datenblatt-ersetzen"
+  },
+  "preis_eur": {
+    "wert": 999,
+    "stand": "2099-12-31"
+  },
+  "linkshaender": "ungeprueft",
+  "kinderfreundlich": "ungeprueft",
+  "eigenerTest": {
+    "getestet_am": "2099-12-31",
+    "tester": "[Vorname Nachname]",
+    "gemessen": {
+      "laenge_mm": 999,
+      "durchmesser_mm": 999,
+      "gewicht_g": 999,
+      "abtrag_mg_pro_zug": 999,
+      "zuege_bis_zuendung_median": 999
+    },
+    "bewertung": {
+      "funken": 1,
+      "handhabung": 1,
+      "handschuhe": 1,
+      "nass": 1
+    },
+    "notizen": "[Beobachtungen aus dem eigenen Test, keine Vermutungen]"
+  }
+}

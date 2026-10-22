@@ -1,0 +1,200 @@
+---
+import { getCollection, type CollectionEntry } from 'astro:content';
+import Base from '../layouts/Base.astro';
+import Breadcrumbs from '../components/Breadcrumbs.astro';
+import Datum from '../components/Datum.astro';
+import RechnerLebensdauer from '../components/RechnerLebensdauer.astro';
+import RechnerAlter from '../components/RechnerAlter.astro';
+import Ueberschriften from '../components/Ueberschriften.astro';
+import { Content as Testmethodik } from '../texte/testmethodik.md';
+import { SITE } from '../site';
+import { EIGNUNG, KATEGORIEN } from '../lib/labels';
+import { absoluteUrl, pfade } from '../lib/url';
+import { breadcrumbLd, ORGANISATION, type Krume } from '../lib/jsonld';
+import { datumIso, zahlFlexibel } from '../lib/format';
+import { anteilAnnahmen, type RechnerDaten } from '../lib/rechner';
+import rechnerDaten from '../data/rechner.json';
+
+type Produkt = CollectionEntry<'produkte'>;
+
+const produkte = (await getCollection('produkte')).sort((a, b) => a.data.name.localeCompare(b.data.name, 'de'));
+const getestet = produkte.filter((p) => p.data.eigenerTest);
+const alterAnnahmen = anteilAnnahmen((rechnerDaten as unknown as RechnerDaten).stablaenge_nach_alter.altersgruppen);
+
+const krumen: Krume[] = [
+  { name: 'Basecamp', pfad: pfade.start },
+  { name: 'Vergleichstest', pfad: pfade.vergleichstest },
+];
+const description =
+  'Unabhängiger Vergleichstest von Feuerstahl, Striker und Verbindung: Testmethode, Produkttabelle und Rechner für Lebensdauer und Stabgröße.';
+
+function masse(m: { laenge_mm?: number; durchmesser_mm?: number; gewicht_g?: number }): string[] {
+  const teile: string[] = [];
+  if (m.laenge_mm) teile.push(`Länge ${zahlFlexibel(m.laenge_mm)} mm`);
+  if (m.durchmesser_mm) teile.push(`Durchmesser ${zahlFlexibel(m.durchmesser_mm)} mm`);
+  if (m.gewicht_g) teile.push(`Gewicht ${zahlFlexibel(m.gewicht_g)} g`);
+  return teile;
+}
+
+function messwerte(p: Produkt): string[] {
+  const t = p.data.eigenerTest;
+  if (!t) return [];
+  const teile = masse(t.gemessen);
+  if (t.gemessen.abtrag_mg_pro_zug) teile.push(`Abtrag ${zahlFlexibel(t.gemessen.abtrag_mg_pro_zug)} mg pro Zug`);
+  if (t.gemessen.zuege_bis_zuendung_median) {
+    teile.push(`Züge bis zur Zündung (Median) ${zahlFlexibel(t.gemessen.zuege_bis_zuendung_median)}`);
+  }
+  const b = t.bewertung;
+  const namen: Record<string, string> = {
+    funken: 'Funken',
+    handhabung: 'Handhabung',
+    handschuhe: 'mit Handschuhen',
+    nass: 'bei Nässe',
+  };
+  for (const [k, v] of Object.entries(b)) if (typeof v === 'number') teile.push(`${namen[k] ?? k}: ${v} von 5`);
+  return teile;
+}
+
+const produktLd = getestet.map((p) => ({
+  '@context': 'https://schema.org',
+  '@type': 'Product',
+  name: p.data.name,
+  brand: { '@type': 'Brand', name: p.data.hersteller },
+  category: KATEGORIEN[p.data.kategorie],
+  review: {
+    '@type': 'Review',
+    author: ORGANISATION,
+    publisher: ORGANISATION,
+    datePublished: datumIso(p.data.eigenerTest!.getestet_am),
+    ...(p.data.eigenerTest!.notizen ? { reviewBody: p.data.eigenerTest!.notizen } : {}),
+  },
+}));
+
+const jsonLd = [
+  {
+    '@context': 'https://schema.org',
+    '@type': 'WebPage',
+    name: 'Vergleichstest',
+    url: absoluteUrl(pfade.vergleichstest),
+    inLanguage: SITE.sprache,
+    description,
+    publisher: ORGANISATION,
+  },
+  breadcrumbLd(krumen),
+  ...produktLd,
+];
+---
+
+<Base title="Vergleichstest Feuerstahl und Striker" description={description} jsonLd={jsonLd}>
+  <div class="container">
+    <Breadcrumbs krumen={krumen} />
+    <h1>Vergleichstest</h1>
+    <div class="prose">
+      <p class="lead">
+        Wir testen Feuerstähle, Striker und Verbindungen selbst und unabhängig. Auf dieser Seite gibt es keine Werbung
+        und keine Affiliate-Links. Herstellerangaben und eigene Messwerte stehen getrennt, damit du siehst, was wir
+        selbst gemessen haben.
+      </p>
+    </div>
+
+    <aside class="box box-hinweis" aria-label="Stand der Tests">
+      {getestet.length === 0 ? (
+        <p>
+          <strong>Die ersten Testergebnisse werden gerade erarbeitet.</strong> Hier steht,{' '}
+          <a href="#so-testen-wir">wie wir testen</a>.
+        </p>
+      ) : (
+        <p>
+          <strong>Stand der Tests:</strong> {getestet.length} von {produkte.length}{' '}
+          {produkte.length === 1 ? 'Produkt' : 'Produkten'} haben wir selbst getestet. Wie, steht unter{' '}
+          <a href="#so-testen-wir">So testen wir</a>.
+        </p>
+      )}
+    </aside>
+
+    <section class="abschnitt" aria-labelledby="produkte">
+      <h2 id="produkte">Produkte im Vergleich</h2>
+      {produkte.length === 0 ? (
+        <p class="box box-info">
+          Noch keine Produkte erfasst. Die Tabelle mit Herstellerangaben und eigenen Messwerten erscheint hier mit den
+          ersten Tests.
+        </p>
+      ) : (
+        <div class="tabelle-scroll tabelle-stapel" tabindex="0" role="region" aria-labelledby="produkte-caption">
+          <table class="tabelle-breit">
+            <caption id="produkte-caption">
+              <span class="caption-text">Produkte: Herstellerangaben und eigene Messwerte</span>
+            </caption>
+            <thead>
+              <tr>
+                <th scope="col">Name</th>
+                <th scope="col">Hersteller</th>
+                <th scope="col">Kategorie</th>
+                <th scope="col">Herstellerangaben</th>
+                <th scope="col">Linkshänder</th>
+                <th scope="col">Kinderfreundlich</th>
+                <th scope="col">Eigene Messwerte</th>
+                <th scope="col">Testdatum</th>
+              </tr>
+            </thead>
+            <tbody>
+              {produkte.map((p) => {
+                const h = p.data.herstellerangaben;
+                const angaben = [...masse(h), ...(h.material ? [`Material ${h.material}`] : [])];
+                const gemessen = messwerte(p);
+                return (
+                  <tr>
+                    <th scope="row">{p.data.name}</th>
+                    <td data-label="Hersteller">{p.data.hersteller}</td>
+                    <td data-label="Kategorie">{KATEGORIEN[p.data.kategorie]}</td>
+                    <td data-label="Herstellerangaben">
+                      {angaben.length > 0 ? angaben.join(', ') : 'keine Angaben'}
+                      {h.quelle_url && (
+                        <>
+                          {' '}
+                          (<a href={h.quelle_url}>Quelle</a>)
+                        </>
+                      )}
+                      <br />
+                      <span class="klein">laut Hersteller</span>
+                    </td>
+                    <td data-label="Linkshänder">{EIGNUNG[p.data.linkshaender]}</td>
+                    <td data-label="Kinderfreundlich">{EIGNUNG[p.data.kinderfreundlich]}</td>
+                    <td data-label="Eigene Messwerte">
+                      {gemessen.length > 0 ? gemessen.join(', ') : 'Noch nicht getestet'}
+                    </td>
+                    <td data-label="Testdatum">
+                      {p.data.eigenerTest ? <Datum datum={p.data.eigenerTest.getestet_am} /> : 'Noch nicht getestet'}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+
+    <section class="abschnitt" aria-labelledby="so-testen-wir">
+      <h2 id="so-testen-wir">So testen wir</h2>
+      <div class="prose">
+        <Ueberschriften ab={3}>
+          <Testmethodik />
+        </Ueberschriften>
+      </div>
+    </section>
+
+    <section class="abschnitt" id="rechner" aria-labelledby="rechner-titel">
+      <h2 id="rechner-titel">Rechner</h2>
+      <div class="prose">
+        <p>
+          Zwei Rechner helfen bei der Auswahl: Der erste schätzt, wie lange ein Stab hält. Der zweite zeigt
+          {alterAnnahmen === 'keine' ? ' Richtwerte' : ' vorläufige Richtwerte'} zur Stabgröße nach Alter. Formeln und
+          alle Werte stehen offen unter den Rechnern, jeweils mit ihrer Herkunft.
+        </p>
+      </div>
+      <RechnerLebensdauer />
+      <RechnerAlter />
+    </section>
+  </div>
+</Base>

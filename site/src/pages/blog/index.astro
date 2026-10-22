@@ -1,0 +1,68 @@
+---
+import Base from '../../layouts/Base.astro';
+import ArtikelListe from '../../components/ArtikelListe.astro';
+import Breadcrumbs from '../../components/Breadcrumbs.astro';
+import { SITE } from '../../site';
+import { alleArtikel, zuletztGeaendert } from '../../lib/blog';
+import { ZIELGRUPPEN, ZIELGRUPPEN_IDS } from '../../lib/labels';
+import { absoluteUrl, pfade, url } from '../../lib/url';
+import { breadcrumbLd, ORGANISATION, type Krume } from '../../lib/jsonld';
+import { datumIso } from '../../lib/format';
+
+const artikel = await alleArtikel();
+const krumen: Krume[] = [
+  { name: 'Basecamp', pfad: pfade.start },
+  { name: 'Blog', pfad: pfade.blog },
+];
+const description =
+  'Alle Artikel zu Feuerstahl, Striker und Verbindung: Grundlagen, Sicherheit und Tests, jeweils mit Quellen und Stand-Datum.';
+
+const jsonLd = [
+  {
+    '@context': 'https://schema.org',
+    '@type': 'Blog',
+    name: `Blog von ${SITE.name}`,
+    url: absoluteUrl(pfade.blog),
+    inLanguage: SITE.sprache,
+    description,
+    publisher: ORGANISATION,
+    blogPost: artikel.map((a) => ({
+      '@type': 'BlogPosting',
+      headline: a.data.title,
+      description: a.data.description,
+      url: absoluteUrl(pfade.artikel(a.id)),
+      datePublished: datumIso(a.data.pubDate),
+      dateModified: datumIso(zuletztGeaendert(a)),
+    })),
+  },
+  breadcrumbLd(krumen),
+];
+---
+
+<Base title="Blog: Feuerstahl, Striker und Zubehör" description={description} jsonLd={jsonLd}>
+  <div class="container schmal">
+    <Breadcrumbs krumen={krumen} />
+    <h1>Blog</h1>
+    <p class="lead">
+      Grundlagen, Sicherheit und Tests rund um Feuerstahl, Striker und Verbindung. Jeder Artikel nennt seine Quellen und
+      das Datum, an dem wir die Fakten zuletzt geprüft haben.
+    </p>
+    <nav aria-label="Zielgruppen">
+      <p class="klein">Nach Zielgruppe filtern:</p>
+      <ul class="tags">
+        {ZIELGRUPPEN_IDS.map((z) => (
+          <li>
+            <a class="tag" href={url(pfade.zielgruppe(z))}>
+              {ZIELGRUPPEN[z].name}
+            </a>
+          </li>
+        ))}
+      </ul>
+    </nav>
+    {artikel.length > 0 ? (
+      <ArtikelListe artikel={artikel} ebene={2} />
+    ) : (
+      <p>Die ersten Artikel sind in Arbeit. Schau bald wieder vorbei.</p>
+    )}
+  </div>
+</Base>

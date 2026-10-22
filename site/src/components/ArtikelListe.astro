@@ -1,0 +1,31 @@
+---
+import type { Artikel } from '../lib/blog';
+import { pfade, url } from '../lib/url';
+import Datum from './Datum.astro';
+import ZielgruppenTags from './ZielgruppenTags.astro';
+
+interface Props {
+  artikel: Artikel[];
+  /** Heading level of the article titles, depends on where the list sits. */
+  ebene?: 2 | 3;
+  tags?: boolean;
+}
+const { artikel, ebene = 2, tags = true } = Astro.props;
+const Ueberschrift = ebene === 2 ? 'h2' : 'h3';
+---
+
+<ul class="artikel-liste">
+  {artikel.map((a) => (
+    <li>
+      <Ueberschrift>
+        <a href={url(pfade.artikel(a.id))}>{a.data.title}</a>
+      </Ueberschrift>
+      <p>{a.data.description}</p>
+      <p class="meta">
+        Stand: <Datum datum={a.data.stand} />
+        {a.data.testbasiert && <span> · Mit eigenen Testergebnissen</span>}
+      </p>
+      {tags && <ZielgruppenTags zielgruppen={a.data.zielgruppen} />}
+    </li>
+  ))}
+</ul>

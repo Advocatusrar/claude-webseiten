@@ -1,0 +1,41 @@
+---
+// Shows where a calculator value comes from: "Annahme", "Quelle" (with links) or "Eigene Messung",
+// plus optional hinweis / begruendung from src/data/rechner.json.
+import { quellenAus, statusText, type Status } from '../lib/rechner';
+import { datumDeutsch } from '../lib/format';
+
+interface Props {
+  eintrag: {
+    status?: Status | null;
+    quelle?: unknown;
+    quellen?: unknown;
+    hinweis?: string | null;
+    begruendung?: unknown;
+  };
+  /** Show hinweis/begruendung below the badge. */
+  details?: boolean;
+}
+const { eintrag, details = true } = Astro.props;
+const status = eintrag.status ?? undefined;
+const quellen = quellenAus(eintrag.quelle, eintrag.quellen);
+const klasse = ['annahme', 'quelle', 'gemessen'].includes(String(status)) ? `status status-${status}` : 'status';
+const begruendung = typeof eintrag.begruendung === 'string' ? eintrag.begruendung : null;
+---
+
+<span class={klasse}>{statusText(status)}</span>
+{quellen.length > 0 && (
+  <span class="klein">
+    {' '}
+    {quellen.map((q, i) => (
+      <>
+        {i > 0 && ', '}
+        {q.url ? <a href={q.url}>{q.titel}</a> : q.titel}
+        {q.abgerufen && (
+          <> (abgerufen am {/^\d{4}-\d{2}-\d{2}/.test(q.abgerufen) ? datumDeutsch(q.abgerufen) : q.abgerufen})</>
+        )}
+      </>
+    ))}
+  </span>
+)}
+{details && begruendung && <p class="klein">Begründung: {begruendung}</p>}
+{details && eintrag.hinweis && <p class="klein">{eintrag.hinweis}</p>}

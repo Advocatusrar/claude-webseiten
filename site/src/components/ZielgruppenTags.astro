@@ -1,0 +1,22 @@
+---
+import { ZIELGRUPPEN, type Zielgruppe } from '../lib/labels';
+import { pfade, url } from '../lib/url';
+
+interface Props {
+  zielgruppen: readonly Zielgruppe[];
+  label?: string;
+}
+const { zielgruppen, label = 'Zielgruppen' } = Astro.props;
+---
+
+{zielgruppen.length > 0 && (
+  <ul class="tags" aria-label={label}>
+    {zielgruppen.map((z) => (
+      <li>
+        <a class="tag" href={url(pfade.zielgruppe(z))}>
+          {ZIELGRUPPEN[z]?.name ?? z}
+        </a>
+      </li>
+    ))}
+  </ul>
+)}

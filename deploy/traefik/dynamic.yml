@@ -1,0 +1,48 @@
+# Routes for Traefik (file provider). DOMAIN and REDIRECT_DOMAIN come from .env via compose.yml.
+http:
+  routers:
+    website:
+      rule: 'Host(`{{ env "DOMAIN" }}`)'
+      entryPoints: [websecure]
+      service: website
+      middlewares: [hsts]
+      tls:
+        certResolver: letsencrypt
+{{ if env "REDIRECT_DOMAIN" }}
+    # Second name (e.g. without www) redirects permanently to DOMAIN.
+    weiterleitung:
+      rule: 'Host(`{{ env "REDIRECT_DOMAIN" }}`)'
+      entryPoints: [websecure]
+      service: noop@internal
+      middlewares: [zur-hauptdomain]
+      tls:
+        certResolver: letsencrypt
+{{ end }}
+
+  middlewares:
+    # All other security headers are set by nginx in the image (tested in CI).
+    hsts:
+      headers:
+        stsSeconds: 31536000
+        stsIncludeSubdomains: false
+        stsPreload: false
+    zur-hauptdomain:
+      redirectRegex:
+        regex: '^https?://[^/]+(.*)'
+        replacement: 'https://{{ env "DOMAIN" }}${1}'
+        permanent: true
+
+  services:
+    website:
+      loadBalancer:
+        servers:
+          - url: 'http://website:8080'
+        healthCheck:
+          path: /healthz
+          interval: 10s
+          timeout: 3s
+
+tls:
+  options:
+    default:
+      minVersion: VersionTLS12

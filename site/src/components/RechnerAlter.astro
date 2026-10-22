@@ -1,0 +1,252 @@
+---
+// Calculator 2: rod size by age of the person using it. Server-rendered for the
+// default age (works without JavaScript) plus the complete table of all age groups.
+import daten from '../data/rechner.json';
+import {
+  altersAnzeige,
+  altersgruppeText,
+  anteilAnnahmen,
+  beschreibeWert,
+  spanneText,
+  type RechnerDaten,
+} from '../lib/rechner';
+import { mitEinheit, zahlEingabe, zahlFlexibel } from '../lib/format';
+import { alleArtikel, fuerZielgruppe } from '../lib/blog';
+import { pfade, url } from '../lib/url';
+import StatusMarke from './StatusMarke.astro';
+import Datum from './Datum.astro';
+
+const d = daten as unknown as RechnerDaten;
+const r = d.stablaenge_nach_alter.regler.alter;
+const gruppen = d.stablaenge_nach_alter.altersgruppen;
+const anzeige = altersAnzeige(r.default, gruppen);
+const annahmen = anteilAnnahmen(gruppen);
+const mitBegruendung = gruppen.some((g) => beschreibeWert(g.begruendung) !== '');
+const mitHandmassen = gruppen.some((g) => beschreibeWert(g.handmasse) !== '');
+
+// Link for left-handers: best matching published article. Without one there is no
+// link (the target group page would be empty).
+const linkshaender = fuerZielgruppe(await alleArtikel(), 'linkshaender');
+const lhArtikel = linkshaender.find((a) => a.data.themen.includes('striker')) ?? linkshaender[0];
+const lhLink = lhArtikel ? { href: url(pfade.artikel(lhArtikel.id)), text: `Artikel „${lhArtikel.data.title}“` } : null;
+---
+
+<section class="rechner" data-rechner="alter" aria-labelledby="rechner-alter">
+  <h3 id="rechner-alter">Stablänge nach Alter: Welche Größe passt?</h3>
+  <p>
+    Ein Feuerstahl sollte zur Hand passen, die ihn hält. Der Rechner zeigt für ein Alter eine Spanne für Länge und
+    Durchmesser und einen Hinweis zur Aufsicht.
+  </p>
+  {annahmen === 'alle' && (
+    <p class="box box-hinweis" role="note">
+      <strong>Vorläufige Werte:</strong> Alle Werte dieses Rechners sind derzeit Annahmen der Redaktion (Platzhalter),
+      auch die Hinweise zur Aufsicht. Sie sind weder durch Quellen belegt noch durch eigene Erfahrungswerte geprüft und
+      keine Empfehlung. Wir ersetzen sie durch eigene Erfahrungswerte.
+    </p>
+  )}
+  {annahmen === 'einige' && (
+    <p class="box box-hinweis" role="note">
+      <strong>Vorläufige Werte:</strong> Einige Altersgruppen beruhen noch auf Annahmen der Redaktion (Platzhalter). Sie
+      sind in der Tabelle unten als „Annahme“ gekennzeichnet und werden durch eigene Erfahrungswerte ersetzt.
+    </p>
+  )}
+
+  <div class="rechner-raster">
+    <div class="rechner-eingabe">
+      <div class="regler">
+        <label for="alt-alter" id="alt-alter-label">
+          {r.label}
+        </label>
+        <div class="regler-zeile">
+          <input
+            type="range"
+            id="alt-alter"
+            name="alter"
+            min={r.min}
+            max={r.max}
+            step={r.step}
+            value={r.default}
+            data-regler="alter"
+            data-einheit={r.einheit ?? ''}
+            aria-valuetext={mitEinheit(r.default, r.einheit)}
+            aria-describedby="alt-alter-bereich"
+          />
+          <input
+            type="text"
+            id="alt-alter-zahl"
+            value={zahlEingabe(r.default)}
+            inputmode="numeric"
+            autocomplete="off"
+            spellcheck="false"
+            data-zahl="alter"
+            aria-labelledby="alt-alter-label alt-alter-einheit"
+            aria-describedby="alt-alter-bereich alt-alter-hinweis"
+          />
+          <span class="einheit" id="alt-alter-einheit">
+            {r.einheit}
+          </span>
+        </div>
+        <p class="regler-bereich" id="alt-alter-bereich">
+          {zahlFlexibel(r.min)} bis {zahlFlexibel(r.max)} {r.einheit}, Standard {zahlFlexibel(r.default)}
+        </p>
+        <p class="regler-hinweis" id="alt-alter-hinweis" data-hinweis="alter" aria-live="polite"></p>
+      </div>
+
+      <fieldset>
+        <legend>Händigkeit (optional)</legend>
+        <div class="optionen">
+          <label>
+            <input type="radio" name="haendigkeit" value="" checked /> Keine Angabe
+          </label>
+          <label>
+            <input type="radio" name="haendigkeit" value="rechts" /> Rechts
+          </label>
+          <label>
+            <input type="radio" name="haendigkeit" value="links" /> Links
+          </label>
+        </div>
+      </fieldset>
+      <p class="box box-info" data-linkshaender-hinweis>
+        <strong>Für Linkshänder:</strong> Die Richtwerte zur Stabgröße unterscheiden nicht nach Händigkeit.
+        {lhLink ? (
+          <>
+            Worauf es bei Striker und Griff ankommt, steht im <a href={lhLink.href}>{lhLink.text}</a>.
+          </>
+        ) : (
+          <>Einen Artikel für Linkshänder haben wir noch nicht veröffentlicht.</>
+        )}
+      </p>
+    </div>
+
+    <div class="ergebnis">
+      <h4 class="sr-only">Ergebnis</h4>
+      <div class="ergebnis-text">
+        <p class="ergebnis-satz" data-feld="satz">
+          {anzeige.satz}
+        </p>
+        <p data-zeile="aufsicht">
+          <strong>
+            <span data-feld="aufsicht-titel">{anzeige.aufsichtTitel}</span>:
+          </strong>{' '}
+          <span data-feld="aufsicht">{anzeige.aufsicht}</span>
+        </p>
+        <p data-zeile="begruendung" hidden={!anzeige.begruendung}>
+          <strong>Begründung:</strong> <span data-feld="begruendung">{anzeige.begruendung}</span>
+        </p>
+        <p data-zeile="handmasse" hidden={!anzeige.handmasse}>
+          <strong>Handmaße:</strong> <span data-feld="handmasse">{anzeige.handmasse}</span>
+        </p>
+        <p data-zeile="status" hidden={!anzeige.status}>
+          <strong>Herkunft der Werte:</strong> <span data-feld="status">{anzeige.status}</span>
+        </p>
+      </div>
+      <p class="sr-only" role="status" data-ansage></p>
+      <p class="klein">
+        Die Spannen sind vorläufige Richtwerte. Probier den Stab am besten vorher in der Hand aus, bei Kindern gemeinsam
+        mit ihnen.
+      </p>
+    </div>
+  </div>
+
+  <h4>Alle Altersgruppen</h4>
+  <div class="tabelle-scroll tabelle-stapel" tabindex="0" role="region" aria-labelledby="alt-tabelle-caption">
+    <table class:list={[{ 'tabelle-breit': mitBegruendung || mitHandmassen }]}>
+      <caption id="alt-tabelle-caption">
+        <span class="caption-text">
+          {annahmen === 'keine'
+            ? 'Richtwerte zu Stabgröße und Aufsicht nach Alter'
+            : 'Vorläufige Richtwerte (Annahmen) zu Stabgröße und Aufsicht nach Alter'}
+          {d.stand && (
+            <>
+              , Stand: <Datum datum={d.stand} />
+            </>
+          )}
+        </span>
+      </caption>
+      <thead>
+        <tr>
+          <th scope="col">Alter</th>
+          <th scope="col">Stablänge</th>
+          <th scope="col">Aufsicht</th>
+          <th scope="col">Durchmesser</th>
+          {mitBegruendung && <th scope="col">Begründung</th>}
+          {mitHandmassen && <th scope="col">Handmaße</th>}
+          <th scope="col">Herkunft</th>
+        </tr>
+      </thead>
+      <tbody>
+        {gruppen.map((g, i) => {
+          const aktiv = i === anzeige.gruppeIndex;
+          return (
+            <tr data-gruppe={i} class:list={[{ aktiv }]}>
+              <th scope="row">
+                {altersgruppeText(g, r.max)}
+                <span class="markierung" data-markierung hidden={!aktiv}>
+                  Deine Auswahl
+                </span>
+              </th>
+              <td class="zahl" data-label="Stablänge">
+                {spanneText(g.laenge_mm)}
+              </td>
+              <td data-label="Aufsicht">{g.aufsicht ?? 'keine Angabe'}</td>
+              <td class="zahl" data-label="Durchmesser">
+                {spanneText(g.durchmesser_mm)}
+              </td>
+              {mitBegruendung && <td data-label="Begründung">{beschreibeWert(g.begruendung)}</td>}
+              {mitHandmassen && <td data-label="Handmaße">{beschreibeWert(g.handmasse)}</td>}
+              <td data-label="Herkunft">
+                <StatusMarke eintrag={{ ...g, begruendung: null }} />
+              </td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<script>
+  import daten from '../data/rechner.json';
+  import { altersAnzeige, type RechnerDaten } from '../lib/rechner';
+  import { erstelleAnsage, setzeText, verbindeRegler } from '../lib/regler';
+
+  const gruppen = (daten as unknown as RechnerDaten).stablaenge_nach_alter.altersgruppen;
+
+  document.querySelectorAll<HTMLElement>('[data-rechner="alter"]').forEach((root) => {
+    const ansage = erstelleAnsage(root);
+    const wert = verbindeRegler(root, () => aktualisieren(true));
+    const hinweis = root.querySelector<HTMLElement>('[data-linkshaender-hinweis]');
+    root
+      .querySelectorAll<HTMLInputElement>('input[name="haendigkeit"]')
+      .forEach((radio) => radio.addEventListener('change', () => aktualisieren(false)));
+
+    function zeile(name: string, text: string): void {
+      setzeText(root, name, text);
+      const el = root.querySelector<HTMLElement>(`[data-zeile="${name}"]`);
+      if (el) el.hidden = !text;
+    }
+
+    function aktualisieren(ansagen: boolean): void {
+      const a = altersAnzeige(wert('alter'), gruppen);
+      setzeText(root, 'satz', a.satz);
+      setzeText(root, 'aufsicht-titel', a.aufsichtTitel);
+      zeile('aufsicht', a.aufsicht);
+      zeile('begruendung', a.begruendung);
+      zeile('handmasse', a.handmasse);
+      zeile('status', a.status);
+
+      root.querySelectorAll<HTMLTableRowElement>('tr[data-gruppe]').forEach((tr) => {
+        const aktiv = Number(tr.dataset.gruppe) === a.gruppeIndex;
+        tr.classList.toggle('aktiv', aktiv);
+        const markierung = tr.querySelector<HTMLElement>('[data-markierung]');
+        if (markierung) markierung.hidden = !aktiv;
+      });
+
+      const haendigkeit = root.querySelector<HTMLInputElement>('input[name="haendigkeit"]:checked')?.value;
+      if (hinweis) hinweis.hidden = haendigkeit !== 'links';
+      if (ansagen) ansage(`${a.satz} ${a.aufsichtTitel}: ${a.aufsicht}`);
+    }
+
+    aktualisieren(false);
+  });
+</script>

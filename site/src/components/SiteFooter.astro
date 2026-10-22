@@ -1,0 +1,38 @@
+---
+import { SITE } from '../site';
+import { pfade, url } from '../lib/url';
+import Datum from './Datum.astro';
+
+interface Props {
+  stand?: Date;
+}
+const { stand } = Astro.props;
+const jahr = new Date().getFullYear();
+---
+
+<footer class="site-footer">
+  <div class="container">
+    <nav aria-label="Rechtliches">
+      <ul>
+        <li>
+          <a href={url(pfade.impressum)}>Impressum</a>
+        </li>
+        <li>
+          <a href={url(pfade.datenschutz)}>Datenschutz</a>
+        </li>
+        <li>
+          <a href={url('llms.txt')}>llms.txt</a>
+        </li>
+      </ul>
+    </nav>
+    <p class="versprechen">Keine Werbung. Keine Tracker. Keine Cookies.</p>
+    {stand && (
+      <p>
+        Stand dieser Seite: <Datum datum={stand} />
+      </p>
+    )}
+    <p>
+      © {jahr} {SITE.name}
+    </p>
+  </div>
+</footer>

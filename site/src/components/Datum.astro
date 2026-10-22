@@ -1,0 +1,10 @@
+---
+import { datumDeutsch, datumIso } from '../lib/format';
+
+interface Props {
+  datum: Date | string;
+}
+const { datum } = Astro.props;
+---
+
+<time datetime={datumIso(datum)}>{datumDeutsch(datum)}</time>

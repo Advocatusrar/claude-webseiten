@@ -1,0 +1,29 @@
+---
+import Base from '../layouts/Base.astro';
+import { pfade, url } from '../lib/url';
+---
+
+<Base
+  title="Seite nicht gefunden"
+  description="Diese Seite gibt es nicht. Von hier geht es zurück ins Basecamp, zum Blog oder zum Vergleichstest."
+  noindex
+>
+  <div class="container schmal">
+    <h1>Seite nicht gefunden</h1>
+    <p class="lead">Diese Seite gibt es nicht oder nicht mehr. Vielleicht hilft einer dieser Wege weiter:</p>
+    <ul>
+      <li>
+        <a href={url(pfade.start)}>Basecamp</a>: die Startseite
+      </li>
+      <li>
+        <a href={url(pfade.blog)}>Blog</a>: alle Artikel
+      </li>
+      <li>
+        <a href={url(pfade.vergleichstest)}>Vergleichstest</a>: Testmethode und Rechner
+      </li>
+      <li>
+        <a href={url(pfade.kontakt)}>Kontakt</a>: wenn du einen kaputten Link gefunden hast
+      </li>
+    </ul>
+  </div>
+</Base>

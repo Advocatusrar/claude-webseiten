@@ -1,0 +1,41 @@
+---
+import { SITE } from '../site';
+import { ohneBasis, pfade, url } from '../lib/url';
+import Funke from './Funke.astro';
+
+const aktuell = ohneBasis(Astro.url.pathname);
+
+const punkte = [
+  { name: 'Basecamp', pfad: pfade.start },
+  { name: 'Vergleichstest', pfad: pfade.vergleichstest },
+  { name: 'Blog', pfad: pfade.blog },
+  { name: 'Kontakt', pfad: pfade.kontakt },
+];
+
+// "page" for the exact page, "true" for pages inside a section (e.g. an article in the blog).
+function current(pfad: string): 'page' | 'true' | undefined {
+  if (aktuell === pfad) return 'page';
+  if (pfad !== '' && aktuell.startsWith(pfad)) return 'true';
+  return undefined;
+}
+---
+
+<header class="site-header">
+  <div class="container">
+    <a class="site-name" href={url(pfade.start)}>
+      <Funke />
+      <span>{SITE.name}</span>
+    </a>
+    <nav class="site-nav" aria-label="Hauptnavigation">
+      <ul>
+        {punkte.map((p) => (
+          <li>
+            <a href={url(p.pfad)} aria-current={current(p.pfad)}>
+              {p.name}
+            </a>
+          </li>
+        ))}
+      </ul>
+    </nav>
+  </div>
+</header>

@@ -1,0 +1,27 @@
+# Local Git hooks (https://lefthook.dev). Installed automatically by "npm install" in site/,
+# manually with "cd site && npx lefthook install".
+# They are a fast early warning. The binding gate is the CI on GitHub: main only accepts
+# pull requests whose checks are green. Skipping a hook once: git commit --no-verify.
+
+pre-commit:
+  parallel: true
+  jobs:
+    - name: format
+      root: site/
+      glob: '*.{astro,ts,mjs,js,json,css,md,yml,yaml}'
+      exclude:
+        - site/src/content/**
+        - site/src/texte/**
+        - site/package-lock.json
+      run: npx prettier --check {staged_files}
+
+    - name: unit tests
+      root: site/
+      glob: '*.{ts,mjs,json}'
+      run: npm run --silent test:unit
+
+pre-push:
+  jobs:
+    - name: typecheck, build and checks
+      root: site/
+      run: npm run --silent typecheck && npm test

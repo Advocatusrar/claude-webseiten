@@ -1,0 +1,62 @@
+# Production on the server: Traefik in front (HTTPS, Let's Encrypt), the website behind it.
+# Lives in /opt/website on the server, next to .env (see .env.example) and deploy.sh.
+# Traefik gets its routes from traefik/dynamic.yml (file provider), so it needs no
+# access to the Docker socket.
+name: website
+
+services:
+  traefik:
+    image: traefik:v3.7.16
+    restart: unless-stopped
+    command:
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+      - --providers.file.filename=/etc/traefik/dynamic.yml
+      - --providers.file.watch=true
+      - --certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:?ACME_EMAIL fehlt in .env}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.letsencrypt.acme.tlschallenge=true
+      # Let's Encrypt staging for first tests (no rate limits, untrusted certificates).
+      - --certificatesresolvers.letsencrypt.acme.caserver=${ACME_CA_SERVER:-https://acme-v02.api.letsencrypt.org/directory}
+      - --ping=true
+      - --log.level=INFO
+      # No access log: visitor IP addresses are not stored (see Datenschutzerklärung).
+      - --global.checknewversion=false
+      - --global.sendanonymoususage=false
+    environment:
+      DOMAIN: ${DOMAIN:?DOMAIN fehlt in .env}
+      REDIRECT_DOMAIN: ${REDIRECT_DOMAIN:-}
+    ports:
+      - '80:80'
+      - '443:443'
+    volumes:
+      - ./traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+      - letsencrypt:/letsencrypt
+    healthcheck:
+      test: ['CMD', 'traefik', 'healthcheck', '--ping']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+
+  website:
+    image: ${WEBSITE_IMAGE:?WEBSITE_IMAGE fehlt in .env}
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  # Certificates and the ACME account. Losing it only means new certificates are requested.
+  letsencrypt:

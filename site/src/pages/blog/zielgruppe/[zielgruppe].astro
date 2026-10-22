@@ -1,0 +1,81 @@
+---
+import type { GetStaticPaths } from 'astro';
+import Base from '../../../layouts/Base.astro';
+import ArtikelListe from '../../../components/ArtikelListe.astro';
+import Breadcrumbs from '../../../components/Breadcrumbs.astro';
+import { SITE } from '../../../site';
+import { alleArtikel, fuerZielgruppe } from '../../../lib/blog';
+import { ZIELGRUPPEN, ZIELGRUPPEN_IDS, type Zielgruppe } from '../../../lib/labels';
+import { absoluteUrl, pfade, url } from '../../../lib/url';
+import { breadcrumbLd, type Krume } from '../../../lib/jsonld';
+
+// One page per target group of the content schema (ZIELGRUPPEN is typed against it).
+export const getStaticPaths = (() =>
+  ZIELGRUPPEN_IDS.map((zielgruppe) => ({ params: { zielgruppe } }))) satisfies GetStaticPaths;
+
+const zielgruppe = Astro.params.zielgruppe as Zielgruppe;
+const info = ZIELGRUPPEN[zielgruppe];
+const artikel = fuerZielgruppe(await alleArtikel(), zielgruppe);
+// A page without articles stays reachable for visitors, but is not offered to search
+// engines: noindex here, which also keeps it out of the sitemap (astro.config.mjs)
+// and out of llms.txt.
+const leer = artikel.length === 0;
+
+const krumen: Krume[] = [
+  { name: 'Basecamp', pfad: pfade.start },
+  { name: 'Blog', pfad: pfade.blog },
+  { name: info.name, pfad: pfade.zielgruppe(zielgruppe) },
+];
+const description = `Artikel zu Feuerstahl, Striker und Verbindung für die Zielgruppe ${info.name}. ${info.text}`.slice(
+  0,
+  160,
+);
+
+const jsonLd = [
+  {
+    '@context': 'https://schema.org',
+    '@type': 'CollectionPage',
+    name: `Artikel für ${info.name}`,
+    url: absoluteUrl(pfade.zielgruppe(zielgruppe)),
+    inLanguage: SITE.sprache,
+    description,
+    hasPart: artikel.map((a) => ({
+      '@type': 'Article',
+      headline: a.data.title,
+      url: absoluteUrl(pfade.artikel(a.id)),
+    })),
+  },
+  breadcrumbLd(krumen),
+];
+---
+
+<Base title={`Feuerstahl und Striker für ${info.name}`} description={description} jsonLd={jsonLd} noindex={leer}>
+  <div class="container schmal">
+    <Breadcrumbs krumen={krumen} />
+    <h1>Zielgruppe: {info.name}</h1>
+    <p class="lead">{info.text}</p>
+    {!leer ? (
+      <ArtikelListe artikel={artikel} ebene={2} />
+    ) : (
+      <div class="box box-info">
+        <p>
+          Für diese Zielgruppe gibt es noch keine Artikel. Wir arbeiten daran. Bis dahin findest du alle bisherigen
+          Artikel im <a href={url(pfade.blog)}>Blog</a>.
+        </p>
+        <p>
+          Du hast eine Frage, die wir beantworten sollten? <a href={url(pfade.kontakt)}>Schreib uns</a>.
+        </p>
+      </div>
+    )}
+    <h2>Weitere Zielgruppen</h2>
+    <ul class="tags">
+      {ZIELGRUPPEN_IDS.filter((z) => z !== zielgruppe).map((z) => (
+        <li>
+          <a class="tag" href={url(pfade.zielgruppe(z))}>
+            {ZIELGRUPPEN[z].name}
+          </a>
+        </li>
+      ))}
+    </ul>
+  </div>
+</Base>

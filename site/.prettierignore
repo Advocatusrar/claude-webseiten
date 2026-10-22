@@ -1,0 +1,9 @@
+dist/
+.astro/
+node_modules/
+playwright-report/
+test-results/
+package-lock.json
+# Content is written by people and agents and checked by the content rules, not reformatted.
+src/content/
+src/texte/

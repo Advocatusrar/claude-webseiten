@@ -1,0 +1,271 @@
+---
+// Calculator 1: rough lifetime of a ferro rod. Server-rendered with the default
+// values (works without JavaScript); the script below recalculates on input.
+// Formula and formatting live in src/lib/rechner.ts (shared with the client).
+import daten from '../data/rechner.json';
+import {
+  anteilAnnahmen,
+  berechneLebensdauer,
+  lebensdauerAnzeige,
+  lebensdauerParameter,
+  lebensdauerStandard,
+  WOCHEN_PRO_JAHR,
+  type RechnerDaten,
+} from '../lib/rechner';
+import { mitEinheit, zahl, zahlEingabe, zahlFlexibel } from '../lib/format';
+import StatusMarke from './StatusMarke.astro';
+import Datum from './Datum.astro';
+
+const d = daten as unknown as RechnerDaten;
+const parameter = d.lebensdauer.parameter;
+const regler = d.lebensdauer.regler;
+const p = lebensdauerParameter(d);
+const e = lebensdauerStandard(d);
+const erg = berechneLebensdauer(e, p);
+const annahmen = anteilAnnahmen(Object.values(parameter));
+const anzeige = lebensdauerAnzeige(e, erg, p, { annahmen: annahmen !== 'keine' });
+
+const pw = (key: string) => {
+  const x = parameter[key];
+  return x && x.wert != null && Number.isFinite(Number(x.wert))
+    ? `${zahlFlexibel(Number(x.wert))}${x.einheit ? ` ${x.einheit}` : ''}`
+    : 'keine Angabe';
+};
+---
+
+<section class="rechner" data-rechner="lebensdauer" aria-labelledby="rechner-lebensdauer">
+  <h3 id="rechner-lebensdauer">Lebensdauer: Wie lange hält ein Feuerstahl?</h3>
+  <p>
+    Der Rechner schätzt aus Länge und Durchmesser eines Stabs, wie viele Züge, Zündungen und Wochen er ungefähr hält.
+    Stell ein, wie du den Stab nutzt.
+  </p>
+  {annahmen === 'alle' && (
+    <p class="box box-hinweis" role="note">
+      <strong>Vorläufige Werte:</strong> Alle festen Parameter dieses Rechners sind derzeit Annahmen (Platzhalter). Sie
+      sind weder gemessen noch durch Quellen belegt. Das Ergebnis ist deshalb nur eine grobe Orientierung.
+    </p>
+  )}
+  {annahmen === 'einige' && (
+    <p class="box box-hinweis" role="note">
+      <strong>Vorläufige Werte:</strong> Einige Parameter sind noch Annahmen (Platzhalter), weder gemessen noch durch
+      Quellen belegt. Welche, steht in der Tabelle „Parameter“ unten.
+    </p>
+  )}
+
+  <div class="rechner-raster">
+    <div class="rechner-eingabe">
+      {Object.entries(regler).map(([key, r]) => (
+        <div class="regler">
+          <label for={`ld-${key}`} id={`ld-${key}-label`}>
+            {r.label}
+          </label>
+          <div class="regler-zeile">
+            <input
+              type="range"
+              id={`ld-${key}`}
+              name={key}
+              min={r.min}
+              max={r.max}
+              step={r.step}
+              value={r.default}
+              data-regler={key}
+              data-einheit={r.einheit ?? ''}
+              aria-valuetext={mitEinheit(r.default, r.einheit)}
+              aria-describedby={`ld-${key}-bereich`}
+            />
+            <input
+              type="text"
+              id={`ld-${key}-zahl`}
+              value={zahlEingabe(r.default)}
+              inputmode="decimal"
+              autocomplete="off"
+              spellcheck="false"
+              data-zahl={key}
+              aria-labelledby={r.einheit ? `ld-${key}-label ld-${key}-einheit` : `ld-${key}-label`}
+              aria-describedby={`ld-${key}-bereich ld-${key}-hinweis`}
+            />
+            <span class="einheit" id={`ld-${key}-einheit`}>
+              {r.einheit}
+            </span>
+          </div>
+          <p class="regler-bereich" id={`ld-${key}-bereich`}>
+            {zahlFlexibel(r.min)} bis {zahlFlexibel(r.max)}
+            {r.einheit ? ` ${r.einheit}` : ''}, Standard {zahlFlexibel(r.default)}
+          </p>
+          <p class="regler-hinweis" id={`ld-${key}-hinweis`} data-hinweis={key} aria-live="polite"></p>
+        </div>
+      ))}
+    </div>
+
+    <div class="ergebnis">
+      <h4 class="sr-only">Ergebnis</h4>
+      <p class="ergebnis-satz" data-feld="satz">
+        {anzeige.satz}
+      </p>
+      <p class="sr-only" role="status" data-ansage></p>
+      <dl class="kacheln">
+        <div class="kachel">
+          <dt>Züge</dt>
+          <dd data-feld="zuege">{anzeige.felder.zuege}</dd>
+        </div>
+        <div class="kachel">
+          <dt>Zündungen</dt>
+          <dd data-feld="zuendungen">{anzeige.felder.zuendungen}</dd>
+        </div>
+        <div class="kachel">
+          <dt>Wochen</dt>
+          <dd data-feld="wochen">{anzeige.felder.wochen}</dd>
+        </div>
+        <div class="kachel">
+          <dt>Jahre</dt>
+          <dd data-feld="jahre">{anzeige.felder.jahre}</dd>
+        </div>
+      </dl>
+      <dl class="details">
+        <dt>Nutzbare Länge</dt>
+        <dd>
+          <span data-feld="nutzbare_laenge_mm">{anzeige.felder.nutzbare_laenge_mm}</span> mm
+        </dd>
+        <dt>Nutzbares Volumen</dt>
+        <dd>
+          <span data-feld="volumen_cm3">{anzeige.felder.volumen_cm3}</span> cm³
+        </dd>
+        <dt>Nutzbare Masse</dt>
+        <dd>
+          <span data-feld="masse_g">{anzeige.felder.masse_g}</span> g
+        </dd>
+      </dl>
+      <p class="klein">
+        <strong>Grobe Schätzung.</strong> Der Rechner nimmt an, dass der Stab über die ganze nutzbare Länge gleichmäßig
+        abgetragen wird. Wie viel ein Zug wirklich abträgt, hängt unter anderem von Striker, Druck und Technik ab.
+      </p>
+      <noscript>
+        <p class="klein">Ohne JavaScript zeigt der Rechner das Ergebnis für die Standardwerte.</p>
+      </noscript>
+    </div>
+  </div>
+
+  <h4>So rechnet der Rechner</h4>
+  <ol class="formel">
+    <li>Nutzbare Länge in mm = Stablänge minus Länge im Griff ({pw('griff_laenge_mm')}).</li>
+    <li>
+      {`Nutzbares Volumen in mm³ = π ÷ 4 × (Durchmesser² minus Rest-Durchmesser²) × nutzbare Länge, alle Maße in mm. Rest-Durchmesser: ${pw('rest_durchmesser_mm')}. Umgerechnet in cm³: mm³ ÷ 1.000.`}
+    </li>
+    <li>Masse in g = Volumen in cm³ × Dichte ({pw('dichte_g_cm3')}).</li>
+    <li>Züge = Masse in mg (g × 1.000) ÷ Abtrag pro Zug ({pw('abtrag_mg_pro_zug')}).</li>
+    <li>Zündungen = Züge ÷ Züge pro Zündung.</li>
+    <li>Wochen = Zündungen ÷ Zündungen pro Woche. Jahre = Wochen ÷ {zahl(WOCHEN_PRO_JAHR, 2)}.</li>
+  </ol>
+  <p class="klein">
+    Gerundet wird erst am Ende: Züge, Zündungen und Wochen auf ganze Zahlen, ab 1.000 auf Zehner. Jahre unter 10 auf
+    eine Nachkommastelle, darüber auf ganze Jahre, ab 100 steht „über 100“. Weniger als eine halbe Woche erscheint als
+    „unter 1“ Woche, weniger als 0,05 Jahre als „unter 0,1“ Jahre. Ist die nutzbare Länge null oder der Durchmesser
+    nicht größer als der Rest-Durchmesser, ist das Ergebnis 0.
+  </p>
+
+  <h4>Parameter</h4>
+  <div class="tabelle-scroll tabelle-stapel" tabindex="0" role="region" aria-labelledby="ld-parameter-caption">
+    <table>
+      <caption id="ld-parameter-caption">
+        <span class="caption-text">
+          Feste Parameter des Lebensdauer-Rechners
+          {d.stand && (
+            <>
+              , Stand: <Datum datum={d.stand} />
+            </>
+          )}
+        </span>
+      </caption>
+      <thead>
+        <tr>
+          <th scope="col">Parameter</th>
+          <th scope="col">Wert</th>
+          <th scope="col">Herkunft</th>
+        </tr>
+      </thead>
+      <tbody>
+        {Object.entries(parameter).map(([key, x]) => (
+          <tr data-parameter={key}>
+            <th scope="row">{x.label}</th>
+            <td class="zahl" data-label="Wert">
+              {pw(key)}
+            </td>
+            <td data-label="Herkunft">
+              <StatusMarke eintrag={x} />
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="tabelle-scroll tabelle-stapel" tabindex="0" role="region" aria-labelledby="ld-regler-caption">
+    <table>
+      <caption id="ld-regler-caption">
+        <span class="caption-text">Einstellbare Werte</span>
+      </caption>
+      <thead>
+        <tr>
+          <th scope="col">Wert</th>
+          <th scope="col">Standard</th>
+          <th scope="col">Bereich</th>
+          <th scope="col">Schrittweite</th>
+        </tr>
+      </thead>
+      <tbody>
+        {Object.entries(regler).map(([key, r]) => (
+          <tr data-regler-zeile={key}>
+            <th scope="row">{r.label}</th>
+            <td class="zahl" data-label="Standard">
+              {zahlFlexibel(r.default)}
+              {r.einheit ? ` ${r.einheit}` : ''}
+            </td>
+            <td class="zahl" data-label="Bereich">
+              {zahlFlexibel(r.min)} bis {zahlFlexibel(r.max)}
+              {r.einheit ? ` ${r.einheit}` : ''}
+            </td>
+            <td class="zahl" data-label="Schrittweite">
+              {zahlFlexibel(r.step)}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<script>
+  import daten from '../data/rechner.json';
+  import {
+    anteilAnnahmen,
+    berechneLebensdauer,
+    lebensdauerAnzeige,
+    lebensdauerParameter,
+    type RechnerDaten,
+  } from '../lib/rechner';
+  import { erstelleAnsage, setzeText, verbindeRegler } from '../lib/regler';
+
+  const d = daten as unknown as RechnerDaten;
+  const p = lebensdauerParameter(d);
+  const annahmen = anteilAnnahmen(Object.values(d.lebensdauer.parameter)) !== 'keine';
+
+  document.querySelectorAll<HTMLElement>('[data-rechner="lebensdauer"]').forEach((root) => {
+    const ansage = erstelleAnsage(root);
+    const wert = verbindeRegler(root, () => aktualisieren(true));
+
+    function aktualisieren(ansagen: boolean): void {
+      const e = {
+        laenge_mm: wert('laenge_mm'),
+        durchmesser_mm: wert('durchmesser_mm'),
+        zuege_pro_zuendung: wert('zuege_pro_zuendung'),
+        zuendungen_pro_woche: wert('zuendungen_pro_woche'),
+      };
+      const anzeige = lebensdauerAnzeige(e, berechneLebensdauer(e, p), p, { annahmen });
+      setzeText(root, 'satz', anzeige.satz);
+      for (const [feld, text] of Object.entries(anzeige.felder)) setzeText(root, feld, text);
+      if (ansagen) ansage(anzeige.satz);
+    }
+
+    aktualisieren(false);
+  });
+</script>

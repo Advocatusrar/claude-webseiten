@@ -1,0 +1,74 @@
+---
+import Base from '../layouts/Base.astro';
+import Breadcrumbs from '../components/Breadcrumbs.astro';
+import { istPlatzhalter, SITE } from '../site';
+import { absoluteUrl, pfade, url } from '../lib/url';
+import { breadcrumbLd, type Krume } from '../lib/jsonld';
+
+const email = SITE.betreiber.email;
+// No clickable placeholder: the button appears once a real address is set in src/site.ts.
+const emailFehlt = istPlatzhalter(email);
+const krumen: Krume[] = [
+  { name: 'Basecamp', pfad: pfade.start },
+  { name: 'Kontakt', pfad: pfade.kontakt },
+];
+const description = `So erreichst du ${SITE.name}: Fehlerhinweise, Produktvorschläge für Tests und Fragen per E-Mail. Kein Formular, keine Werbung.`;
+
+const jsonLd = [
+  {
+    '@context': 'https://schema.org',
+    '@type': 'ContactPage',
+    name: 'Kontakt',
+    url: absoluteUrl(pfade.kontakt),
+    inLanguage: SITE.sprache,
+    description,
+  },
+  breadcrumbLd(krumen),
+];
+---
+
+<Base title="Kontakt" description={description} jsonLd={jsonLd}>
+  <div class="container schmal">
+    <Breadcrumbs krumen={krumen} />
+    <h1>Kontakt</h1>
+    {emailFehlt ? (
+      <p class="lead">
+        Am schnellsten erreichst du uns per E-Mail. Die Adresse tragen wir hier ein, bevor die Seite offiziell startet.
+      </p>
+    ) : (
+      <>
+        <p class="lead">Am schnellsten erreichst du uns per E-Mail:</p>
+        <p>
+          <a class="knopf" href={`mailto:${email}`}>
+            {email}
+          </a>
+        </p>
+      </>
+    )}
+
+    <h2>Wofür du uns schreiben kannst</h2>
+    <ul>
+      <li>
+        <strong>Fehlerhinweise:</strong> Ein Fakt stimmt nicht, eine Quelle ist veraltet oder ein Link kaputt.
+      </li>
+      <li>
+        <strong>Produktvorschläge:</strong> Welchen Feuerstahl, Striker oder welche Verbindung sollen wir testen?
+      </li>
+      <li>
+        <strong>Fragen:</strong> Zu Ausrüstung, Technik oder Sicherheit, gern auch für einen künftigen Artikel.
+      </li>
+    </ul>
+
+    <h2>Unabhängig</h2>
+    <p>
+      Diese Seite enthält keine Werbung und keine Affiliate-Links. Was wir testen und wie wir bewerten, entscheiden wir
+      selbst.
+    </p>
+
+    <h2>Datenschutz</h2>
+    <p>
+      Es gibt bewusst kein Kontaktformular. Was mit deiner E-Mail passiert, steht in der{' '}
+      <a href={url(pfade.datenschutz)}>Datenschutzerklärung</a>.
+    </p>
+  </div>
+</Base>

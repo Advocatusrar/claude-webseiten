@@ -1,0 +1,20 @@
+---
+import Base from '../layouts/Base.astro';
+import { Content } from '../texte/datenschutz.md';
+import { SITE } from '../site';
+import Ueberschriften from '../components/Ueberschriften.astro';
+---
+
+<Base
+  title="Datenschutzerklärung"
+  description={`Datenschutzerklärung von ${SITE.name}: welche Daten beim Besuch anfallen. Keine Tracker, keine Cookies.`}
+>
+  <div class="container schmal">
+    <h1>Datenschutzerklärung</h1>
+    <div class="prose">
+      <Ueberschriften ab={2}>
+        <Content />
+      </Ueberschriften>
+    </div>
+  </div>
+</Base>

@@ -1,0 +1,17 @@
+---
+import Base from '../layouts/Base.astro';
+import { Content } from '../texte/impressum.md';
+import { SITE } from '../site';
+import Ueberschriften from '../components/Ueberschriften.astro';
+---
+
+<Base title="Impressum" description={`Impressum von ${SITE.name}: Angaben zum Betreiber und Kontakt.`}>
+  <div class="container schmal">
+    <h1>Impressum</h1>
+    <div class="prose">
+      <Ueberschriften ab={2}>
+        <Content />
+      </Ueberschriften>
+    </div>
+  </div>
+</Base>
