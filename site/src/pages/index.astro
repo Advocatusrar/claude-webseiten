@@ -29,123 +29,151 @@ const anzahlText = (n: number) => (n === 0 ? 'Noch keine Artikel' : n === 1 ? '1
 ---
 
 <Base title={`${SITE.name} | ${SITE.claim}`} description={description} jsonLd={jsonLd}>
-  <div class="container">
-    <h1>Feuerstahl, Striker und Zubehör: unabhängig erklärt</h1>
-    <p class="lead">
-      {SITE.name} ist eine unabhängige, deutschsprachige Informationsquelle zu Feuerstahl (Ferrocerium-Stab), Striker
-      (Schaber) und der Verbindung zwischen beiden, etwa Shockcord oder Schnur. Wir testen die Produkte selbst, trennen
-      Herstellerangaben von eigenen Messwerten und belegen Fakten mit Quellen und Datum.
-    </p>
-
-    <section class="abschnitt" aria-labelledby="erwartung">
-      <h2 id="erwartung">Was dich hier erwartet</h2>
-      <div class="raster">
-        <div class="karte">
-          <h3>Was du hier findest</h3>
-          <ul>
-            <li>Grundlagenartikel mit Quellen und Stand-Datum</li>
-            <li>einen Vergleichstest, in dem wir selbst messen</li>
-            <li>zwei Rechner: Lebensdauer eines Stabs und Stabgröße nach Alter</li>
-          </ul>
-        </div>
-        <div class="karte">
-          <h3>Was du hier nicht findest</h3>
-          <ul>
-            <li>Werbung, Affiliate-Links oder bezahlte Platzierungen</li>
-            <li>Tracker oder Cookies</li>
-            <li>erfundene Testergebnisse: Was wir nicht gemessen haben, steht nicht als Messwert da</li>
-          </ul>
-        </div>
+  <div class="startseite">
+    <section class="hero" aria-labelledby="titel">
+      <div class="hero-flaeche" aria-hidden="true">
+        <svg class="hero-funken" viewBox="0 0 400 300" focusable="false">
+          <circle class="funke f1" cx="60" cy="250" r="5" />
+          <circle class="funke f2" cx="110" cy="270" r="3.5" />
+          <circle class="funke f3" cx="40" cy="280" r="2.5" />
+          <circle class="funke f4" cx="150" cy="260" r="4" />
+          <circle class="funke f5" cx="90" cy="290" r="2" />
+          <circle class="funke f6" cx="20" cy="260" r="3" />
+          <circle class="funke f7" cx="130" cy="290" r="2.5" />
+        </svg>
       </div>
-    </section>
-
-    <aside class="box box-hinweis" aria-labelledby="sicherheit-zuerst">
-      <h2 id="sicherheit-zuerst" class="box-titel">
-        Sicherheit zuerst
-      </h2>
-      <p>
-        Bevor du Funken schlägst: Kläre, ob Feuer an diesem Ort erlaubt ist, achte auf die aktuelle Waldbrandgefahr und
-        halte Wasser zum Löschen bereit. Kinder üben nur mit einem Erwachsenen.
-      </p>
-      {sicherheit && (
-        <p>
-          <a href={url(pfade.artikel(sicherheit.id))}>{sicherheit.data.title}</a>
+      <div class="container hero-inhalt">
+        <p class="hero-kicker">Unabhängig. Ohne Werbung. Mit Quellen.</p>
+        <h1 id="titel" class="hero-titel">
+          Feuerstahl, Striker und Zubehör: <span class="hero-akzent">unabhängig erklärt</span>
+        </h1>
+        <p class="lead hero-lead">
+          {SITE.name} ist eine unabhängige, deutschsprachige Informationsquelle zu Feuerstahl (Ferrocerium-Stab),
+          Striker (Schaber) und der Verbindung zwischen beiden, etwa Shockcord oder Schnur. Wir testen die Produkte
+          selbst, trennen Herstellerangaben von eigenen Messwerten und belegen Fakten mit Quellen und Datum.
         </p>
-      )}
-    </aside>
-
-    <section class="abschnitt" aria-labelledby="zielgruppen">
-      <h2 id="zielgruppen">Einstieg nach Zielgruppe</h2>
-      <ul class="raster raster-3">
-        {ZIELGRUPPEN_IDS.map((z) => (
-          <li>
-            <div class="karte">
-              <h3>
-                <a class="karte-link" href={url(pfade.zielgruppe(z))}>
-                  {ZIELGRUPPEN[z].name}
-                </a>
-              </h3>
-              <p>{ZIELGRUPPEN[z].text}</p>
-              <p class="klein">{anzahlText(fuerZielgruppe(artikel, z).length)}</p>
-            </div>
-          </li>
-        ))}
-      </ul>
-    </section>
-
-    <section class="abschnitt" aria-labelledby="themen">
-      <h2 id="themen">Themen</h2>
-      <div class="raster">
-        {themen.map((t) => {
-          const passend = mitThema(artikel, t).slice(0, 4);
-          return (
-            <div class="karte karte-funke thema">
-              <h3>{THEMEN[t].name}</h3>
-              <p>{THEMEN[t].text}</p>
-              {passend.length > 0 ? (
-                <ul>
-                  {passend.map((a) => (
-                    <li>
-                      <a href={url(pfade.artikel(a.id))}>{a.data.title}</a>
-                    </li>
-                  ))}
-                </ul>
-              ) : (
-                <p class="klein">Zu diesem Thema erscheinen bald die ersten Artikel.</p>
-              )}
-            </div>
-          );
-        })}
-      </div>
-    </section>
-
-    <section class="abschnitt" aria-labelledby="rechner-hinweis">
-      <h2 id="rechner-hinweis">Rechner</h2>
-      <div class="box box-info">
-        <p>
-          Wie lange hält ein Feuerstahl, wenn du ihn regelmäßig nutzt? Und welche Stablänge passt zu welchem Alter?
-          Beide Rechner findest du im Vergleichstest, mit Formel und allen Werten offen gelegt.
-        </p>
-        <p>
-          <a class="knopf" href={url(pfade.rechner)}>
-            Zu den Rechnern
+        <p class="hero-knoepfe">
+          <a class="knopf" href={url(pfade.vergleichstest)}>
+            Zum Vergleichstest
+          </a>
+          <a class="knopf knopf-zweit" href={url(pfade.blog)}>
+            Alle Artikel
           </a>
         </p>
       </div>
     </section>
 
-    <section class="abschnitt" aria-labelledby="neueste">
-      <h2 id="neueste">Neueste Artikel</h2>
-      {neueste.length > 0 ? (
-        <>
-          <ArtikelListe artikel={neueste} ebene={3} />
+    <div class="container">
+      <section class="abschnitt einblenden" aria-labelledby="erwartung">
+        <h2 id="erwartung">Was dich hier erwartet</h2>
+        <div class="raster">
+          <div class="karte">
+            <h3>Was du hier findest</h3>
+            <ul>
+              <li>Grundlagenartikel mit Quellen und Stand-Datum</li>
+              <li>einen Vergleichstest, in dem wir selbst messen</li>
+              <li>zwei Rechner: Lebensdauer eines Stabs und Stabgröße nach Alter</li>
+            </ul>
+          </div>
+          <div class="karte">
+            <h3>Was du hier nicht findest</h3>
+            <ul>
+              <li>Werbung, Affiliate-Links oder bezahlte Platzierungen</li>
+              <li>Tracker oder Cookies</li>
+              <li>erfundene Testergebnisse: Was wir nicht gemessen haben, steht nicht als Messwert da</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <aside class="box box-hinweis einblenden" aria-labelledby="sicherheit-zuerst">
+        <h2 id="sicherheit-zuerst" class="box-titel">
+          Sicherheit zuerst
+        </h2>
+        <p>
+          Bevor du Funken schlägst: Kläre, ob Feuer an diesem Ort erlaubt ist, achte auf die aktuelle Waldbrandgefahr
+          und halte Wasser zum Löschen bereit. Kinder üben nur mit einem Erwachsenen.
+        </p>
+        {sicherheit && (
           <p>
-            <a href={url(pfade.blog)}>Alle Artikel im Blog</a>
+            <a href={url(pfade.artikel(sicherheit.id))}>{sicherheit.data.title}</a>
           </p>
-        </>
-      ) : (
-        <p>Die ersten Artikel sind in Arbeit. Schau bald wieder vorbei.</p>
-      )}
-    </section>
+        )}
+      </aside>
+
+      <section class="abschnitt einblenden" aria-labelledby="zielgruppen">
+        <h2 id="zielgruppen">Einstieg nach Zielgruppe</h2>
+        <ul class="raster raster-3">
+          {ZIELGRUPPEN_IDS.map((z) => (
+            <li>
+              <div class="karte">
+                <h3>
+                  <a class="karte-link" href={url(pfade.zielgruppe(z))}>
+                    {ZIELGRUPPEN[z].name}
+                  </a>
+                </h3>
+                <p>{ZIELGRUPPEN[z].text}</p>
+                <p class="klein zahl">{anzahlText(fuerZielgruppe(artikel, z).length)}</p>
+              </div>
+            </li>
+          ))}
+        </ul>
+      </section>
+
+      <section class="abschnitt einblenden" aria-labelledby="themen">
+        <h2 id="themen">Themen</h2>
+        <div class="raster">
+          {themen.map((t) => {
+            const passend = mitThema(artikel, t).slice(0, 4);
+            return (
+              <div class="karte karte-funke thema">
+                <h3>{THEMEN[t].name}</h3>
+                <p>{THEMEN[t].text}</p>
+                {passend.length > 0 ? (
+                  <ul>
+                    {passend.map((a) => (
+                      <li>
+                        <a href={url(pfade.artikel(a.id))}>{a.data.title}</a>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p class="klein">Zu diesem Thema erscheinen bald die ersten Artikel.</p>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </section>
+
+      <section class="abschnitt einblenden" aria-labelledby="rechner-hinweis">
+        <h2 id="rechner-hinweis">Rechner</h2>
+        <div class="box box-info">
+          <p>
+            Wie lange hält ein Feuerstahl, wenn du ihn regelmäßig nutzt? Und welche Stablänge passt zu welchem Alter?
+            Beide Rechner findest du im Vergleichstest, mit Formel und allen Werten offen gelegt.
+          </p>
+          <p>
+            <a class="knopf" href={url(pfade.rechner)}>
+              Zu den Rechnern
+            </a>
+          </p>
+        </div>
+      </section>
+
+      <section class="abschnitt einblenden" aria-labelledby="neueste">
+        <h2 id="neueste">Neueste Artikel</h2>
+        {neueste.length > 0 ? (
+          <>
+            <ArtikelListe artikel={neueste} ebene={3} />
+            <p>
+              <a href={url(pfade.blog)}>Alle Artikel im Blog</a>
+            </p>
+          </>
+        ) : (
+          <p>Die ersten Artikel sind in Arbeit. Schau bald wieder vorbei.</p>
+        )}
+      </section>
+    </div>
   </div>
 </Base>
