@@ -13,7 +13,7 @@ Regeln für KI-Agenten, die die Seite pflegen: [`CLAUDE.md`](CLAUDE.md).
 
 ## Lokale Entwicklung
 
-Voraussetzung: Node.js 22.12 oder neuer (Astro 7 verlangt das, siehe `engines` in `package.json`).
+Voraussetzung: Node.js 26 oder neuer (siehe `engines` in `package.json` und `.nvmrc`).
 
 ```sh
 cd site
