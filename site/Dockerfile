@@ -6,7 +6,7 @@
 # CHECK_LIVE=1 (set by the CI for the release image) makes placeholders such as
 # [Vorname Nachname] or example.org a build error, so an incomplete Impressum never ships.
 
-FROM node:22.23-alpine AS build
+FROM node:26.12-alpine AS build
 WORKDIR /app
 # No Git hooks inside the image.
 ENV LEFTHOOK=0
