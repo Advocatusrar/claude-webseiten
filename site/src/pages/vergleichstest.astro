@@ -26,7 +26,7 @@ const krumen: Krume[] = [
   { name: 'Vergleichstest', pfad: pfade.vergleichstest },
 ];
 const description =
-  'Unabhängiger Vergleichstest von Feuerstahl, Striker und Verbindung: Testmethode, Produkttabelle und Rechner für Lebensdauer und Stabgröße.';
+  'Unabhängiger Vergleichstest von Feuerstahl, Striker und Verbindung: Rechner für Lebensdauer und Stabgröße, Produkttabelle und Testmethode.';
 
 function masse(m: { laenge_mm?: number; durchmesser_mm?: number; gewicht_g?: number }): string[] {
   const teile: string[] = [];
@@ -96,6 +96,19 @@ const jsonLd = [
         selbst gemessen haben.
       </p>
     </div>
+
+    <section class="abschnitt" id="rechner" aria-labelledby="rechner-titel">
+      <h2 id="rechner-titel">Rechner</h2>
+      <div class="prose">
+        <p>
+          Zwei Rechner helfen bei der Auswahl: Der erste schätzt, wie lange ein Stab hält. Der zweite zeigt
+          {alterAnnahmen === 'keine' ? ' Richtwerte' : ' vorläufige Richtwerte'} zur Stabgröße nach Alter. Formeln und
+          alle Werte stehen offen unter den Rechnern, jeweils mit ihrer Herkunft.
+        </p>
+      </div>
+      <RechnerLebensdauer />
+      <RechnerAlter />
+    </section>
 
     <aside class="box box-hinweis" aria-label="Stand der Tests">
       {getestet.length === 0 ? (
@@ -182,19 +195,6 @@ const jsonLd = [
           <Testmethodik />
         </Ueberschriften>
       </div>
-    </section>
-
-    <section class="abschnitt" id="rechner" aria-labelledby="rechner-titel">
-      <h2 id="rechner-titel">Rechner</h2>
-      <div class="prose">
-        <p>
-          Zwei Rechner helfen bei der Auswahl: Der erste schätzt, wie lange ein Stab hält. Der zweite zeigt
-          {alterAnnahmen === 'keine' ? ' Richtwerte' : ' vorläufige Richtwerte'} zur Stabgröße nach Alter. Formeln und
-          alle Werte stehen offen unter den Rechnern, jeweils mit ihrer Herkunft.
-        </p>
-      </div>
-      <RechnerLebensdauer />
-      <RechnerAlter />
     </section>
   </div>
 </Base>
