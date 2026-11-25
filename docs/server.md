@@ -42,19 +42,58 @@ scp deploy/setup-server.sh ubuntu@SERVER:
 ssh ubuntu@SERVER 'sudo bash setup-server.sh'
 ```
 
-Das Skript bricht ohne jede Änderung ab, wenn `/home/ubuntu/.ssh/authorized_keys` fehlt
-oder leer ist, wenn es nicht als root läuft oder wenn das System kein Ubuntu ist. Es
-lässt sich gefahrlos ein zweites Mal ausführen und meldet dann 0 Änderungen.
+Das Skript lässt sich gefahrlos ein zweites Mal ausführen und meldet dann 0 Änderungen.
+
+**Abbruch ohne jede Änderung**, wenn eine dieser Prüfungen scheitert:
+
+- Es läuft nicht als root (Aufruf ohne `sudo`).
+- Das System ist kein Ubuntu (eine andere Ubuntu-Version als 24.04 oder eine andere
+  Architektur als aarch64 gibt nur eine Warnung).
+- `DRY_RUN` hat einen anderen Wert als `0` oder `1`.
+- `ADMIN_USER` ist kein gültiger Benutzername (nur Kleinbuchstaben, Ziffern, `_` und
+  `-`), der Benutzer existiert nicht, oder er heißt `root` oder `deploy`.
+- Das Skript wurde per `sudo` von einem anderen Benutzer als `ADMIN_USER` aufgerufen
+  (Variable `SUDO_USER`). Danach dürfte nur noch `ADMIN_USER` per SSH herein, der
+  aufrufende Benutzer wäre ausgesperrt. Abhilfe: `ADMIN_USER` auf deinen Benutzer
+  setzen, z. B. `sudo ADMIN_USER=name bash setup-server.sh`.
+- In der Schlüsseldatei von `ADMIN_USER` steht kein Schlüssel (fehlt, leer oder nur
+  Kommentare). Geprüft wird die Datei, die sshd für diesen Benutzer liest
+  (`AuthorizedKeysFile` laut `sshd -T`, relativ zum Home-Verzeichnis aus
+  `getent passwd`), im Normalfall `~/.ssh/authorized_keys`, beim Standardbenutzer also
+  `/home/ubuntu/.ssh/authorized_keys`. Weicht `AuthorizedKeysFile` vom Standard ab,
+  warnt das Skript.
+- Eines der Pakete `docker.io`, `docker-compose`, `docker-compose-v2`, `docker-doc`
+  oder `podman-docker` ist installiert. Sie kollidieren mit Docker aus dem offiziellen
+  Repository; erst mit `sudo apt-get remove <paket>` entfernen.
+
+**Abbruch während des Laufs** (was bis dahin eingerichtet wurde, bleibt; nach der
+Ursache einfach erneut starten):
+
+- Eine Konfigurationsdatei lässt sich nicht schreiben. Die bisherige Datei bleibt.
+- `sshd -t` meldet einen Fehler, `sshd -T` scheitert, oder laut `sshd -T` stünde
+  `ADMIN_USER` danach nicht in `AllowUsers`. Dann wird
+  `/etc/ssh/sshd_config.d/10-haertung.conf` zurückgesetzt und SSH nicht neu geladen.
+- `fail2ban-client -t` meldet einen Fehler in `/etc/fail2ban/jail.local`.
+- Der Signaturschlüssel von Docker hat nicht den erwarteten Fingerabdruck
+  `9DC8 5822 9FC7 DD38 854A E2D8 8D81 803C 0EBF CD88`. Dann wird nichts von Docker
+  installiert.
+- iptables lässt sich nicht lesen, oder die Kette `INPUT` ändert sich, während das
+  Skript eine wirkungslose Regel hinter `REJECT` löscht. Es löscht nur eine Regel, die
+  es vorher unter genau dieser Nummer gefunden hat.
 
 Was es einrichtet:
 
-- System-Updates, automatische Sicherheitsupdates, bei Bedarf Neustart um 04:00
+- System-Updates (`apt-get full-upgrade`), automatische Sicherheitsupdates, bei Bedarf
+  Neustart um 04:00
   (Zeitzone des Servers: Europe/Berlin)
 - SSH nur mit Schlüssel, kein Root-Login, nur die Benutzer `ubuntu` und `deploy`
   (`/etc/ssh/sshd_config.d/10-haertung.conf`)
 - fail2ban für SSH
 - Firewall über die iptables-Regeln des Oracle-Images (kein UFW): Ports 22, 80 und 443
-- Docker aus dem offiziellen Repository mit begrenzten Logs, ohne TCP-Socket
+  für IPv4 und IPv6, wenn `INPUT` andere Verbindungen abweist (`REJECT`-Regel oder
+  Policy `DROP`)
+- Docker aus dem offiziellen Repository (Signaturschlüssel per Fingerabdruck geprüft)
+  mit begrenzten Logs, ohne TCP-Socket
 - Benutzer `deploy` in der Gruppe `docker`, mit leerer `authorized_keys`
 
 Optionen: `sudo DRY_RUN=1 bash setup-server.sh` zeigt nur, was geschehen würde.
@@ -72,21 +111,47 @@ Optionen: `sudo DRY_RUN=1 bash setup-server.sh` zeigt nur, was geschehen würde.
    (noch kein Webserver). Ein Timeout heißt: Port 80 ist gesperrt, auf dem Server oder
    in der Security List (siehe „Was ihr braucht“, Punkt 2).
 
+### Skript testen
+
+Jede Änderung an `deploy/setup-server.sh` braucht vor dem Pull Request einen grünen
+Lauf der Tests, das Ergebnis gehört in die PR-Beschreibung:
+
+```sh
+sudo bash site/tests/server/setup-server.test.sh
+```
+
+Der Test spielt das Skript in Wegwerf-Umgebungen durch (eigener Mount- und
+Netz-Namespace mit `unshare`, Overlay über `/etc`, `/home` und weitere Verzeichnisse,
+iptables-Regeln wie im Oracle-Image). Auf dem Rechner selbst ändert sich nichts. Er
+braucht root, Netz-Namespaces und die Werkzeuge `unshare`, `setpriv`, iptables,
+`sshd`, `fail2ban-client`, `apt-config`, `shellcheck` und `python3`; außerdem müssen
+die Benutzer `ubuntu` und `claude` existieren. Exit-Code 0 heißt bestanden, 1 mindestens
+ein Fehler, 2 der Test kann hier nicht laufen (dann gilt er als nicht ausgeführt, nicht
+als bestanden). In der CI läuft er nicht (dort ist er nicht eingerichtet); er ist deshalb
+lokal Pflicht.
+
 **Hinweis Docker und Firewall:** Docker leitet veröffentlichte Container-Ports an der
 INPUT-Kette vorbei. Deshalb veröffentlicht nur Traefik Ports (80, 443). Eigene Regeln
 für Container gehören in die Kette `DOCKER-USER`.
 
 ## Website einrichten (folgt mit dem Aufbau von Live und Staging)
 
-Dieser Teil wird mit der neuen Struktur neu geschrieben. Erhalten bleibt:
+Dieser Teil wird mit der neuen Struktur neu geschrieben.
+
+> **Wichtig:** Die Variable `DEPLOY_ENABLED` in GitHub erst auf `true` setzen, wenn
+> Live und Staging aufgebaut sind. `setup-server.sh` legt weder `deploy.sh` noch die
+> Verzeichnisse der Website an. Mit `DEPLOY_ENABLED=true` würde jeder Merge nach `main`
+> den Deploy-Job starten, und der schlägt dann fehl (siehe [`ci-cd.md`](ci-cd.md)).
+
+Erhalten bleibt:
 
 - **Deploy-Schlüssel nur für die CI** auf eurem Rechner erzeugen
   (`ssh-keygen -t ed25519 -f github-deploy -N '' -C github-deploy`) und den öffentlichen
   Teil in `/home/deploy/.ssh/authorized_keys` eintragen, beschränkt auf einen Befehl
   (`command="…",restrict`). Den privaten Teil als Secret `DEPLOY_SSH_KEY` in GitHub
   eintragen, `ssh-keyscan SERVER` als Secret `DEPLOY_KNOWN_HOSTS`, danach die lokale
-  Datei löschen. Dann in GitHub `DEPLOY_ENABLED=true` setzen (siehe
-  [`ci-cd.md`](ci-cd.md)).
+  Datei löschen. `DEPLOY_ENABLED=true` erst danach und erst nach dem Aufbau von Live
+  und Staging setzen (siehe oben und [`ci-cd.md`](ci-cd.md)).
 - **Tipp für den ersten Start:** In `.env` die Zeile `ACME_CA_SERVER=...staging...`
   aktivieren. Let's Encrypt begrenzt fehlgeschlagene Versuche; mit der Staging-CA lässt
   sich gefahrlos testen. Wenn alles läuft, die Zeile entfernen, das Zertifikats-Volume

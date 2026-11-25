@@ -12,8 +12,11 @@
 # It does not set up the website; that follows with the layout for live and staging.
 #
 # Variables:
-#   ADMIN_USER  user that keeps SSH access (default: ubuntu); needs a key in
-#               /home/${ADMIN_USER}/.ssh/authorized_keys, otherwise nothing is changed.
+#   ADMIN_USER  user that keeps SSH access (default: ubuntu); needs a key in its
+#               AuthorizedKeysFile (normally ~/.ssh/authorized_keys, home directory
+#               from getent passwd), otherwise nothing is changed. When run with sudo,
+#               it must be the user who called sudo (SUDO_USER), otherwise nothing is
+#               changed either: AllowUsers would lock that user out.
 #   DRY_RUN=1   only print what would be done; changes nothing and needs no root.
 #
 # It is idempotent: a second run changes nothing and does not fail.
@@ -45,17 +48,26 @@ run() {
   fi
 }
 
+# Temporary directory of this run, created on demand, removed on exit.
+TMP_DIR=""
+cleanup() { if [[ -n $TMP_DIR ]]; then rm -rf -- "$TMP_DIR"; fi; }
+trap cleanup EXIT
+ensure_tmp_dir() { [[ -n $TMP_DIR ]] || TMP_DIR=$(mktemp -d); }
+
 # put_file PATH MODE, content on stdin. Writes only if content or mode differ.
-# Returns 0 if the file was (or in a dry run would be) changed, 1 if it is unchanged.
+# Returns 0 if the file was (or in a dry run would be) changed, 1 if it is unchanged,
+# 2 if writing failed. It runs as an "if" condition, where set -e has no effect, so
+# every step checks its own result. Call it through put, which stops on 2.
 put_file() {
-  local path=$1 mode=$2 content line
-  content=$(cat)
+  local path=$1 mode=$2 content line cur_mode tmp
+  content=$(cat) || return 2
   if [[ -f $path ]] && [[ "$(cat "$path" 2>/dev/null)" == "$content" ]]; then
-    if [[ "$(stat -c %a "$path")" == "${mode#0}" ]]; then
+    cur_mode=$(stat -c %a "$path") || return 2
+    if [[ $cur_mode == "${mode#0}" ]]; then
       info "unverändert: $path"
       return 1
     fi
-    run chmod "$mode" "$path"
+    run chmod "$mode" "$path" || return 2
     changed
     return 0
   fi
@@ -65,11 +77,24 @@ put_file() {
     while IFS= read -r line; do printf '      | %s\n' "$line"; done <<<"$content"
     return 0
   fi
-  install -d -m 0755 "$(dirname "$path")"
-  printf '%s\n' "$content" >"$path.tmp.$$"
-  chmod "$mode" "$path.tmp.$$"
-  mv -f "$path.tmp.$$" "$path"
+  tmp="$path.tmp.$$"
+  install -d -m 0755 "$(dirname "$path")" || return 2
+  printf '%s\n' "$content" >"$tmp" || { rm -f -- "$tmp"; return 2; }
+  chmod "$mode" "$tmp" || { rm -f -- "$tmp"; return 2; }
+  mv -f "$tmp" "$path" || { rm -f -- "$tmp"; return 2; }
   info "geschrieben: $path"
+}
+
+# put PATH MODE: put_file, but a failed write stops the script (also inside "if").
+# Returns 0 if changed, 1 if unchanged.
+put() {
+  local rc=0
+  put_file "$@" || rc=$?
+  if ((rc >= 2)); then
+    echo "Abbruch: $1 ließ sich nicht schreiben. Die bisherige Datei bleibt, wie sie war." >&2
+    exit 1
+  fi
+  return "$rc"
 }
 
 # Precondition failed: stop before any change. A dry run only reports it.
@@ -110,30 +135,104 @@ fi
 [[ "$(uname -m)" == aarch64 ]] || warn "Geschrieben für Oracle A1 (aarch64), gefunden: $(uname -m)."
 
 # The user name ends up in sshd_config, so allow only plain user names.
+ADMIN_OK=0
 if [[ ! $ADMIN_USER =~ ^[a-z_][a-z0-9_-]*$ ]]; then
   precondition_failed "ADMIN_USER '$ADMIN_USER' ist kein gültiger Benutzername."
 elif [[ $ADMIN_USER == root || $ADMIN_USER == "$DEPLOY_USER" ]]; then
   precondition_failed "ADMIN_USER darf nicht root oder $DEPLOY_USER sein (Root-Login wird gesperrt, $DEPLOY_USER ist für die CI)."
 elif ! id "$ADMIN_USER" >/dev/null 2>&1; then
   precondition_failed "Benutzer $ADMIN_USER existiert nicht."
+else
+  ADMIN_OK=1
 fi
 
-# Do not lock yourself out: only harden SSH if the admin user can log in with a key.
-ADMIN_KEYS="/home/${ADMIN_USER}/.ssh/authorized_keys"
-# Without root (only possible in a dry run) the file may exist behind a directory
-# that cannot be entered (e.g. /home/ubuntu with mode 750). Then it is unknown.
-keys_checkable() {
-  local home="/home/${ADMIN_USER}"
-  [[ $EUID -eq 0 || -r $ADMIN_KEYS ]] && return 0
-  [[ -x $home ]] || return 1
-  [[ -d $home/.ssh ]] || return 0
-  [[ -x $home/.ssh ]] || return 1
-  [[ ! -e $ADMIN_KEYS ]]
+# AllowUsers lets in only ADMIN_USER and deploy. Whoever called sudo must be one of
+# them, otherwise the next SSH login of that user fails.
+if [[ -n ${SUDO_USER:-} && $SUDO_USER != root && $SUDO_USER != "$ADMIN_USER" ]]; then
+  precondition_failed "Du hast sudo als '$SUDO_USER' aufgerufen, SSH erlaubt danach aber nur '$ADMIN_USER' und $DEPLOY_USER. Damit sperrst du '$SUDO_USER' aus. Aufruf mit passendem Benutzer: sudo ADMIN_USER=$SUDO_USER bash setup-server.sh"
+fi
+
+# key_file_state FILE: prints "yes" if FILE holds at least one key line, "no" if not,
+# "unknown" if it cannot be read. Without root (only possible in a dry run) the file
+# may exist behind a directory that cannot be entered (e.g. /home/ubuntu with mode 750).
+key_file_state() {
+  local f=$1 d
+  if [[ $EUID -ne 0 && ! -r $f ]]; then
+    d=$(dirname "$f")
+    while [[ $d != / && $d != . ]]; do
+      if [[ -d $d && ! -x $d ]]; then
+        echo unknown
+        return 0
+      fi
+      d=$(dirname "$d")
+    done
+    if [[ -e $f ]]; then
+      echo unknown
+      return 0
+    fi
+  fi
+  if [[ -s $f ]] && grep -qvE '^[[:space:]]*(#|$)' "$f" 2>/dev/null; then
+    echo yes
+  else
+    echo no
+  fi
 }
-if ! keys_checkable; then
-  warn "SSH-Schlüssel in $ADMIN_KEYS kann ohne root nicht geprüft werden (kein Zugriff). Ein echter Lauf mit sudo prüft ihn."
-elif [[ ! -s $ADMIN_KEYS ]] || ! grep -qvE '^[[:space:]]*(#|$)' "$ADMIN_KEYS" 2>/dev/null; then
-  precondition_failed "Kein SSH-Schlüssel in $ADMIN_KEYS. Sonst sperrst du dich aus."
+
+# Do not lock yourself out: only harden SSH if the admin user can log in with a key.
+# The files come from AuthorizedKeysFile as sshd sees it for ADMIN_USER (sshd -T),
+# relative to the real home directory from getent passwd.
+if [[ $ADMIN_OK == 1 ]]; then
+  ADMIN_HOME=$(getent passwd "$ADMIN_USER" | cut -d: -f6) || ADMIN_HOME=""
+  if [[ $ADMIN_HOME != /* ]]; then
+    precondition_failed "Home-Verzeichnis von $ADMIN_USER nicht ermittelbar (getent passwd $ADMIN_USER)."
+  else
+    AKF_DEFAULT=".ssh/authorized_keys .ssh/authorized_keys2"
+    akf=""
+    if sshd_eff=$(sshd -T -C "user=$ADMIN_USER,host=localhost,addr=127.0.0.1" 2>/dev/null); then
+      akf=$(awk '$1 == "authorizedkeysfile" { $1 = ""; sub(/^ +/, ""); print }' <<<"$sshd_eff")
+      if [[ -n "$(awk '$1 == "authorizedkeyscommand" && $2 != "none"' <<<"$sshd_eff")" ]]; then
+        warn "sshd verwendet ein AuthorizedKeysCommand. Geprüft werden nur die Schlüsseldateien."
+      fi
+    fi
+    if [[ -z $akf ]]; then
+      if [[ $EUID -eq 0 ]]; then
+        warn "AuthorizedKeysFile ließ sich nicht mit sshd -T ermitteln. Geprüft wird der Standard ~/.ssh/authorized_keys."
+      fi
+      akf=".ssh/authorized_keys"
+    elif [[ $akf != "$AKF_DEFAULT" ]]; then
+      warn "AuthorizedKeysFile ist nicht der Standard ($AKF_DEFAULT), sondern: $akf"
+    fi
+    ADMIN_KEY_FILES=()
+    if [[ $akf != none ]]; then
+      read -r -a akf_tokens <<<"$akf"
+      for tok in "${akf_tokens[@]}"; do
+        tok=${tok//%%/$'\x01'}
+        tok=${tok//%h/$ADMIN_HOME}
+        tok=${tok//%u/$ADMIN_USER}
+        if [[ $tok == *%* ]]; then
+          warn "AuthorizedKeysFile-Eintrag '$tok' enthält ein nicht unterstütztes %-Kürzel und wird nicht geprüft."
+          continue
+        fi
+        tok=${tok//$'\x01'/%}
+        [[ $tok == /* ]] || tok="$ADMIN_HOME/$tok"
+        ADMIN_KEY_FILES+=("$tok")
+      done
+    fi
+    key_found=0 key_unknown=0
+    for f in "${ADMIN_KEY_FILES[@]}"; do
+      case $(key_file_state "$f") in
+        yes) key_found=1 ;;
+        unknown) key_unknown=1 ;;
+      esac
+    done
+    if ((${#ADMIN_KEY_FILES[@]} == 0)); then
+      precondition_failed "sshd liest für $ADMIN_USER keine Schlüsseldatei (AuthorizedKeysFile: $akf). Sonst sperrst du dich aus."
+    elif ((key_found == 0 && key_unknown == 1)); then
+      warn "SSH-Schlüssel in ${ADMIN_KEY_FILES[*]} kann ohne root nicht geprüft werden (kein Zugriff). Ein echter Lauf mit sudo prüft ihn."
+    elif ((key_found == 0)); then
+      precondition_failed "Kein SSH-Schlüssel in ${ADMIN_KEY_FILES[*]}. Sonst sperrst du dich aus."
+    fi
+  fi
 fi
 
 # Docker's own packages conflict with the unofficial ones from Ubuntu.
@@ -168,7 +267,9 @@ iptables-persistent iptables-persistent/autosave_v6 boolean true
 SEL
 fi
 run apt-get update -q
-run apt-get "${APT_OPTS[@]}" upgrade
+# full-upgrade: on a fresh server also take updates that add or remove packages
+# (e.g. a new kernel package). Not interactive, see APT_OPTS.
+run apt-get "${APT_OPTS[@]}" full-upgrade
 run apt-get "${APT_OPTS[@]}" install ca-certificates curl gnupg unattended-upgrades \
   fail2ban iptables iptables-persistent netfilter-persistent
 
@@ -187,13 +288,13 @@ else
 fi
 
 step "Automatische Updates mit Neustart um 04:00"
-put_file /etc/apt/apt.conf.d/20auto-upgrades 0644 <<'CONF' || true
+put /etc/apt/apt.conf.d/20auto-upgrades 0644 <<'CONF' || true
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 CONF
 # Own file instead of editing 50unattended-upgrades; later files override earlier ones.
 # Reboot only if an update needs it (e.g. a new kernel), at 04:00 local time.
-put_file /etc/apt/apt.conf.d/52unattended-upgrades-local 0644 <<'CONF' || true
+put /etc/apt/apt.conf.d/52unattended-upgrades-local 0644 <<'CONF' || true
 // Managed by deploy/setup-server.sh
 Unattended-Upgrade::Automatic-Reboot "true";
 Unattended-Upgrade::Automatic-Reboot-Time "04:00";
@@ -234,32 +335,78 @@ rule_numbers() {
   "$tool" -S INPUT | awk -v want="-A INPUT $*" '$1 == "-A" { n++; if ($0 == want) print n }'
 }
 
+# nth_rule N: rule number N ("-A INPUT ...") of an "iptables -S INPUT" listing on stdin.
+nth_rule() { awk -v n="$1" '$1 == "-A" { i++; if (i == n) print }'; }
+# without_rule N: the listing on stdin without rule number N.
+without_rule() { awk -v n="$1" '$1 == "-A" { i++; if (i == n) next } { print }'; }
+
 # remove_behind_reject TOOL PORT RULE...: delete exact copies of RULE that sit behind
 # the first REJECT in INPUT. They have no effect (typical after "iptables -A" on Oracle).
 # Called only once an effective copy sits before the REJECT.
+# Rules are deleted by number. Other programs (fail2ban, Docker) may insert rules at
+# any time, so before every deletion the number is determined anew and the rule with
+# that number must equal RULE exactly; afterwards INPUT must equal the listing before
+# minus exactly that rule. Otherwise the script stops instead of guessing.
 remove_behind_reject() {
-  local tool=$1 port=$2 pos n d shown
+  local tool=$1 port=$2 pos n d shown nums tries=0 before after
   shift 2
-  pos=$(reject_pos "$tool")
-  [[ -n $pos ]] || return 0
-  # Highest number first, so the lower numbers stay valid.
-  for n in $(rule_numbers "$tool" "$@" | sort -rn); do
-    ((n > pos)) || continue
-    shown=$n
-    if dry; then
+  local want="-A INPUT $*"
+  if dry; then
+    pos=$(reject_pos "$tool")
+    [[ -n $pos ]] || return 0
+    nums=$(rule_numbers "$tool" "$@" | sort -rn)
+    for n in $nums; do
+      ((n > pos)) || continue
+      if [[ "$("$tool" -S INPUT | nth_rule "$n")" != "$want" ]]; then
+        warn "$tool: Regel $n ist nicht mehr die gesuchte. Ein echter Lauf ermittelt die Nummern neu."
+        continue
+      fi
       # Nothing was inserted or deleted, so shift the number like a real run would.
       shown=$((n + DRY_SHIFT))
       for d in "${DRY_DELETED[@]}"; do
         if ((d < n)); then shown=$((shown - 1)); fi
       done
       DRY_DELETED+=("$n")
-    fi
-    run "$tool" -D INPUT "$shown"
-    if dry; then
+      run "$tool" -D INPUT "$shown"
       info "[Testlauf] $tool: würde die wirkungslose ACCEPT-Regel für Port $port hinter REJECT entfernen"
-    else
-      warn "$tool: wirkungslose ACCEPT-Regel für Port $port hinter REJECT entfernt (war Regel $shown)"
+      FW_CHANGED=1
+      changed
+    done
+    return 0
+  fi
+  while :; do
+    # Position of the first REJECT and of the copies, all from one listing.
+    before=$("$tool" -S INPUT)
+    pos=$(awk '$1 == "-A" { n++; if (!p && / -j REJECT( |$)/) p = n } END { if (p) print p }' <<<"$before")
+    [[ -n $pos ]] || return 0
+    # Highest number behind the REJECT first.
+    nums=$(awk -v want="$want" '$1 == "-A" { n++; if ($0 == want) print n }' <<<"$before" | sort -rn)
+    n=""
+    for d in $nums; do
+      if ((d > pos)); then
+        n=$d
+        break
+      fi
+    done
+    [[ -n $n ]] || return 0
+    # Read again right before deleting: rule n must still be exactly RULE.
+    if [[ "$("$tool" -S INPUT | nth_rule "$n")" != "$want" ]]; then
+      # INPUT changed in the meantime: determine the numbers again.
+      tries=$((tries + 1))
+      if ((tries >= 3)); then
+        echo "Abbruch: $tool INPUT ändert sich laufend, die wirkungslose Regel für Port $port wird nicht gelöscht. Prüfen mit: sudo $tool -S INPUT" >&2
+        exit 1
+      fi
+      continue
     fi
+    run "$tool" -D INPUT "$n"
+    after=$("$tool" -S INPUT)
+    if [[ $after != "$(without_rule "$n" <<<"$before")" ]]; then
+      printf 'Abbruch: %s INPUT hat sich beim Löschen von Regel %s geändert. Prüfen mit: sudo %s -S INPUT\nVorher:\n%s\nJetzt:\n%s\n' \
+        "$tool" "$n" "$tool" "$before" "$after" >&2
+      exit 1
+    fi
+    warn "$tool: wirkungslose ACCEPT-Regel für Port $port hinter REJECT entfernt (war Regel $n)"
     FW_CHANGED=1
     changed
   done
@@ -304,6 +451,20 @@ allow_port() {
   fi
 }
 
+# open_ports TOOL: open 22/80/443 if INPUT rejects (REJECT rule) or drops (policy not
+# ACCEPT) other traffic; otherwise everything is open anyway.
+open_ports() {
+  local tool=$1 policy port
+  DRY_SHIFT=0
+  DRY_DELETED=()
+  policy=$("$tool" -S INPUT | awk '$1 == "-P" { print $3 }')
+  if [[ -n "$(reject_pos "$tool")" || $policy != ACCEPT ]]; then
+    for port in 22 80 443; do allow_port "$tool" "$port"; done
+  else
+    info "$tool: keine REJECT-Regel in INPUT und Policy ACCEPT, keine Regel nötig"
+  fi
+}
+
 if ! iptables -L INPUT -n >/dev/null 2>&1; then
   if dry; then
     info "[Testlauf] iptables nicht lesbar (kein root). Ein echter Lauf ermittelt die REJECT-Regel in INPUT und fügt davor ACCEPT für tcp 22, 80, 443 ein, falls sie fehlen."
@@ -312,21 +473,12 @@ if ! iptables -L INPUT -n >/dev/null 2>&1; then
     exit 1
   fi
 else
-  DRY_SHIFT=0
-  DRY_DELETED=()
-  policy=$(iptables -S INPUT | awk '$1 == "-P" { print $3 }')
-  if [[ -n "$(reject_pos iptables)" || $policy != ACCEPT ]]; then
-    for port in 22 80 443; do allow_port iptables "$port"; done
+  open_ports iptables
+  # IPv6 like IPv4: REJECT rule (Oracle image) or policy DROP.
+  if ip6tables -L INPUT -n >/dev/null 2>&1; then
+    open_ports ip6tables
   else
-    info "iptables: keine REJECT-Regel in INPUT und Policy ACCEPT, keine Regel nötig"
-  fi
-  # IPv6 only if the image rejects there as well.
-  DRY_SHIFT=0
-  DRY_DELETED=()
-  if ip6tables -L INPUT -n >/dev/null 2>&1 && [[ -n "$(reject_pos ip6tables)" ]]; then
-    for port in 22 80 443; do allow_port ip6tables "$port"; done
-  else
-    info "ip6tables: keine REJECT-Regel in INPUT, nichts zu tun"
+    warn "ip6tables lässt sich nicht lesen, IPv6-Regeln bleiben unverändert."
   fi
 fi
 
@@ -338,7 +490,9 @@ if [[ $FW_CHANGED == 1 ]]; then
   fi
   run netfilter-persistent save
 fi
-if ! dry && ! systemctl is-enabled --quiet netfilter-persistent 2>/dev/null; then
+# Restores the saved rules at boot. A dry run shows it as well; on a fresh server the
+# package is only installed in step 1, so it is not enabled yet.
+if ! systemctl is-enabled --quiet netfilter-persistent 2>/dev/null; then
   run systemctl enable netfilter-persistent
   changed
 fi
@@ -351,13 +505,29 @@ step "SSH: nur Schlüssel, kein root, nur $ADMIN_USER und $DEPLOY_USER"
 SSHD_CONF=/etc/ssh/sshd_config.d/10-haertung.conf
 # sshd uses the first value it reads; files in sshd_config.d are read in name order
 # before the rest of sshd_config, so "10-" wins over 50-cloud-init.conf and others.
-SSHD_OLD=""
 SSHD_HAD_FILE=0
-if [[ -f $SSHD_CONF ]]; then
+if [[ -f $SSHD_CONF ]] && ! dry; then
+  # Exact copy, to put the old, working file back if the new one fails a check.
   SSHD_HAD_FILE=1
-  SSHD_OLD=$(cat "$SSHD_CONF" 2>/dev/null || true)
+  ensure_tmp_dir
+  cp -p -- "$SSHD_CONF" "$TMP_DIR/sshd.old"
 fi
-if put_file "$SSHD_CONF" 0644 <<CONF; then
+# restore_sshd_conf REASON: put the previous file back (or remove the new one), stop.
+restore_sshd_conf() {
+  local ok=1
+  if [[ $SSHD_HAD_FILE == 1 ]]; then
+    cp -p -- "$TMP_DIR/sshd.old" "$SSHD_CONF" || ok=0
+  else
+    rm -f -- "$SSHD_CONF" || ok=0
+  fi
+  if ((ok)); then
+    echo "Abbruch: $1 $SSHD_CONF wurde zurückgesetzt, SSH nicht neu geladen." >&2
+  else
+    echo "Abbruch: $1 $SSHD_CONF ließ sich NICHT zurücksetzen. SSH wurde nicht neu geladen; die Datei vor dem nächsten Neustart von ssh von Hand prüfen!" >&2
+  fi
+  exit 1
+}
+if put "$SSHD_CONF" 0644 <<CONF; then
 # Managed by deploy/setup-server.sh
 PasswordAuthentication no
 KbdInteractiveAuthentication no
@@ -367,22 +537,18 @@ CONF
   # With socket activation (default on 24.04) /run/sshd may be missing, then sshd -t fails.
   run install -d -m 0755 /run/sshd
   if ! dry; then
-    if ! sshd -t; then
-      # Leave the old, working configuration in place.
-      if [[ $SSHD_HAD_FILE == 1 ]]; then
-        printf '%s\n' "$SSHD_OLD" >"$SSHD_CONF"
-      else
-        rm -f "$SSHD_CONF"
-      fi
-      echo "Abbruch: sshd -t meldet einen Fehler. $SSHD_CONF wurde zurückgesetzt, SSH nicht neu geladen." >&2
-      exit 1
+    sshd -t || restore_sshd_conf "sshd -t meldet einen Fehler."
+    effective=$(sshd -T 2>/dev/null) || restore_sshd_conf "sshd -T meldet einen Fehler, die wirksame Konfiguration ist unbekannt."
+    # Without ADMIN_USER in AllowUsers the next login fails: never reload like that.
+    if ! grep -qx "allowusers $ADMIN_USER" <<<"$effective"; then
+      allowed=$(awk '$1 == "allowusers" { printf "%s%s", sep, $2; sep = " " }' <<<"$effective")
+      restore_sshd_conf "sshd würde $ADMIN_USER nicht einlassen (AllowUsers laut sshd -T: ${allowed:-kein Eintrag}; wird $SSHD_CONF überhaupt gelesen?)."
     fi
-    effective=$(sshd -T 2>/dev/null || true)
     for setting in "passwordauthentication no" "kbdinteractiveauthentication no" "permitrootlogin no"; do
       grep -qx "$setting" <<<"$effective" || warn "sshd verwendet nicht '$setting'. Eine andere Datei in /etc/ssh/sshd_config.d setzt den Wert vorher."
     done
   else
-    info "[Testlauf] sshd -t"
+    info "[Testlauf] sshd -t, danach Prüfung mit sshd -T (AllowUsers enthält $ADMIN_USER)"
   fi
   cat <<'TEXT'
 
@@ -407,7 +573,7 @@ fi
 step "fail2ban für SSH"
 # Ubuntu 24.04 sets banaction = nftables in jail.d/defaults-debian.conf. Docker does not
 # support rules created with nft next to its own, so fail2ban uses iptables here.
-if put_file /etc/fail2ban/jail.local 0644 <<'CONF'; then
+if put /etc/fail2ban/jail.local 0644 <<'CONF'; then
 # Managed by deploy/setup-server.sh
 [sshd]
 enabled = true
@@ -441,6 +607,16 @@ DAEMON_CONTENT='{
   }
 }'
 DAEMON_CHANGED=0
+# Signing key of the Docker apt repository and its fingerprint. Source of the
+# fingerprint: Docker's official installation guide for Ubuntu in the repository
+# docker/docs, file engine/install/ubuntu.md, e.g. commit be718ce24184 (2020-12-09):
+# "Verify that you now have the key with the fingerprint 9DC8 5822 9FC7 DD38 854A
+# E2D8 8D81 803C 0EBF CD88" (pub rsa4096 2017-02-22, "Docker Release (CE deb)").
+# The current guide no longer prints it (removed with apt-key in commit 760bb64,
+# 2021-03-02). The key served at DOCKER_KEY_URL on 2026-11-25 has this fingerprint.
+DOCKER_KEY_URL=https://download.docker.com/linux/ubuntu/gpg
+DOCKER_KEY_FPR=9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+DOCKER_KEY=/etc/apt/keyrings/docker.asc
 if [[ -f $DAEMON_JSON ]] && [[ "$(cat "$DAEMON_JSON" 2>/dev/null)" != "$DAEMON_CONTENT" ]]; then
   # Someone changed it by hand: keep it, but check the important parts.
   info "$DAEMON_JSON existiert mit eigenem Inhalt und bleibt unverändert."
@@ -450,7 +626,7 @@ if [[ -f $DAEMON_JSON ]] && [[ "$(cat "$DAEMON_JSON" 2>/dev/null)" != "$DAEMON_C
   if grep -q '"hosts"' "$DAEMON_JSON"; then
     warn "$DAEMON_JSON enthält einen hosts-Eintrag. Docker soll nicht über TCP erreichbar sein."
   fi
-elif put_file "$DAEMON_JSON" 0644 <<<"$DAEMON_CONTENT"; then
+elif put "$DAEMON_JSON" 0644 <<<"$DAEMON_CONTENT"; then
   DAEMON_CHANGED=1
 fi
 
@@ -461,17 +637,39 @@ if command -v docker >/dev/null 2>&1; then
   fi
 else
   # Repository as in https://docs.docker.com/engine/install/ubuntu/ (deb822 format).
-  run install -m 0755 -d /etc/apt/keyrings
-  run curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-  run chmod a+r /etc/apt/keyrings/docker.asc
+  # The key is fetched to a temporary file and installed only if its fingerprint is the
+  # one Docker publishes. Otherwise nothing is written and the script stops.
+  if dry; then
+    run curl -fsSL "$DOCKER_KEY_URL" -o "<temporäre Datei>"
+    info "[Testlauf] würde den Fingerabdruck prüfen (erwartet: $DOCKER_KEY_FPR) und bei Abweichung abbrechen"
+    run install -m 0755 -d /etc/apt/keyrings
+    run install -m 0644 "<temporäre Datei>" "$DOCKER_KEY"
+  else
+    command -v gpg >/dev/null 2>&1 || { echo "Abbruch: gpg fehlt, der Docker-Schlüssel lässt sich nicht prüfen (Paket gnupg)." >&2; exit 1; }
+    ensure_tmp_dir
+    curl -fsSL "$DOCKER_KEY_URL" -o "$TMP_DIR/docker.asc" ||
+      { echo "Abbruch: Docker-Schlüssel ließ sich nicht von $DOCKER_KEY_URL laden." >&2; exit 1; }
+    # Fingerprints of the primary keys in the file; exactly one, the expected one.
+    mkdir -m 0700 "$TMP_DIR/gnupg"
+    key_fprs=$(GNUPGHOME="$TMP_DIR/gnupg" gpg --batch --quiet --with-colons --show-keys "$TMP_DIR/docker.asc" 2>/dev/null |
+      awk -F: '$1 == "pub" { p = 1; next } p && $1 == "fpr" { print $10; p = 0 }') || key_fprs=""
+    if [[ $key_fprs != "$DOCKER_KEY_FPR" ]]; then
+      printf 'Abbruch: Der Docker-Schlüssel von %s hat nicht den erwarteten Fingerabdruck.\n  erwartet: %s\n  gefunden: %s\nNichts installiert. Fingerabdruck in der Docker-Dokumentation prüfen.\n' \
+        "$DOCKER_KEY_URL" "$DOCKER_KEY_FPR" "${key_fprs:-keiner (keine gültige Schlüsseldatei)}" >&2
+      exit 1
+    fi
+    info "Fingerabdruck des Docker-Schlüssels stimmt: $DOCKER_KEY_FPR"
+    install -m 0755 -d /etc/apt/keyrings
+    install -m 0644 "$TMP_DIR/docker.asc" "$DOCKER_KEY"
+  fi
   arch=$(dpkg --print-architecture 2>/dev/null || echo arm64)
-  put_file /etc/apt/sources.list.d/docker.sources 0644 <<SRC || true
+  put /etc/apt/sources.list.d/docker.sources 0644 <<SRC || true
 Types: deb
 URIs: https://download.docker.com/linux/ubuntu
 Suites: ${OS_CODENAME:-noble}
 Components: stable
 Architectures: ${arch}
-Signed-By: /etc/apt/keyrings/docker.asc
+Signed-By: ${DOCKER_KEY}
 SRC
   run apt-get update -q
   run apt-get "${APT_OPTS[@]}" install docker-ce docker-ce-cli containerd.io docker-compose-plugin
