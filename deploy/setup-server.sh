@@ -161,15 +161,33 @@ sshd_auth_problem() {
   printf '%s' "AuthenticationMethods verlangt außer dem Schlüssel ein weiteres Verfahren (laut $view: ${methods:-kein Eintrag}), ohne password und keyboard-interactive ist keine der Listen erfüllbar. Dateien mit AuthenticationMethods: $(sshd_candidates authenticationmethods)."
 }
 
+# FINAL_RULE_AWK: awk function final_rule(LINE) for a rule line of "iptables -S INPUT"
+# (or ip6tables): 1 if the rule turns other traffic away, else 0. That is any REJECT
+# rule, or an unconditional DROP rule ("-A INPUT -j DROP"; a DROP with conditions,
+# e.g. a ban of fail2ban for one address, does not count). A comment
+# ("-m comment --comment TEXT", TEXT in quotes if it has blanks, \" and \\ escaped)
+# is no condition: it is removed first, so "-A INPUT -m comment --comment x -j DROP"
+# counts as unconditional. The target is the last "-j" of what remains.
+# fw_state and reject_pos both use it, so they always agree on the final rule.
+FINAL_RULE_AWK='
+function final_rule(r,   f, n, i, t) {
+  gsub(/ -m comment --comment ("([^"\\]|\\.)*"|[^ "]+)/, "", r)
+  n = split(r, f, " ")
+  t = ""
+  for (i = 3; i < n; i++) if (f[i] == "-j") t = f[i + 1]
+  return t == "REJECT" || r == "-A INPUT -j DROP"
+}'
+
 # fw_state TOOL: prints "POLICY FINAL" for the chain INPUT of TOOL (iptables or
-# ip6tables): its policy, and 1 if it has an unconditional REJECT or DROP rule
-# ("-A INPUT -j REJECT ..." or "-A INPUT -j DROP", like the last rule of the Oracle
-# image), else 0. Fails if the rules cannot be read.
+# ip6tables): its policy, and 1 if it has a rule that turns other traffic away (a
+# REJECT rule or an unconditional DROP rule, see FINAL_RULE_AWK; like the last rule of
+# the Oracle image), else 0. Fails if the rules cannot be read.
 fw_state() {
   local rules
   rules=$("$1" -S INPUT 2>/dev/null) || return 1
-  awk '$1 == "-P" { p = $3 }
-       $1 == "-A" && $3 == "-j" && ($4 == "REJECT" || ($4 == "DROP" && NF == 4)) { f = 1 }
+  awk "$FINAL_RULE_AWK"'
+       $1 == "-P" { p = $3 }
+       $1 == "-A" && final_rule($0) { f = 1 }
        END { printf "%s %d\n", p, f }' <<<"$rules"
 }
 
@@ -213,11 +231,13 @@ fi
 
 # AllowUsers lets in only ADMIN_USER and deploy. Whoever called sudo must be ADMIN_USER,
 # otherwise the next SSH login of that user fails.
-lockout_failed() { # USER
-  precondition_failed "Du hast sudo als '$1' aufgerufen, SSH erlaubt danach aber nur '$ADMIN_USER' und $DEPLOY_USER. Damit sperrst du '$1' aus. Aufruf mit passendem Benutzer: sudo ADMIN_USER=$1 bash setup-server.sh"
+# lockout_failed USER HOW: HOW says where USER comes from, as the start of the message
+# (SUDO_USER: called sudo as USER; audit login UID: logged in as USER).
+lockout_failed() { # USER HOW
+  precondition_failed "$2, SSH erlaubt danach aber nur '$ADMIN_USER' und $DEPLOY_USER. Damit sperrst du '$1' aus. Aufruf mit passendem Benutzer: sudo ADMIN_USER=$1 bash setup-server.sh"
 }
 if [[ -n ${SUDO_USER:-} && $SUDO_USER != root && $SUDO_USER != "$ADMIN_USER" ]]; then
-  lockout_failed "$SUDO_USER"
+  lockout_failed "$SUDO_USER" "Du hast sudo als '$SUDO_USER' aufgerufen"
 else
   # SUDO_USER is root or missing after "sudo -i", "sudo su" or a root shell. The audit
   # login UID still names the user who logged in (set by pam_loginuid at login, kept
@@ -231,7 +251,7 @@ else
     if [[ -z $login_user ]]; then
       precondition_failed "Du bist mit der UID $login_uid angemeldet (Audit-Login-UID, /proc/self/loginuid), zu der es keinen Benutzer gibt. SSH erlaubt danach nur '$ADMIN_USER' und $DEPLOY_USER. Bitte als $ADMIN_USER anmelden und das Skript mit sudo starten."
     elif [[ $login_user != "$ADMIN_USER" ]]; then
-      lockout_failed "$login_user"
+      lockout_failed "$login_user" "Du bist als '$login_user' angemeldet (Audit-Login-UID, /proc/self/loginuid)"
     fi
   fi
 fi
@@ -510,14 +530,12 @@ FW_CHANGED=0
 DRY_SHIFT=0
 
 # Number of the first rule in INPUT that turns other traffic away, empty if there is
-# none: a REJECT rule, or an unconditional DROP rule ("-A INPUT -j DROP"; a DROP with
-# conditions, e.g. a ban of fail2ban for one address, does not count). The target is
-# the last "-j" of the line (a comment comes before it). No early exit in awk: with
+# none: a REJECT rule, or an unconditional DROP rule (comments do not count as a
+# condition); the same test as fw_state, see FINAL_RULE_AWK. No early exit in awk: with
 # pipefail, iptables could otherwise fail on a closed pipe.
 reject_pos() {
-  "$1" -S INPUT | awk '$1 == "-A" && !found { n++; t = ""
-      for (i = 3; i < NF; i++) if ($i == "-j") t = $(i + 1)
-      if (t == "REJECT" || $0 == "-A INPUT -j DROP") { print n; found = 1 } }'
+  "$1" -S INPUT | awk "$FINAL_RULE_AWK"'
+      $1 == "-A" && !found { n++; if (final_rule($0)) { print n; found = 1 } }'
 }
 
 # rule_numbers TOOL RULE...: numbers of the rules in INPUT that equal RULE exactly.
