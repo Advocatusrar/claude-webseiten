@@ -89,25 +89,41 @@ Prüfung an, weil `sshd -T` es braucht. sshd legt es bei jedem Start ohnehin sel
 Ursache einfach erneut starten):
 
 - Eine Konfigurationsdatei lässt sich nicht schreiben. Die bisherige Datei bleibt.
-- Die Paketinstallation hat die Firewall verändert: In `INPUT` (IPv4 oder IPv6) fehlt
-  danach die abschließende `REJECT`- oder `DROP`-Regel, die vorher da war, oder die
-  Policy ist von `DROP` auf `ACCEPT` gewechselt. Das kann passieren, wenn apt UFW
-  entfernt (dessen `prerm` ruft `ufw-init stop`). Gespeichert wird dabei nichts:
-  `iptables-persistent` ist so vorbelegt, dass es bei der Installation nicht speichert
-  (`autosave_v4` und `autosave_v6` `false`), `/etc/iptables/rules.v4` und `rules.v6`
-  enthalten also noch die bisherigen Regeln. Ein Neustart lädt sie wieder, sofort von
-  Hand mit `sudo iptables-restore < /etc/iptables/rules.v4` (IPv6 entsprechend).
+- Die Paketinstallation hat die Firewall verändert und die Wiederherstellung hilft
+  nicht: In `INPUT` (IPv4 oder IPv6) fehlt danach die abschließende `REJECT`- oder
+  `DROP`-Regel, die vorher da war, die Policy ist von `DROP` auf `ACCEPT` gewechselt,
+  oder `INPUT` lässt sich nicht mehr lesen. Das kann passieren, wenn apt UFW entfernt
+  (dessen `prerm` ruft `ufw-init stop`). Vor der Paketinstallation sichert das Skript
+  deshalb die Tabelle `filter` (darin liegt `INPUT`) mit `iptables-save -t filter` und
+  `ip6tables-save -t filter` in eine temporäre Datei (nur für root lesbar, am Ende
+  gelöscht). Erkennt es danach eine solche Abweichung, spielt es die Sicherung mit
+  `iptables-restore` bzw. `ip6tables-restore` zurück (die Tabelle `filter` als Ganzes in
+  einem Schritt, keine einzelne Regel gelöscht; andere Tabellen wie `nat` bleiben
+  unberührt) und prüft erneut.
+  Stimmt `INPUT` dann wieder, warnt es („Firewall nach Paketinstallation
+  wiederhergestellt“) und macht weiter. Abgebrochen wird, wenn es keine Sicherung gibt,
+  die Wiederherstellung scheitert oder `INPUT` danach weiter abweicht. Gespeichert wird
+  dabei nichts: `iptables-persistent` ist so vorbelegt, dass es bei der Installation
+  nicht speichert (`autosave_v4` und `autosave_v6` `false`), `/etc/iptables/rules.v4`
+  und `rules.v6` enthalten also noch die bisherigen Regeln. Ein Neustart lädt sie
+  wieder, sofort von Hand mit `sudo iptables-restore < /etc/iptables/rules.v4` (IPv6
+  entsprechend).
 - `sshd -t` meldet einen Fehler, `sshd -T` scheitert, oder die wirksame Konfiguration
   (`sshd -T` global und `sshd -T -C user=ADMIN_USER,…` nach `Match`-Blöcken) erfüllt
   eine dieser Bedingungen nicht: `ADMIN_USER` steht in `AllowUsers`;
-  `PasswordAuthentication`, `KbdInteractiveAuthentication` und `PermitRootLogin` sind
-  `no`; `PubkeyAuthentication` ist `yes`; `AuthenticationMethods` ist `any` oder hat
+  `PasswordAuthentication`, `KbdInteractiveAuthentication`, `PermitRootLogin`,
+  `GSSAPIAuthentication` und `HostbasedAuthentication` sind `no`;
+  `PubkeyAuthentication` ist `yes`; `AuthenticationMethods` ist `any` oder hat
   eine Liste nur aus `publickey`; `DenyUsers` nennt `ADMIN_USER` nicht; ist
   `AllowGroups` gesetzt, ist `ADMIN_USER` in einer dieser Gruppen; `DenyGroups` nennt
   keine seiner Gruppen. Geprüft wird bei jedem Lauf, auch wenn
   `/etc/ssh/sshd_config.d/10-haertung.conf` unverändert bleibt. Hat dieser Lauf die
   Datei geändert, wird sie zurückgesetzt; ist sie unverändert, bleibt sie, und die
-  Meldung sagt, was zu tun ist. SSH wird in beiden Fällen nicht neu geladen. Die Meldung
+  Meldung sagt je nach Ursache, was zu tun ist: `/run/sshd` ließ sich nicht anlegen
+  (dann ist die Konfiguration ungeprüft), `sshd -t` oder `sshd -T` meldet einen Fehler,
+  oder die bestehende Konfiguration erfüllt eine Prüfung nicht (eine andere Datei hat
+  sich seit dem letzten Lauf geändert, oder die Prüfung ist neu). SSH wird in allen
+  Fällen nicht neu geladen. Die Meldung
   nennt die Dateien, die den Wert vermutlich vorher setzen (sshd nimmt den ersten Wert;
   Dateien in `sshd_config.d` mit früher sortiertem Namen werden zuerst gelesen).
 - `fail2ban-client -t` meldet einen Fehler in `/etc/fail2ban/fail2ban.local` oder
@@ -124,6 +140,13 @@ Ursache einfach erneut starten):
   also überstimmen. Die Meldung nennt die Dateien, die den Wert vermutlich setzen. Das
   Skript ändert sie nicht und startet fail2ban nicht neu; die Datei anpassen oder
   entfernen und das Skript erneut starten.
+- Außer `sshd` ist in fail2ban ein weiterer Jail aktiv (z. B. `recidive`, laut
+  `fail2ban-client -d`). Dessen Sperrdauer und Werte prüft das Skript nicht, sie
+  entsprechen nicht der Datenschutzerklärung. Die Meldung nennt jeden Jail und die
+  Dateien mit seinem Abschnitt; fail2ban wird weder neu gestartet noch gestartet. Den
+  Jail abschalten (`enabled = false`) oder die Datei entfernen und das Skript erneut
+  starten; soll er bleiben, zuerst Datenschutzerklärung und Skript anpassen. Ein
+  Testlauf (`DRY_RUN=1`) meldet das schon, wenn fail2ban installiert ist.
 - Der Signaturschlüssel von Docker hat nicht den erwarteten Fingerabdruck
   `9DC8 5822 9FC7 DD38 854A E2D8 8D81 803C 0EBF CD88`. Dann wird nichts von Docker
   installiert.
@@ -135,13 +158,16 @@ Was es einrichtet:
 - System-Updates (`apt-get full-upgrade`), automatische Sicherheitsupdates, bei Bedarf
   Neustart um 04:00
   (Zeitzone des Servers: Europe/Berlin)
-- SSH nur mit Schlüssel, kein Root-Login, nur die Benutzer `ADMIN_USER` und `deploy`
-  (`/etc/ssh/sshd_config.d/10-haertung.conf`). Die Prüfungen von `AllowUsers`,
-  `DenyUsers`, `AllowGroups` und `DenyGroups` laufen auch für `deploy` (mit
-  `sshd -T -C user=deploy,…`; auf einem frischen Server, wo das Skript `deploy` erst
-  danach anlegt, mit den Gruppen `deploy` und `docker`, die er dann bekommt). Sperren
-  sie `deploy` aus, gibt das Skript nur eine Warnung: Der Zugang von `ADMIN_USER` ist
-  nicht betroffen, das Deploy der CI würde aber scheitern.
+- SSH nur mit Schlüssel (auch ohne GSSAPI und hostbasierte Anmeldung), kein
+  Root-Login, nur die Benutzer `ADMIN_USER` und `deploy`
+  (`/etc/ssh/sshd_config.d/10-haertung.conf`). Für `deploy` prüft das Skript (mit
+  `sshd -T -C user=deploy,…`) `AllowUsers`, `DenyUsers`, `AllowGroups` und `DenyGroups`
+  (auf einem frischen Server, wo das Skript `deploy` erst danach anlegt, mit den Gruppen
+  `deploy` und `docker`, die er dann bekommt) und ob eine Anmeldung nur mit Schlüssel
+  möglich ist (`PubkeyAuthentication`, `AuthenticationMethods`); die noch leere
+  `authorized_keys` von `deploy` prüft es nicht. Scheitert eine dieser Prüfungen, gibt
+  das Skript nur eine Warnung: Der Zugang von `ADMIN_USER` ist nicht betroffen, das
+  Deploy der CI würde aber scheitern.
 - fail2ban für SSH mit den Werten der Datenschutzerklärung, ausdrücklich gesetzt:
   `maxretry = 5`, `findtime = 10m`, `bantime = 10m` (`/etc/fail2ban/jail.local`) und
   `dbpurgeage = 1d`; fail2ban schreibt sein Protokoll statt nach
@@ -149,8 +175,7 @@ Was es einrichtet:
   rsyslog installiert ist, nach `/var/log/auth.log`, nicht nach `/var/log/syslog`
   (`logtarget = SYSLOG[facility=AUTHPRIV]` in `/etc/fail2ban/fail2ban.local`). Ob diese
   Werte auch wirken, prüft das Skript mit `fail2ban-client -d` (siehe oben). Sind außer
-  `sshd` weitere Jails aktiv (z. B. `recidive`), warnt es: Deren Sperrdauer prüft es
-  nicht, sie entspricht nicht der Datenschutzerklärung.
+  `sshd` weitere Jails aktiv (z. B. `recidive`), bricht es ab (siehe oben).
 - Protokolle mit IP-Adressen werden nach etwa 7 Tagen gelöscht, wie in der
   Datenschutzerklärung angegeben: im Journal
   (`/etc/systemd/journald.conf.d/10-aufbewahrung.conf`) und, falls logrotate vorhanden
@@ -166,7 +191,9 @@ Was es einrichtet:
   für IPv4 und IPv6, wenn `INPUT` andere Verbindungen abweist (`REJECT`-Regel,
   abschließende Regel `-j DROP` ohne Bedingung oder Policy `DROP`); die ACCEPT-Regeln
   kommen vor die `REJECT`- bzw. `DROP`-Regel. Das Skript fügt nur Regeln ein und löscht
-  keine. Eine wirkungslose Kopie hinter `REJECT` bleibt stehen, das Skript warnt bei
+  keine (das Zurückspielen der Sicherung nach einer Änderung durch die
+  Paketinstallation, siehe oben, ersetzt die ganze Tabelle `filter` durch den Stand von
+  vorher). Eine wirkungslose Kopie hinter `REJECT` bleibt stehen, das Skript warnt bei
   jedem Lauf; entfernen von Hand (Nummer mit `sudo iptables -L INPUT --line-numbers -n`).
   Gespeichert (`netfilter-persistent save`) wird nur nach diesen Prüfungen und nur, wenn
   das Skript eine Regel eingefügt hat. Hat `INPUT` schon vor der Installation weder eine
