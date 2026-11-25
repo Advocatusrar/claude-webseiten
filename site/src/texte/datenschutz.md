@@ -38,7 +38,7 @@ Zweck ist, diese Website zuverlässig und sicher auszuliefern. Rechtsgrundlage i
 
 ### Schutz des Servers vor Angriffen
 
-Der Server lässt Wartungszugriffe nur über SSH mit Schlüssel zu. Für Anmeldeversuche über SSH speichert der Server die IP-Adresse, den Zeitpunkt und den verwendeten Benutzernamen. Das Programm fail2ban liest diese Einträge: Wer innerhalb von 10 Minuten fünfmal scheitert, wird für 10 Minuten gesperrt. Die Liste gesperrter Adressen löscht fail2ban nach einem Tag. Protokolle des Servers mit IP-Adressen, auch die von fail2ban, werden nach 7 Tagen gelöscht. Besuche der Website betrifft das nicht.
+Der Server lässt Wartungszugriffe nur über SSH mit Schlüssel zu. Für Anmeldeversuche über SSH speichert der Server die IP-Adresse, den Zeitpunkt und den verwendeten Benutzernamen. Das Programm fail2ban liest diese Einträge: Wer innerhalb von 10 Minuten fünfmal scheitert, wird für 10 Minuten gesperrt. Die Liste gesperrter Adressen löscht fail2ban nach einem Tag. Die Protokolle zu SSH-Anmeldeversuchen, auch die von fail2ban, werden nach 7 Tagen gelöscht. Besuche der Website betrifft das nicht.
 
 Zweck ist die Abwehr von Angriffen auf den Server. Rechtsgrundlage ist ein berechtigtes Interesse nach [Vorschrift nach rechtlicher Prüfung ergänzen].
 

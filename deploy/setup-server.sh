@@ -16,8 +16,9 @@
 #   ADMIN_USER  user that keeps SSH access (default: ubuntu); needs a key in its
 #               AuthorizedKeysFile (normally ~/.ssh/authorized_keys, home directory
 #               from getent passwd), otherwise nothing is changed. When run with sudo,
-#               it must be the user who called sudo (SUDO_USER), otherwise nothing is
-#               changed either: AllowUsers would lock that user out.
+#               it must be the user who called sudo (SUDO_USER) and the user who logged
+#               in (audit login UID, /proc/self/loginuid), otherwise nothing is changed
+#               either: AllowUsers would lock that user out.
 #   DRY_RUN=1   only print what would be done; changes nothing and needs no root.
 #
 # It is idempotent: a second run changes nothing and does not fail.
@@ -27,6 +28,8 @@ ADMIN_USER="${ADMIN_USER:-ubuntu}"
 DRY_RUN="${DRY_RUN:-0}"
 DEPLOY_USER=deploy
 CHANGES=0
+# Drop-in of this script; sshd reads it before 50-cloud-init.conf and the like (step 4).
+SSHD_CONF=/etc/ssh/sshd_config.d/10-haertung.conf
 # Connection that sshd -T -C evaluates Match blocks for (used once ADMIN_USER is checked).
 SSHD_TEST_SPEC="user=$ADMIN_USER,host=localhost,addr=127.0.0.1"
 # The same for the user deploy of the CI (only warnings, see check_sshd_deploy).
@@ -123,6 +126,53 @@ precondition_failed() {
   fi
 }
 
+# sshd_candidates KEYWORD: config files that mention KEYWORD (case-insensitive), apart
+# from the drop-in of this script. Only a hint for the abort message.
+sshd_candidates() {
+  local f found=()
+  for f in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
+    [[ -f $f && $f != "$SSHD_CONF" ]] || continue
+    if grep -qiE "^[[:space:]]*$1([[:space:]]|=)" "$f" 2>/dev/null; then found+=("$f"); fi
+  done
+  if ((${#found[@]} > 0)); then printf '%s' "${found[*]}"; else printf 'keine gefunden'; fi
+}
+# sshd_auth_problem VIEW OUTPUT: OUTPUT is what sshd -T (as VIEW) prints. Prints why a
+# login with a key alone would fail once PasswordAuthentication and
+# KbdInteractiveAuthentication are off, nothing if it works: PubkeyAuthentication must
+# be yes, and AuthenticationMethods "any" or at least one of its lists made up only of
+# "publickey" (a list like "publickey,password" also needs a password).
+sshd_auth_problem() {
+  local view=$1 eff=$2 pub methods list m only_key
+  local -a lists items
+  pub=$(awk '$1 == "pubkeyauthentication" { print $2; exit }' <<<"$eff")
+  if [[ $pub != yes ]]; then
+    printf '%s' "sshd erlaubt keine Anmeldung mit Schlüssel (PubkeyAuthentication laut $view: ${pub:-kein Eintrag}). Dateien mit PubkeyAuthentication: $(sshd_candidates pubkeyauthentication)."
+    return 0
+  fi
+  methods=$(awk '$1 == "authenticationmethods" { $1 = ""; sub(/^ +/, ""); print; exit }' <<<"$eff")
+  [[ $methods == any ]] && return 0
+  read -r -a lists <<<"$methods"
+  for list in "${lists[@]}"; do
+    IFS=, read -r -a items <<<"$list"
+    only_key=1
+    for m in "${items[@]}"; do [[ $m == publickey ]] || only_key=0; done
+    ((only_key)) && return 0
+  done
+  printf '%s' "AuthenticationMethods verlangt außer dem Schlüssel ein weiteres Verfahren (laut $view: ${methods:-kein Eintrag}), ohne password und keyboard-interactive ist keine der Listen erfüllbar. Dateien mit AuthenticationMethods: $(sshd_candidates authenticationmethods)."
+}
+
+# fw_state TOOL: prints "POLICY FINAL" for the chain INPUT of TOOL (iptables or
+# ip6tables): its policy, and 1 if it has an unconditional REJECT or DROP rule
+# ("-A INPUT -j REJECT ..." or "-A INPUT -j DROP", like the last rule of the Oracle
+# image), else 0. Fails if the rules cannot be read.
+fw_state() {
+  local rules
+  rules=$("$1" -S INPUT 2>/dev/null) || return 1
+  awk '$1 == "-P" { p = $3 }
+       $1 == "-A" && $3 == "-j" && ($4 == "REJECT" || ($4 == "DROP" && NF == 4)) { f = 1 }
+       END { printf "%s %d\n", p, f }' <<<"$rules"
+}
+
 # ---------------------------------------------------------------------------
 # 0. Checks. Nothing is changed before all of them have passed, except the runtime
 #    directory /run/sshd (see below).
@@ -161,10 +211,29 @@ else
   ADMIN_OK=1
 fi
 
-# AllowUsers lets in only ADMIN_USER and deploy. Whoever called sudo must be one of
-# them, otherwise the next SSH login of that user fails.
+# AllowUsers lets in only ADMIN_USER and deploy. Whoever called sudo must be ADMIN_USER,
+# otherwise the next SSH login of that user fails.
+lockout_failed() { # USER
+  precondition_failed "Du hast sudo als '$1' aufgerufen, SSH erlaubt danach aber nur '$ADMIN_USER' und $DEPLOY_USER. Damit sperrst du '$1' aus. Aufruf mit passendem Benutzer: sudo ADMIN_USER=$1 bash setup-server.sh"
+}
 if [[ -n ${SUDO_USER:-} && $SUDO_USER != root && $SUDO_USER != "$ADMIN_USER" ]]; then
-  precondition_failed "Du hast sudo als '$SUDO_USER' aufgerufen, SSH erlaubt danach aber nur '$ADMIN_USER' und $DEPLOY_USER. Damit sperrst du '$SUDO_USER' aus. Aufruf mit passendem Benutzer: sudo ADMIN_USER=$SUDO_USER bash setup-server.sh"
+  lockout_failed "$SUDO_USER"
+else
+  # SUDO_USER is root or missing after "sudo -i", "sudo su" or a root shell. The audit
+  # login UID still names the user who logged in (set by pam_loginuid at login, kept
+  # by sudo and su); 4294967295 means not set (e.g. started by a service).
+  login_uid=""
+  if [[ -r /proc/self/loginuid ]]; then
+    login_uid=$(</proc/self/loginuid) || login_uid=""
+  fi
+  if [[ $login_uid =~ ^[0-9]+$ && $login_uid != 4294967295 && $login_uid != 0 ]]; then
+    login_user=$(getent passwd "$login_uid" | cut -d: -f1) || login_user=""
+    if [[ -z $login_user ]]; then
+      precondition_failed "Du bist mit der UID $login_uid angemeldet (Audit-Login-UID, /proc/self/loginuid), zu der es keinen Benutzer gibt. SSH erlaubt danach nur '$ADMIN_USER' und $DEPLOY_USER. Bitte als $ADMIN_USER anmelden und das Skript mit sudo starten."
+    elif [[ $login_user != "$ADMIN_USER" ]]; then
+      lockout_failed "$login_user"
+    fi
+  fi
 fi
 
 # key_file_state FILE: prints "yes" if FILE holds at least one key line, "no" if not,
@@ -215,6 +284,21 @@ if [[ $ADMIN_OK == 1 ]]; then
       akf=$(awk '$1 == "authorizedkeysfile" { $1 = ""; sub(/^ +/, ""); print }' <<<"$sshd_eff")
       if [[ -n "$(awk '$1 == "authorizedkeyscommand" && $2 != "none"' <<<"$sshd_eff")" ]]; then
         warn "sshd verwendet ein AuthorizedKeysCommand. Geprüft werden nur die Schlüsseldateien."
+      fi
+      # The hardening turns passwords off. If the current configuration needs more than
+      # a key (PubkeyAuthentication no, AuthenticationMethods publickey,password), the
+      # admin would be locked out afterwards: stop now, before any change, instead of
+      # only after writing the drop-in. Globally and for ADMIN_USER after Match blocks.
+      auth_problem=$(sshd_auth_problem "sshd -T -C $SSHD_TEST_SPEC" "$sshd_eff")
+      if [[ -z $auth_problem ]]; then
+        if sshd_glob=$(sshd -T 2>&1); then
+          auth_problem=$(sshd_auth_problem "sshd -T" "$sshd_glob")
+        else
+          precondition_failed "sshd -T meldet einen Fehler, ob eine Anmeldung nur mit Schlüssel möglich ist, ist ungeprüft. Ausgabe: $(tail -n 3 <<<"$sshd_glob")"
+        fi
+      fi
+      if [[ -n $auth_problem ]]; then
+        precondition_failed "$auth_problem Ohne Passwort wäre $ADMIN_USER danach ausgesperrt."
       fi
     fi
     if [[ -z $akf ]] && dry && [[ $EUID -ne 0 || ! -d /run/sshd ]]; then
@@ -294,8 +378,25 @@ if pkg_installed ufw || command -v ufw >/dev/null 2>&1; then
   esac
 fi
 
+# State of the firewall before the packages: removing ufw in step 1 runs its prerm,
+# which calls "ufw-init stop" and can reset the rules in INPUT. Step 1 compares
+# against this state. Only read here; without root (dry run) it cannot be read.
+FW_BEFORE_V4="" FW_BEFORE_V6=""
+FW_BEFORE_V4=$(fw_state iptables) || FW_BEFORE_V4=""
+FW_BEFORE_V6=$(fw_state ip6tables) || FW_BEFORE_V6=""
+for fw_tool in iptables ip6tables; do
+  if [[ $fw_tool == iptables ]]; then fw_before=$FW_BEFORE_V4; else fw_before=$FW_BEFORE_V6; fi
+  if [[ -z $fw_before && $EUID -ne 0 ]]; then
+    info "$fw_tool: INPUT ohne root nicht lesbar, ein echter Lauf hält den Zustand vor der Paketinstallation fest"
+  elif [[ -z $fw_before ]]; then
+    warn "$fw_tool: INPUT nicht lesbar, ob die Paketinstallation die Firewall verändert, bleibt ungeprüft"
+  elif [[ $fw_before == "ACCEPT 0" ]]; then
+    warn "$fw_tool: INPUT hat weder eine abschließende REJECT- oder DROP-Regel noch die Policy DROP, eingehende Verbindungen sind nicht gefiltert. Auf Oracle ist das unerwartet (das Image beendet INPUT mit REJECT)."
+  fi
+done
+
 if [[ $PRE_FAILED == 0 ]]; then
-  info "in Ordnung: root, Ubuntu $OS_VERSION, Schlüssel für $ADMIN_USER vorhanden"
+  info "in Ordnung: root, Ubuntu $OS_VERSION, Schlüssel für $ADMIN_USER vorhanden, Anmeldung nur mit Schlüssel möglich"
 fi
 
 # ---------------------------------------------------------------------------
@@ -308,14 +409,16 @@ export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=l
 APT_OPTS=(-y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
 
-# Answer the questions of iptables-persistent in advance: save the current rules
-# (the Oracle image rules) on installation.
+# Answer the questions of iptables-persistent in advance: do not save the rules on
+# installation. Removing ufw in the same apt run can change them first (see below);
+# saving then would make that permanent. The script saves only itself, with
+# netfilter-persistent save in step 3, after its checks.
 if dry; then
-  info "[Testlauf] debconf-set-selections: iptables-persistent/autosave_v4 und autosave_v6 = true"
+  info "[Testlauf] debconf-set-selections: iptables-persistent/autosave_v4 und autosave_v6 = false"
 else
   debconf-set-selections <<'SEL'
-iptables-persistent iptables-persistent/autosave_v4 boolean true
-iptables-persistent iptables-persistent/autosave_v6 boolean true
+iptables-persistent iptables-persistent/autosave_v4 boolean false
+iptables-persistent iptables-persistent/autosave_v6 boolean false
 SEL
 fi
 run apt-get update -q
@@ -324,6 +427,38 @@ run apt-get update -q
 run apt-get "${APT_OPTS[@]}" full-upgrade
 run apt-get "${APT_OPTS[@]}" install ca-certificates curl gnupg unattended-upgrades \
   fail2ban iptables iptables-persistent netfilter-persistent
+
+# apt removes ufw for iptables-persistent (see the checks); the prerm of ufw calls
+# "ufw-init stop", which can flush INPUT and set its policy to ACCEPT. Compare with the
+# state before the installation: if the final REJECT or DROP rule is gone, or the
+# policy went from DROP to ACCEPT, the server is open. Stop then; nothing has been saved
+# (autosave false above), the rules files still hold the previous rules.
+# fw_after_packages TOOL BEFORE RULES_FILE
+fw_after_packages() {
+  local tool=$1 before=$2 file=$3 now p0 f0 p1="" f1="" what=""
+  [[ -n $before ]] || return 0
+  read -r p0 f0 <<<"$before"
+  if now=$(fw_state "$tool"); then
+    read -r p1 f1 <<<"$now"
+    if [[ $f0 == 1 && $f1 != 1 ]]; then what="die abschließende REJECT- oder DROP-Regel in INPUT fehlt jetzt"; fi
+    if [[ $p0 == DROP && $p1 == ACCEPT ]]; then what="${what:+$what; }die Policy von INPUT ist von DROP auf ACCEPT gewechselt"; fi
+  else
+    what="INPUT lässt sich nicht mehr lesen"
+  fi
+  [[ -n $what ]] || return 0
+  {
+    echo "Abbruch: Die Firewall wurde durch die Paketinstallation verändert ($tool: $what). Vermutlich hat apt beim Entfernen von ufw dessen Regeln zurückgesetzt (ufw-init stop). Eingehende Verbindungen sind damit womöglich nicht mehr gefiltert."
+    echo "Gespeichert wurde nichts: $file enthält, falls vorhanden, noch die bisherigen Regeln. Ein Neustart lädt sie wieder (netfilter-persistent), sofort von Hand: sudo ${tool}-restore < $file"
+    echo "Danach mit sudo $tool -L INPUT --line-numbers -n prüfen und das Skript erneut starten."
+  } >&2
+  exit 1
+}
+if dry; then
+  info "[Testlauf] Nach der Paketinstallation prüft ein echter Lauf, ob INPUT (IPv4 und IPv6) noch die abschließende REJECT- oder DROP-Regel und die Policy von vorher hat; sonst Abbruch ohne Speichern."
+else
+  fw_after_packages iptables "$FW_BEFORE_V4" /etc/iptables/rules.v4
+  fw_after_packages ip6tables "$FW_BEFORE_V6" /etc/iptables/rules.v6
+fi
 
 # ---------------------------------------------------------------------------
 # 2. Time zone and automatic updates
@@ -356,7 +491,8 @@ CONF
 # 3. Firewall (iptables of the Oracle image, no UFW)
 # ---------------------------------------------------------------------------
 # Oracle's Ubuntu images ship iptables rules (/etc/iptables/rules.v4) that end INPUT
-# with "REJECT --reject-with icmp-host-prohibited". New ACCEPT rules must go before it.
+# with "REJECT --reject-with icmp-host-prohibited". New ACCEPT rules must go before it;
+# the same for an unconditional "-j DROP" at the end of INPUT.
 # The script only inserts rules and never deletes one (reason at allow_port).
 # UFW is not used: it manages the same INPUT chain and would conflict with these rules.
 # It cannot stay installed either: ufw breaks iptables-persistent, so apt removed an
@@ -373,9 +509,15 @@ step "Firewall: Ports 22, 80 und 443"
 FW_CHANGED=0
 DRY_SHIFT=0
 
-# Line number of the first REJECT rule in INPUT, empty if there is none.
+# Number of the first rule in INPUT that turns other traffic away, empty if there is
+# none: a REJECT rule, or an unconditional DROP rule ("-A INPUT -j DROP"; a DROP with
+# conditions, e.g. a ban of fail2ban for one address, does not count). The target is
+# the last "-j" of the line (a comment comes before it). No early exit in awk: with
+# pipefail, iptables could otherwise fail on a closed pipe.
 reject_pos() {
-  "$1" -L INPUT --line-numbers -n | awk 'NR > 2 && $2 == "REJECT" && !found { print $1; found = 1 }'
+  "$1" -S INPUT | awk '$1 == "-A" && !found { n++; t = ""
+      for (i = 3; i < NF; i++) if ($i == "-j") t = $(i + 1)
+      if (t == "REJECT" || $0 == "-A INPUT -j DROP") { print n; found = 1 } }'
 }
 
 # rule_numbers TOOL RULE...: numbers of the rules in INPUT that equal RULE exactly.
@@ -385,7 +527,8 @@ rule_numbers() {
   "$tool" -S INPUT | awk -v want="-A INPUT $*" '$1 == "-A" { n++; if ($0 == want) print n }'
 }
 
-# allow_port TOOL PORT: accept new TCP connections to PORT, before the REJECT rule.
+# allow_port TOOL PORT: accept new TCP connections to PORT, before the REJECT rule (or
+# the unconditional DROP rule, see reject_pos; "REJECT" below stands for both).
 # A rule only counts if it sits before the first REJECT; one behind it has no effect.
 #
 # The script never deletes or replaces firewall rules (no -D, no -R), it only inserts.
@@ -432,12 +575,13 @@ allow_port() {
     else
       open_note="der Port ist durch die Regel davor offen"
     fi
-    warn "$tool: Hinter der REJECT-Regel steht eine ACCEPT-Regel für Port $port. Sie ist wirkungslos ($open_note) und kann von Hand entfernt werden. Das Skript löscht keine Firewall-Regeln. Regelnummer anzeigen mit: sudo $tool -L INPUT --line-numbers -n (danach speichern: sudo netfilter-persistent save)"
+    warn "$tool: Hinter der abweisenden Regel (REJECT oder DROP) steht eine ACCEPT-Regel für Port $port. Sie ist wirkungslos ($open_note) und kann von Hand entfernt werden. Das Skript löscht keine Firewall-Regeln. Regelnummer anzeigen mit: sudo $tool -L INPUT --line-numbers -n (danach speichern: sudo netfilter-persistent save)"
   fi
 }
 
-# open_ports TOOL: open 22/80/443 if INPUT rejects (REJECT rule) or drops (policy not
-# ACCEPT) other traffic; otherwise everything is open anyway.
+# open_ports TOOL: open 22/80/443 if INPUT rejects (REJECT rule), drops (unconditional
+# DROP rule) or drops by policy (not ACCEPT) other traffic; otherwise everything is
+# open anyway.
 open_ports() {
   local tool=$1 policy port
   DRY_SHIFT=0
@@ -445,20 +589,20 @@ open_ports() {
   if [[ -n "$(reject_pos "$tool")" || $policy != ACCEPT ]]; then
     for port in 22 80 443; do allow_port "$tool" "$port"; done
   else
-    info "$tool: keine REJECT-Regel in INPUT und Policy ACCEPT, keine Regel nötig"
+    info "$tool: keine REJECT- oder abschließende DROP-Regel in INPUT und Policy ACCEPT, keine Regel nötig"
   fi
 }
 
 if ! iptables -L INPUT -n >/dev/null 2>&1; then
   if dry; then
-    info "[Testlauf] iptables nicht lesbar (kein root). Ein echter Lauf ermittelt die REJECT-Regel in INPUT und fügt davor ACCEPT für tcp 22, 80, 443 ein, falls sie fehlen."
+    info "[Testlauf] iptables nicht lesbar (kein root). Ein echter Lauf ermittelt die REJECT- oder abschließende DROP-Regel in INPUT und fügt davor ACCEPT für tcp 22, 80, 443 ein, falls sie fehlen."
   else
     echo "Abbruch: iptables lässt sich nicht lesen." >&2
     exit 1
   fi
 else
   open_ports iptables
-  # IPv6 like IPv4: REJECT rule (Oracle image) or policy DROP.
+  # IPv6 like IPv4: REJECT rule (Oracle image), unconditional DROP rule or policy DROP.
   if ip6tables -L INPUT -n >/dev/null 2>&1; then
     open_ports ip6tables
   else
@@ -486,7 +630,6 @@ fi
 # ---------------------------------------------------------------------------
 
 step "SSH: nur Schlüssel, kein root, nur $ADMIN_USER und $DEPLOY_USER"
-SSHD_CONF=/etc/ssh/sshd_config.d/10-haertung.conf
 # sshd uses the first value it reads; files in sshd_config.d are read in name order
 # before the rest of sshd_config, so "10-" wins over 50-cloud-init.conf and others.
 SSHD_HAD_FILE=0
@@ -496,9 +639,22 @@ if [[ -f $SSHD_CONF ]] && ! dry; then
   ensure_tmp_dir
   cp -p -- "$SSHD_CONF" "$TMP_DIR/sshd.old"
 fi
-# restore_sshd_conf REASON: put the previous file back (or remove the new one), stop.
-restore_sshd_conf() {
+# 1 once this run has written the drop-in (put below).
+SSHD_CHANGED=0
+# sshd_check_failed REASON: a check of the sshd configuration failed; stop without
+# reloading ssh. If this run wrote the drop-in, put the previous file back (or remove
+# the new one). If the drop-in is unchanged (from an earlier run), it stays: then
+# another file changed since, and only the abort message says what to do.
+sshd_check_failed() {
   local ok=1
+  if [[ $SSHD_CHANGED != 1 ]]; then
+    {
+      echo "Abbruch: $1"
+      echo "$SSHD_CONF ist unverändert (dieser Lauf hat sie nicht geändert) und bleibt, wie sie ist; SSH wurde nicht neu geladen. Die Konfiguration von sshd hat sich seit dem letzten Lauf an anderer Stelle geändert."
+      echo "Was zu tun ist: die genannte Ursache beheben, mit sudo sshd -t und sudo sshd -T -C $SSHD_TEST_SPEC prüfen und das Skript erneut starten. Bis dahin ssh nicht neu starten oder neu laden; auch ein Neustart des Servers (etwa der automatische um 04:00) übernimmt die geänderte Konfiguration."
+    } >&2
+    exit 1
+  fi
   if [[ $SSHD_HAD_FILE == 1 ]]; then
     cp -p -- "$TMP_DIR/sshd.old" "$SSHD_CONF" || ok=0
   else
@@ -510,16 +666,6 @@ restore_sshd_conf() {
     echo "Abbruch: $1 $SSHD_CONF ließ sich NICHT zurücksetzen. SSH wurde nicht neu geladen; die Datei vor dem nächsten Neustart von ssh von Hand prüfen!" >&2
   fi
   exit 1
-}
-# sshd_candidates KEYWORD: config files that mention KEYWORD (case-insensitive), apart
-# from the drop-in of this script. Only a hint for the abort message.
-sshd_candidates() {
-  local f found=()
-  for f in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
-    [[ -f $f && $f != "$SSHD_CONF" ]] || continue
-    if grep -qiE "^[[:space:]]*$1([[:space:]]|=)" "$f" 2>/dev/null; then found+=("$f"); fi
-  done
-  if ((${#found[@]} > 0)); then printf '%s' "${found[*]}"; else printf 'keine gefunden'; fi
 }
 # sshd_allowusers_problem VIEW OUTPUT USER: OUTPUT is what sshd -T (as VIEW) prints.
 # Prints why AllowUsers does not let USER in, nothing if it does.
@@ -565,24 +711,28 @@ sshd_deny_problem() {
     fi
   fi
 }
-# check_sshd_effective VIEW OUTPUT: OUTPUT is what sshd -T (as VIEW) prints. Puts the
-# previous drop-in back and stops if the hardening does not take effect or ADMIN_USER
-# would be locked out. sshd takes the first value it reads for PasswordAuthentication
+# check_sshd_effective VIEW OUTPUT: OUTPUT is what sshd -T (as VIEW) prints. Stops
+# (sshd_check_failed: the previous drop-in back if this run wrote it) if the hardening
+# does not take effect or ADMIN_USER would be locked out. sshd takes the first value it reads for PasswordAuthentication
 # and the like.
 check_sshd_effective() {
   local view=$1 eff=$2 setting key problem admin_groups
   # Without ADMIN_USER in AllowUsers the next login fails: never reload like that.
   problem=$(sshd_allowusers_problem "$view" "$eff" "$ADMIN_USER")
-  [[ -z $problem ]] || restore_sshd_conf "$problem"
+  [[ -z $problem ]] || sshd_check_failed "$problem"
   for setting in "passwordauthentication no" "kbdinteractiveauthentication no" "permitrootlogin no"; do
     if ! grep -qx "$setting" <<<"$eff"; then
       key=${setting%% *}
-      restore_sshd_conf "sshd verwendet nicht '$setting' (laut $view: '$(awk -v k="$key" '$1 == k' <<<"$eff")'). Vermutlich setzt eine Datei, die vor $SSHD_CONF gelesen wird (Name sortiert früher), oder ein Match-Block den Wert zuerst. Dateien mit $key: $(sshd_candidates "$key")."
+      sshd_check_failed "sshd verwendet nicht '$setting' (laut $view: '$(awk -v k="$key" '$1 == k' <<<"$eff")'). Vermutlich setzt eine Datei, die vor $SSHD_CONF gelesen wird (Name sortiert früher), oder ein Match-Block den Wert zuerst. Dateien mit $key: $(sshd_candidates "$key")."
     fi
   done
+  # Passwords are off now: a key alone must be enough (PubkeyAuthentication,
+  # AuthenticationMethods).
+  problem=$(sshd_auth_problem "$view" "$eff")
+  [[ -z $problem ]] || sshd_check_failed "$problem Ohne Passwort wäre $ADMIN_USER ausgesperrt."
   admin_groups=$(id -nG "$ADMIN_USER" 2>/dev/null) || admin_groups=""
   problem=$(sshd_deny_problem "$view" "$eff" "$ADMIN_USER" "$admin_groups")
-  [[ -z $problem ]] || restore_sshd_conf "$problem"
+  [[ -z $problem ]] || sshd_check_failed "$problem"
 }
 # check_sshd_deploy VIEW OUTPUT: the same access checks for the user deploy of the CI,
 # but only as a warning: the admin login is not affected, the deploy of the CI would
@@ -608,27 +758,38 @@ KbdInteractiveAuthentication no
 PermitRootLogin no
 AllowUsers ${ADMIN_USER} ${DEPLOY_USER}
 CONF
+  SSHD_CHANGED=1
+fi
+# The checks only read and run on every real run, also when the drop-in is unchanged:
+# another file (a later drop-in, a Match block, a package update) can have changed the
+# effective configuration since the last run.
+if ! dry; then
   # The checks created /run/sshd; a package update in step 1 may have stopped ssh since,
   # which removes it again. Without it sshd -t fails.
-  [[ -d /run/sshd ]] || run install -d -m 0755 /run/sshd
-  if ! dry; then
-    sshd -t || restore_sshd_conf "sshd -t meldet einen Fehler."
-    effective=$(sshd -T 2>/dev/null) || restore_sshd_conf "sshd -T meldet einen Fehler, die wirksame Konfiguration ist unbekannt."
-    effective_admin=$(sshd -T -C "$SSHD_TEST_SPEC" 2>/dev/null) ||
-      restore_sshd_conf "sshd -T -C $SSHD_TEST_SPEC meldet einen Fehler, die wirksame Konfiguration für $ADMIN_USER ist unbekannt."
-    # Global values, and the values for ADMIN_USER after Match blocks.
-    check_sshd_effective "sshd -T" "$effective"
-    check_sshd_effective "sshd -T -C $SSHD_TEST_SPEC" "$effective_admin"
-    # The same for deploy, only as a warning (check_sshd_deploy).
-    if effective_deploy=$(sshd -T -C "$SSHD_DEPLOY_SPEC" 2>/dev/null); then
-      check_sshd_deploy "sshd -T" "$effective"
-      check_sshd_deploy "sshd -T -C $SSHD_DEPLOY_SPEC" "$effective_deploy"
-    else
-      warn "sshd -T -C $SSHD_DEPLOY_SPEC meldet einen Fehler, ob $DEPLOY_USER (CI) sich anmelden kann, ist ungeprüft."
-    fi
+  [[ -d /run/sshd ]] || install -d -m 0755 /run/sshd ||
+    sshd_check_failed "/run/sshd ließ sich nicht anlegen (nötig für sshd -t)."
+  sshd -t || sshd_check_failed "sshd -t meldet einen Fehler."
+  effective=$(sshd -T 2>/dev/null) || sshd_check_failed "sshd -T meldet einen Fehler, die wirksame Konfiguration ist unbekannt."
+  effective_admin=$(sshd -T -C "$SSHD_TEST_SPEC" 2>/dev/null) ||
+    sshd_check_failed "sshd -T -C $SSHD_TEST_SPEC meldet einen Fehler, die wirksame Konfiguration für $ADMIN_USER ist unbekannt."
+  # Global values, and the values for ADMIN_USER after Match blocks.
+  check_sshd_effective "sshd -T" "$effective"
+  check_sshd_effective "sshd -T -C $SSHD_TEST_SPEC" "$effective_admin"
+  # The same for deploy, only as a warning (check_sshd_deploy).
+  if effective_deploy=$(sshd -T -C "$SSHD_DEPLOY_SPEC" 2>/dev/null); then
+    check_sshd_deploy "sshd -T" "$effective"
+    check_sshd_deploy "sshd -T -C $SSHD_DEPLOY_SPEC" "$effective_deploy"
   else
-    info "[Testlauf] sshd -t, danach Prüfung mit sshd -T und sshd -T -C $SSHD_TEST_SPEC: AllowUsers enthält $ADMIN_USER, PasswordAuthentication, KbdInteractiveAuthentication und PermitRootLogin sind no, DenyUsers, AllowGroups und DenyGroups schließen $ADMIN_USER nicht aus; dasselbe für $DEPLOY_USER mit sshd -T -C $SSHD_DEPLOY_SPEC, dort nur als Warnung"
+    warn "sshd -T -C $SSHD_DEPLOY_SPEC meldet einen Fehler, ob $DEPLOY_USER (CI) sich anmelden kann, ist ungeprüft."
   fi
+  if [[ $SSHD_CHANGED == 0 ]]; then
+    info "in Ordnung: sshd -t und sshd -T (global, für $ADMIN_USER und $DEPLOY_USER) ohne Befund"
+  fi
+else
+  [[ -d /run/sshd ]] || run install -d -m 0755 /run/sshd
+  info "[Testlauf] sshd -t, danach Prüfung mit sshd -T und sshd -T -C $SSHD_TEST_SPEC (bei jedem echten Lauf, auch wenn $SSHD_CONF unverändert bleibt): AllowUsers enthält $ADMIN_USER, PasswordAuthentication, KbdInteractiveAuthentication und PermitRootLogin sind no, PubkeyAuthentication ist yes, AuthenticationMethods ist any oder hat eine Liste nur mit publickey, DenyUsers, AllowGroups und DenyGroups schließen $ADMIN_USER nicht aus; dasselbe für $DEPLOY_USER mit sshd -T -C $SSHD_DEPLOY_SPEC, dort nur als Warnung"
+fi
+if [[ $SSHD_CHANGED == 1 ]]; then
   cat <<'TEXT'
 
    ################################################################
@@ -709,7 +870,8 @@ F2B_WANT=(
 )
 # Prints "key=value" for logtarget, dbpurgeage and maxretry, findtime, bantime and
 # bantime.increment of the jail sshd, read from the output of fail2ban-client -d on
-# stdin; times in seconds. A time fail2ban's parser does not accept is printed as it is
+# stdin; times in seconds. "jails" lists the names of all jails fail2ban would start
+# (['add', 'sshd', 'systemd'] in the dump), separated by spaces. A time fail2ban's parser does not accept is printed as it is
 # (and then differs). bantime.increment would make repeated bans longer than bantime;
 # the dump shows it only if it is set, as a boolean (['set', 'sshd',
 # 'bantime.increment', True], fail2ban 1.0.2), so a missing value counts as false.
@@ -721,6 +883,7 @@ import sys
 from fail2ban.server.mytime import MyTime
 
 vals = {}
+jails = set()
 for line in sys.stdin:
     line = line.strip()
     if not line.startswith("["):
@@ -731,6 +894,8 @@ for line in sys.stdin:
         continue  # not a command line of the dump
     if not isinstance(c, list):
         continue
+    if len(c) >= 2 and c[0] == "add":
+        jails.add(str(c[1]))
     if len(c) == 3 and c[0] == "set" and c[1] in ("logtarget", "dbpurgeage"):
         vals[c[1]] = str(c[2])
     elif len(c) == 4 and c[:2] == ["set", "sshd"] and c[2] in ("maxretry", "findtime", "bantime"):
@@ -738,6 +903,7 @@ for line in sys.stdin:
     elif len(c) == 4 and c[:3] == ["set", "sshd", "bantime.increment"]:
         vals["sshd.bantime.increment"] = str(c[3]).lower()
 vals.setdefault("sshd.bantime.increment", "false")
+vals["jails"] = " ".join(sorted(jails))
 for k in ("dbpurgeage", "sshd.findtime", "sshd.bantime"):
     if k in vals:
         try:
@@ -792,6 +958,12 @@ else
     exit 1
   fi
   info "in Ordnung: fail2ban-client -d zeigt logtarget SYSLOG[facility=AUTHPRIV], dbpurgeage 86400 s, sshd maxretry 5, findtime 600 s, bantime 600 s, bantime.increment aus"
+  # The privacy policy names only the jail sshd. Other jails (e.g. recidive, which bans
+  # for a week by default) ban with their own values; the script does not check them.
+  f2b_other=$(awk 'index($0, "jails=") == 1 { n = split(substr($0, 7), j, " "); for (i = 1; i <= n; i++) if (j[i] != "sshd") { printf "%s%s", sep, j[i]; sep = " " } }' <<<"$f2b_got")
+  if [[ -n $f2b_other ]]; then
+    warn "In fail2ban sind außer sshd weitere Jails aktiv: $f2b_other. Ihre Sperrdauer und Werte prüft das Skript nicht, sie entsprechen nicht der Datenschutzerklärung (dort nur: Sperre für 10 Minuten nach 5 Fehlversuchen in 10 Minuten). Jail abschalten (enabled = false) oder die Datenschutzerklärung anpassen. Anzeigen mit: sudo fail2ban-client status"
+  fi
 fi
 if [[ $F2B_CHANGED == 1 ]]; then
   run systemctl restart fail2ban
@@ -806,8 +978,8 @@ fi
 # The privacy policy (site/src/texte/datenschutz.md, "Schutz des Servers vor
 # Angriffen") says: the server stores IP address, time and user name of SSH login
 # attempts; fail2ban reads them, bans whoever fails 5 times within 10 minutes for
-# 10 minutes, and deletes its list of banned addresses after one day; logs of the server
-# with IP addresses, those of fail2ban included, are deleted after 7 days. Change these
+# 10 minutes, and deletes its list of banned addresses after one day; the logs of SSH
+# login attempts, those of fail2ban included, are deleted after 7 days. Change these
 # values only together with the privacy policy.
 #
 # fail2ban: the values equal the package defaults of Ubuntu 24.04 (fail2ban 1.0.2,
@@ -1065,7 +1237,16 @@ else
   run usermod -aG docker "$DEPLOY_USER"
   changed
 fi
-DEPLOY_SSH="/home/$DEPLOY_USER/.ssh"
+# Home directory from getent passwd. In a dry run on a fresh server deploy does not
+# exist yet; useradd then creates /home/deploy.
+DEPLOY_HOME=$(getent passwd "$DEPLOY_USER" | cut -d: -f6) || DEPLOY_HOME=""
+if [[ -z $DEPLOY_HOME ]] && dry; then
+  DEPLOY_HOME="/home/$DEPLOY_USER"
+elif [[ $DEPLOY_HOME != /* ]]; then
+  echo "Abbruch: Home-Verzeichnis von $DEPLOY_USER nicht ermittelbar (getent passwd $DEPLOY_USER)." >&2
+  exit 1
+fi
+DEPLOY_SSH="$DEPLOY_HOME/.ssh"
 if [[ -f $DEPLOY_SSH/authorized_keys ]]; then
   info "unverändert: $DEPLOY_SSH/authorized_keys existiert (Inhalt bleibt erhalten)"
 else

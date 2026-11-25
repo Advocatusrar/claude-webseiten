@@ -53,9 +53,12 @@ Das Skript lässt sich gefahrlos ein zweites Mal ausführen und meldet dann 0 Ä
 - `ADMIN_USER` ist kein gültiger Benutzername (nur Kleinbuchstaben, Ziffern, `_` und
   `-`), der Benutzer existiert nicht, oder er heißt `root` oder `deploy`.
 - Das Skript wurde per `sudo` von einem anderen Benutzer als `ADMIN_USER` aufgerufen
-  (Variable `SUDO_USER`). Danach dürfte nur noch `ADMIN_USER` per SSH herein, der
-  aufrufende Benutzer wäre ausgesperrt. Abhilfe: `ADMIN_USER` auf deinen Benutzer
-  setzen, z. B. `sudo ADMIN_USER=name bash setup-server.sh`.
+  (Variable `SUDO_USER`), oder die Audit-Login-UID (`/proc/self/loginuid`, bleibt auch
+  nach `sudo -i` oder `su` erhalten) gehört weder root noch `ADMIN_USER`. Danach dürfte
+  nur noch `ADMIN_USER` per SSH herein, der angemeldete Benutzer wäre ausgesperrt.
+  Abhilfe: `ADMIN_USER` auf deinen Benutzer setzen, z. B.
+  `sudo ADMIN_USER=name bash setup-server.sh`. Eine nicht gesetzte Login-UID
+  (4294967295) zählt nicht.
 - In der Schlüsseldatei von `ADMIN_USER` steht kein Schlüssel (fehlt, leer oder nur
   Kommentare). Geprüft wird die Datei, die sshd für diesen Benutzer liest
   (`AuthorizedKeysFile` laut `sshd -T`, relativ zum Home-Verzeichnis aus
@@ -64,6 +67,11 @@ Das Skript lässt sich gefahrlos ein zweites Mal ausführen und meldet dann 0 Ä
   warnt das Skript.
 - `sshd -T` liefert für `ADMIN_USER` keine wirksame Konfiguration. Ohne sie lässt sich
   die Schlüsseldatei nicht sicher bestimmen; das Skript rät dann nicht.
+- Die bestehende Konfiguration erlaubt keine Anmeldung nur mit Schlüssel (`sshd -T`
+  global und `sshd -T -C user=ADMIN_USER,…`): `PubkeyAuthentication` ist nicht `yes`,
+  oder `AuthenticationMethods` ist nicht `any` und keine seiner Listen besteht nur aus
+  `publickey` (z. B. `publickey,password`). Nach dem Abschalten der Passwörter wäre
+  `ADMIN_USER` sonst ausgesperrt.
 - Eines der Pakete `docker.io`, `docker-compose`, `docker-compose-v2`, `docker-doc`
   oder `podman-docker` ist installiert. Sie kollidieren mit Docker aus dem offiziellen
   Repository; erst mit `sudo apt-get remove <paket>` entfernen.
@@ -81,24 +89,36 @@ Prüfung an, weil `sshd -T` es braucht. sshd legt es bei jedem Start ohnehin sel
 Ursache einfach erneut starten):
 
 - Eine Konfigurationsdatei lässt sich nicht schreiben. Die bisherige Datei bleibt.
+- Die Paketinstallation hat die Firewall verändert: In `INPUT` (IPv4 oder IPv6) fehlt
+  danach die abschließende `REJECT`- oder `DROP`-Regel, die vorher da war, oder die
+  Policy ist von `DROP` auf `ACCEPT` gewechselt. Das kann passieren, wenn apt UFW
+  entfernt (dessen `prerm` ruft `ufw-init stop`). Gespeichert wird dabei nichts:
+  `iptables-persistent` ist so vorbelegt, dass es bei der Installation nicht speichert
+  (`autosave_v4` und `autosave_v6` `false`), `/etc/iptables/rules.v4` und `rules.v6`
+  enthalten also noch die bisherigen Regeln. Ein Neustart lädt sie wieder, sofort von
+  Hand mit `sudo iptables-restore < /etc/iptables/rules.v4` (IPv6 entsprechend).
 - `sshd -t` meldet einen Fehler, `sshd -T` scheitert, oder die wirksame Konfiguration
   (`sshd -T` global und `sshd -T -C user=ADMIN_USER,…` nach `Match`-Blöcken) erfüllt
   eine dieser Bedingungen nicht: `ADMIN_USER` steht in `AllowUsers`;
   `PasswordAuthentication`, `KbdInteractiveAuthentication` und `PermitRootLogin` sind
-  `no`; `DenyUsers` nennt `ADMIN_USER` nicht; ist `AllowGroups` gesetzt, ist
-  `ADMIN_USER` in einer dieser Gruppen; `DenyGroups` nennt keine seiner Gruppen. Dann
-  wird `/etc/ssh/sshd_config.d/10-haertung.conf` zurückgesetzt und SSH nicht neu
-  geladen. Die Meldung nennt die Dateien, die den Wert vermutlich vorher setzen (sshd
-  nimmt den ersten Wert; Dateien in `sshd_config.d` mit früher sortiertem Namen werden
-  zuerst gelesen).
+  `no`; `PubkeyAuthentication` ist `yes`; `AuthenticationMethods` ist `any` oder hat
+  eine Liste nur aus `publickey`; `DenyUsers` nennt `ADMIN_USER` nicht; ist
+  `AllowGroups` gesetzt, ist `ADMIN_USER` in einer dieser Gruppen; `DenyGroups` nennt
+  keine seiner Gruppen. Geprüft wird bei jedem Lauf, auch wenn
+  `/etc/ssh/sshd_config.d/10-haertung.conf` unverändert bleibt. Hat dieser Lauf die
+  Datei geändert, wird sie zurückgesetzt; ist sie unverändert, bleibt sie, und die
+  Meldung sagt, was zu tun ist. SSH wird in beiden Fällen nicht neu geladen. Die Meldung
+  nennt die Dateien, die den Wert vermutlich vorher setzen (sshd nimmt den ersten Wert;
+  Dateien in `sshd_config.d` mit früher sortiertem Namen werden zuerst gelesen).
 - `fail2ban-client -t` meldet einen Fehler in `/etc/fail2ban/fail2ban.local` oder
   `/etc/fail2ban/jail.local`.
-- Die wirksamen Werte von fail2ban laut `fail2ban-client -d` sind nicht die der
-  Datenschutzerklärung: `logtarget` `SYSLOG[facility=AUTHPRIV]`, `dbpurgeage` 86400
-  Sekunden, im Jail `sshd` `maxretry` 5, `findtime` und `bantime` je 600 Sekunden (Zeiten
-  mit dem Parser von fail2ban umgerechnet, `10m` gilt also wie `600`), `bantime.increment`
-  ist für `sshd` aktiv (das würde wiederholte Sperren verlängern), oder der Jail `sshd`
-  ist nicht aktiv. Geprüft wird bei jedem Lauf, vor dem Neustart von fail2ban.
+- Die wirksamen Werte von fail2ban laut `fail2ban-client -d` weichen von denen der
+  Datenschutzerklärung ab, oder der Jail `sshd` ist nicht aktiv. Sollwerte:
+  `logtarget` `SYSLOG[facility=AUTHPRIV]`, `dbpurgeage` 86400 Sekunden, im Jail `sshd`
+  `maxretry` 5, `findtime` und `bantime` je 600 Sekunden (Zeiten mit dem Parser von
+  fail2ban umgerechnet, `10m` gilt also wie `600`) und `bantime.increment` aus (aktiv
+  würde es wiederholte Sperren verlängern). Geprüft wird bei jedem Lauf, vor dem
+  Neustart von fail2ban.
   fail2ban liest `jail.d/*.local` nach `jail.local` und `fail2ban.d/*.local` nach
   `fail2ban.local`, der zuletzt gelesene Wert gilt; eine fremde Datei dort kann die Werte
   also überstimmen. Die Meldung nennt die Dateien, die den Wert vermutlich setzen. Das
@@ -108,13 +128,14 @@ Ursache einfach erneut starten):
   `9DC8 5822 9FC7 DD38 854A E2D8 8D81 803C 0EBF CD88`. Dann wird nichts von Docker
   installiert.
 - iptables lässt sich nicht lesen.
+- Das Home-Verzeichnis von `deploy` lässt sich nicht ermitteln (`getent passwd deploy`).
 
 Was es einrichtet:
 
 - System-Updates (`apt-get full-upgrade`), automatische Sicherheitsupdates, bei Bedarf
   Neustart um 04:00
   (Zeitzone des Servers: Europe/Berlin)
-- SSH nur mit Schlüssel, kein Root-Login, nur die Benutzer `ubuntu` und `deploy`
+- SSH nur mit Schlüssel, kein Root-Login, nur die Benutzer `ADMIN_USER` und `deploy`
   (`/etc/ssh/sshd_config.d/10-haertung.conf`). Die Prüfungen von `AllowUsers`,
   `DenyUsers`, `AllowGroups` und `DenyGroups` laufen auch für `deploy` (mit
   `sshd -T -C user=deploy,…`; auf einem frischen Server, wo das Skript `deploy` erst
@@ -127,7 +148,9 @@ Was es einrichtet:
   `/var/log/fail2ban.log` über syslog mit der Facility `authpriv` ins Journal und, falls
   rsyslog installiert ist, nach `/var/log/auth.log`, nicht nach `/var/log/syslog`
   (`logtarget = SYSLOG[facility=AUTHPRIV]` in `/etc/fail2ban/fail2ban.local`). Ob diese
-  Werte auch wirken, prüft das Skript mit `fail2ban-client -d` (siehe oben).
+  Werte auch wirken, prüft das Skript mit `fail2ban-client -d` (siehe oben). Sind außer
+  `sshd` weitere Jails aktiv (z. B. `recidive`), warnt es: Deren Sperrdauer prüft es
+  nicht, sie entspricht nicht der Datenschutzerklärung.
 - Protokolle mit IP-Adressen werden nach etwa 7 Tagen gelöscht, wie in der
   Datenschutzerklärung angegeben: im Journal
   (`/etc/systemd/journald.conf.d/10-aufbewahrung.conf`) und, falls logrotate vorhanden
@@ -140,13 +163,19 @@ Was es einrichtet:
   Die Dateien der Pakete in `/etc/logrotate.d` bleiben unverändert.
 - Firewall über die iptables-Regeln des Oracle-Images (kein UFW; ein installiertes,
   inaktives UFW entfernt apt mit `iptables-persistent`): Ports 22, 80 und 443
-  für IPv4 und IPv6, wenn `INPUT` andere Verbindungen abweist (`REJECT`-Regel oder
-  Policy `DROP`). Das Skript fügt nur Regeln ein und löscht keine. Eine wirkungslose
-  Kopie hinter `REJECT` bleibt stehen, das Skript warnt bei jedem Lauf; entfernen von
-  Hand (Nummer mit `sudo iptables -L INPUT --line-numbers -n`).
+  für IPv4 und IPv6, wenn `INPUT` andere Verbindungen abweist (`REJECT`-Regel,
+  abschließende Regel `-j DROP` ohne Bedingung oder Policy `DROP`); die ACCEPT-Regeln
+  kommen vor die `REJECT`- bzw. `DROP`-Regel. Das Skript fügt nur Regeln ein und löscht
+  keine. Eine wirkungslose Kopie hinter `REJECT` bleibt stehen, das Skript warnt bei
+  jedem Lauf; entfernen von Hand (Nummer mit `sudo iptables -L INPUT --line-numbers -n`).
+  Gespeichert (`netfilter-persistent save`) wird nur nach diesen Prüfungen und nur, wenn
+  das Skript eine Regel eingefügt hat. Hat `INPUT` schon vor der Installation weder eine
+  abschließende `REJECT`- oder `DROP`-Regel noch die Policy `DROP`, warnt das Skript (auf
+  Oracle unerwartet).
 - Docker aus dem offiziellen Repository (Signaturschlüssel per Fingerabdruck geprüft)
   mit begrenzten Logs, ohne TCP-Socket
-- Benutzer `deploy` in der Gruppe `docker`, mit leerer `authorized_keys`
+- Benutzer `deploy` in der Gruppe `docker`, mit leerer `authorized_keys` (im
+  Home-Verzeichnis laut `getent passwd`, im Normalfall `/home/deploy/.ssh`)
 
 Optionen: `sudo DRY_RUN=1 bash setup-server.sh` zeigt nur, was geschehen würde.
 `sudo ADMIN_USER=name bash setup-server.sh`, falls euer Login-Benutzer nicht `ubuntu` ist.
