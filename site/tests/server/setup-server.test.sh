@@ -12,6 +12,9 @@
 #   timedatectl, curl, netfilter-persistent, ...) are stubs that log their
 #   arguments. iptables, sshd, fail2ban-client, useradd and usermod are the real
 #   tools (inside the sandbox), wrapped so that their calls are logged too.
+# - logrotate: the package state comes from the dpkg-query stub (SC_DPKG), the program
+#   from the fixture (SC_LOGROTATE_BIN=1: a stub at /usr/sbin/logrotate inside the
+#   sandbox; otherwise there is no logrotate in the PATH of the script).
 # - The curl stub serves Docker's real public apt key (fixtures/docker.asc), or for
 #   the negative tests a key generated for this run with another fingerprint.
 # - A fresh server has no group docker; the apt-get stub creates it when docker-ce
@@ -336,6 +339,23 @@ CONF
 CONF
     chmod 644 /etc/logrotate.d/btmp /etc/logrotate.d/wtmp /etc/logrotate.d/fail2ban
   fi
+  # The program logrotate, which the package installs as /usr/sbin/logrotate. The
+  # script counts logrotate as there only if the package is installed (SC_DPKG) and the
+  # program is in its PATH. SC_LOGROTATE_BIN=1: a stub at /usr/sbin/logrotate that only
+  # logs its calls; otherwise no logrotate in the PATH of the script, even if the host
+  # has one. $art/lr_bin: what "command -v logrotate" finds there ("none": nothing).
+  for d in ${SANDBOX_PATH_TAIL//:/ }; do
+    if [[ -e $d/logrotate || -L $d/logrotate ]]; then rm -f "$d/logrotate"; fi
+  done
+  if [[ ${SC_LOGROTATE_BIN:-0} == 1 ]]; then
+    cat >/usr/sbin/logrotate <<'EOF'
+#!/bin/sh
+# logrotate (test stub): only logs its calls.
+{ printf 'logrotate'; printf ' %s' "$@"; printf '\n'; } >>"${STUB_LOG:-/dev/null}"
+EOF
+    chmod 755 /usr/sbin/logrotate
+  fi
+  PATH="$STUBS:$SANDBOX_PATH_TAIL" bash -c 'command -v logrotate || echo none' >"$art/lr_bin"
   # Package defaults that differ from the values in the privacy policy (as after a
   # changed default), in files fail2ban reads before fail2ban.local and jail.local.
   # fail2ban-client -d before the run shows that they take effect.
@@ -1711,11 +1731,12 @@ t_auth_logrotate() { # SCENARIO
 }
 
 # rsyslog not installed (unknown to dpkg, or removed with only its conffiles left):
-# no 00-auth-log and no other new file in /etc/logrotate.d; a leftover
-# /etc/logrotate.d/rsyslog stays as it is. The run reached the log retention step and
-# asked dpkg-query about rsyslog.
+# no 00-auth-log and no other new file in /etc/logrotate.d apart from 00-login-logs and
+# 00-fail2ban-log (written when logrotate is there; t_lr_file and t_no_lr check them);
+# a leftover /etc/logrotate.d/rsyslog stays as it is. The run reached the log retention
+# step and asked dpkg-query about rsyslog.
 t_no_auth_logrotate() { # SCENARIO
-  local ok=1 a dir new s0 d
+  local ok=1 a dir new f s0 d
   have_run "$1" 1 || return 1
   a=$(art "$1")
   [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)"
@@ -1723,7 +1744,12 @@ t_no_auth_logrotate() { # SCENARIO
   grep -qE '^dpkg-query( .*)? rsyslog$' "$a/log1" || no "the script did not ask dpkg-query whether rsyslog is installed"
   dir="$(upper "$1" etc)/logrotate.d"
   [[ ! -f $dir/00-auth-log ]] || no "$AUTH_LOGROTATE written although rsyslog is not installed:" "$(cat "$dir/00-auth-log")"
-  new=$(find "$dir" -mindepth 1 -type f ! -name rsyslog 2>/dev/null)
+  new=""
+  for f in "$dir"/*; do
+    [[ -f $f ]] || continue
+    case ${f##*/} in 00-login-logs | 00-fail2ban-log) continue ;; esac
+    [[ -n $(snap_of "$1" 0 "/etc/logrotate.d/${f##*/}") ]] || new+="$f"$'\n'
+  done
   [[ -z $new ]] || no "new files in /etc/logrotate.d:" "$new"
   s0=$(snap_of "$1" 0 "$RSYSLOG_LOGROTATE")
   if [[ -n $s0 ]]; then
@@ -2337,16 +2363,22 @@ PermitRootLogin yes"
   scenario dry_after_reject SC_DRY_RUN=1 SC_FW=accept_after_reject SC_V6=copies_after_reject
   scenario race_insert SC_FW=accept_after_reject SC_V6=none SC_IPT_RACE=insert
   # Log retention
-  scenario rsyslog "SC_DPKG=rsyslog=install ok installed" SC_LOGROTATE_RSYSLOG=1 SC_RUNS=2
-  scenario rsyslog_removed "SC_DPKG=rsyslog=deinstall ok config-files" SC_LOGROTATE_RSYSLOG=1
-  scenario rsyslog_hold "SC_DPKG=rsyslog=hold ok installed" SC_LOGROTATE_RSYSLOG=1 SC_RUNS=2
-  scenario dry_rsyslog SC_DRY_RUN=1 "SC_DPKG=rsyslog=install ok installed" SC_LOGROTATE_RSYSLOG=1
+  # 00-auth-log needs logrotate (package and program) as well, so the rsyslog
+  # scenarios have it.
+  scenario rsyslog "SC_DPKG=$(printf '%s\n' 'rsyslog=install ok installed' 'logrotate=install ok installed')" \
+    SC_LOGROTATE_BIN=1 SC_LOGROTATE_RSYSLOG=1 SC_RUNS=2
+  scenario rsyslog_removed "SC_DPKG=$(printf '%s\n' 'rsyslog=deinstall ok config-files' 'logrotate=install ok installed')" \
+    SC_LOGROTATE_BIN=1 SC_LOGROTATE_RSYSLOG=1
+  scenario rsyslog_hold "SC_DPKG=$(printf '%s\n' 'rsyslog=hold ok installed' 'logrotate=install ok installed')" \
+    SC_LOGROTATE_BIN=1 SC_LOGROTATE_RSYSLOG=1 SC_RUNS=2
+  scenario dry_rsyslog SC_DRY_RUN=1 "SC_DPKG=$(printf '%s\n' 'rsyslog=install ok installed' 'logrotate=install ok installed')" \
+    SC_LOGROTATE_BIN=1 SC_LOGROTATE_RSYSLOG=1
   scenario journald_old SC_JOURNALD_OLD=1
-  scenario lr "SC_DPKG=logrotate=install ok installed" SC_LOGROTATE_PKG=1 SC_RUNS=2
+  scenario lr "SC_DPKG=logrotate=install ok installed" SC_LOGROTATE_BIN=1 SC_LOGROTATE_PKG=1 SC_RUNS=2
   scenario lr_rsyslog "SC_DPKG=$(printf '%s\n' 'rsyslog=install ok installed' 'logrotate=hold ok installed')" \
-    SC_LOGROTATE_PKG=1 SC_LOGROTATE_RSYSLOG=1
+    SC_LOGROTATE_BIN=1 SC_LOGROTATE_PKG=1 SC_LOGROTATE_RSYSLOG=1
   scenario lr_removed "SC_DPKG=logrotate=deinstall ok config-files" SC_LOGROTATE_PKG=1
-  scenario dry_lr SC_DRY_RUN=1 "SC_DPKG=logrotate=install ok installed" SC_LOGROTATE_PKG=1
+  scenario dry_lr SC_DRY_RUN=1 "SC_DPKG=logrotate=install ok installed" SC_LOGROTATE_BIN=1 SC_LOGROTATE_PKG=1
   # fail2ban values of the privacy policy
   scenario f2b_defaults SC_F2B_DEFAULTS=1
   scenario f2b_edit_local SC_RUNS=2 SC_F2B_EDIT=local
@@ -2499,7 +2531,7 @@ PermitRootLogin yes"
   check "log retention: rsyslog installed and held (hold ok installed): 00-auth-log as above, logrotate.d/rsyslog unchanged" \
     t_auth_logrotate rsyslog_hold
   check "log retention: rsyslog not installed: no 00-auth-log" t_no_auth_logrotate fresh
-  check "log retention: rsyslog removed, conffiles left (deinstall ok config-files): no 00-auth-log, logrotate.d/rsyslog unchanged" \
+  check "log retention: rsyslog removed, conffiles left (deinstall ok config-files), logrotate installed: no 00-auth-log, logrotate.d/rsyslog unchanged" \
     t_no_auth_logrotate rsyslog_removed
   check "dry run with rsyslog: shows journald drop-in and 00-auth-log with their content, changes nothing" \
     t_dry_log_retention dry_rsyslog 1
