@@ -119,6 +119,55 @@ COMMIT
 RULES
 }
 
+# Like the Oracle rules, but INPUT ends with an unconditional DROP instead of REJECT. A
+# conditional DROP at the top (a ban of one address, like fail2ban's) must not count as
+# the rule that turns other traffic away.
+drop_rule_v4() {
+  cat <<'RULES'
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -s 192.0.2.99/32 -j DROP
+-A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+-A INPUT -p icmp -j ACCEPT
+-A INPUT -i lo -j ACCEPT
+-A INPUT -p tcp -m state --state NEW -m tcp --dport 22 -j ACCEPT
+-A INPUT -j DROP
+COMMIT
+RULES
+}
+
+drop_rule_v6() {
+  cat <<'RULES'
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -s 2001:db8::99/128 -j DROP
+-A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+-A INPUT -p ipv6-icmp -j ACCEPT
+-A INPUT -i lo -j ACCEPT
+-A INPUT -p tcp -m state --state NEW -m tcp --dport 22 -j ACCEPT
+-A INPUT -j DROP
+COMMIT
+RULES
+}
+
+# Policy ACCEPT and only conditional DROP rules: nothing turns other traffic away.
+cond_drop_v4() {
+  cat <<'RULES'
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -s 192.0.2.99/32 -j DROP
+-A INPUT -p tcp -m tcp --dport 23 -j DROP
+-A INPUT -i lo -j ACCEPT
+COMMIT
+RULES
+}
+
 # put_key USER CONTENT [WHERE]: WHERE is "home" (home directory from getent passwd,
 # default), "legacy_home" (/home/USER, whatever passwd says) or "etc"
 # (/etc/ssh/authorized_keys/USER, owned by root).
@@ -259,10 +308,18 @@ fixture() {
       iptables -A INPUT -p tcp -m state --state NEW -m tcp --dport 80 -j ACCEPT
       ;;
     drop_policy) drop_policy_v4 | iptables-restore ;;
+    drop_rule) drop_rule_v4 | iptables-restore ;;
+    cond_drop) cond_drop_v4 | iptables-restore ;;
+    # Policy ACCEPT, nothing that turns traffic away (one rule: dump_fw needs a line).
+    open) printf '%s\n' '*filter' ':INPUT ACCEPT [0:0]' '-A INPUT -i lo -j ACCEPT' 'COMMIT' | iptables-restore ;;
+    # The final REJECT of the Oracle rules with a comment in front of the target.
+    oracle_comment) oracle_v4 | sed -E 's/^-A INPUT -j REJECT/-A INPUT -m comment --comment final-reject -j REJECT/' | iptables-restore ;;
   esac
   case ${SC_V6:-reject} in
     reject) oracle_v6 | ip6tables-restore ;;
     drop_policy) drop_policy_v6 | ip6tables-restore ;;
+    drop_rule) drop_rule_v6 | ip6tables-restore ;;
+    open) printf '%s\n' '*filter' ':INPUT ACCEPT [0:0]' '-A INPUT -i lo -j ACCEPT' 'COMMIT' | ip6tables-restore ;;
     copies_after_reject)
       oracle_v6 | ip6tables-restore
       # Copies appended after the REJECT: 22 is open before it anyway, 443 is not.
@@ -270,6 +327,17 @@ fixture() {
       ip6tables -A INPUT -p tcp -m state --state NEW -m tcp --dport 443 -j ACCEPT
       ;;
   esac
+  # Rules saved earlier (netfilter-persistent), as on a server where they were saved
+  # before: a run that aborts must leave these files as they are.
+  if [[ ${SC_RULES_SAVED:-0} == 1 ]]; then
+    mkdir -p /etc/iptables
+    iptables-save >/etc/iptables/rules.v4
+    ip6tables-save >/etc/iptables/rules.v6
+  fi
+  # deploy exists already, with a home directory other than /home/deploy.
+  if [[ -n ${SC_DEPLOY_HOME:-} ]]; then
+    useradd --create-home --home-dir "$SC_DEPLOY_HOME" --shell /bin/bash deploy
+  fi
 
   # No log retention or fail2ban file of the host leaks into a scenario.
   rm -f /etc/logrotate.d/00-auth-log /etc/systemd/journald.conf.d/10-aufbewahrung.conf \
@@ -456,6 +524,8 @@ run_setup() {
     STUB_IPT_RACE="${SC_IPT_RACE:-}"
     STUB_DPKG="${SC_DPKG:-}"
     STUB_UFW="${SC_UFW:-inactive}"
+    STUB_APT_FW="${SC_APT_FW:-}"
+    STUB_APT_SSHD_MATCH="${SC_APT_SSHD_MATCH:-}"
   )
   if [[ -n ${SC_DRY_RUN+x} ]]; then envs+=(DRY_RUN="$SC_DRY_RUN"); fi
   if [[ -n ${SC_ADMIN_USER+x} ]]; then envs+=(ADMIN_USER="$SC_ADMIN_USER"); fi
@@ -485,13 +555,19 @@ run_setup() {
 }
 
 post_checks() {
-  local art=$1
+  local art=$1 dh
   /usr/sbin/sshd -T >"$art/sshd_T" 2>&1 || true
+  /usr/sbin/sshd -T -C user=ubuntu,host=localhost,addr=127.0.0.1 >"$art/sshd_T_admin" 2>&1 || true
   apt-config dump >"$art/aptconf" 2>&1 || true
   fail2ban-client -d >"$art/f2b_dump" 2>/dev/null || true
   getent passwd deploy >"$art/deploy_passwd" || true
   id -nG deploy >"$art/deploy_groups" 2>/dev/null || true
   stat -c '%n %U %G %a %s' /home/deploy/.ssh /home/deploy/.ssh/authorized_keys >"$art/deploy_stat" 2>&1 || true
+  # The same in deploy's home directory from getent passwd (SC_DEPLOY_HOME).
+  dh=$(getent passwd deploy | cut -d: -f6) || dh=""
+  if [[ -n $dh ]]; then
+    stat -c '%n %U %G %a %s' "$dh/.ssh" "$dh/.ssh/authorized_keys" >"$art/deploy_home_stat" 2>&1 || true
+  fi
   ls -1 /etc/ssh/sshd_config.d >"$art/sshd_dir" 2>&1 || true
   sshd_state >"$art/sshd_state_end"
   if command -v dockerd >/dev/null 2>&1 && [[ -f /etc/docker/daemon.json ]]; then
@@ -612,6 +688,21 @@ inner() {
       f2b_foreign
       snapshot "$art" >"$art/snap1"
     fi
+    # Someone changes the sshd configuration elsewhere between run 1 and run 2: a later
+    # drop-in (60-test.conf) or a Match block for ubuntu at the end of sshd_config. "\n"
+    # separates lines. snap1_pre keeps the state right after run 1.
+    if ((i == 1)) && [[ -n ${SC_BETWEEN_SSHD_LATE:-}${SC_BETWEEN_SSHD_MATCH:-} ]]; then
+      cp "$art/snap1" "$art/snap1_pre"
+      if [[ -n ${SC_BETWEEN_SSHD_LATE:-} ]]; then
+        printf '%b\n' "# test fixture (between runs)" "$SC_BETWEEN_SSHD_LATE" >/etc/ssh/sshd_config.d/60-test.conf
+        chmod 644 /etc/ssh/sshd_config.d/60-test.conf
+      fi
+      if [[ -n ${SC_BETWEEN_SSHD_MATCH:-} ]]; then
+        printf '\n# test fixture (between runs)\nMatch User ubuntu\n    %b\n' "$SC_BETWEEN_SSHD_MATCH" >>/etc/ssh/sshd_config
+      fi
+      snapshot "$art" >"$art/snap1"
+      sshd_state >"$art/sshd_state1"
+    fi
   done
   post_checks "$art"
   echo ok >"$art/inner_ok"
@@ -639,12 +730,39 @@ for a in "\$@"; do
     getent group docker >/dev/null || /usr/sbin/groupadd --system docker
   fi
 done
+# The installation of iptables-persistent (step 1) removes ufw, whose prerm runs
+# "ufw-init stop". STUB_APT_FW simulates what that can do to INPUT, with the real
+# tools (not the logged wrappers: these are not calls of the script):
+#   flush_v4, flush_v6    all rules gone, policy ACCEPT
+#   policy_v4, policy_v6  only the policy set to ACCEPT
+#   del_final_v4          the final "-A INPUT -j DROP" deleted
+# STUB_APT_SSHD_MATCH: the same apt run (a package update) adds a Match block for ubuntu
+# to sshd_config. STUB_STATE/apt_hooks records what was done.
+case " \$* " in
+  *" install "*" iptables-persistent "*)
+    case \${STUB_APT_FW:-} in
+      "") ;;
+      flush_v4) /usr/sbin/iptables -F INPUT && /usr/sbin/iptables -P INPUT ACCEPT ;;
+      flush_v6) /usr/sbin/ip6tables -F INPUT && /usr/sbin/ip6tables -P INPUT ACCEPT ;;
+      policy_v4) /usr/sbin/iptables -P INPUT ACCEPT ;;
+      policy_v6) /usr/sbin/ip6tables -P INPUT ACCEPT ;;
+      del_final_v4) /usr/sbin/iptables -D INPUT -j DROP ;;
+      *) echo "apt-get (test stub): unknown STUB_APT_FW '\$STUB_APT_FW'" >&2; exit 99 ;;
+    esac
+    [[ -z \${STUB_APT_FW:-} ]] || echo "fw \$STUB_APT_FW" >>"\$STUB_STATE/apt_hooks"
+    if [[ -n \${STUB_APT_SSHD_MATCH:-} ]]; then
+      printf '\n# test fixture (package update)\nMatch User ubuntu\n    %s\n' "\$STUB_APT_SSHD_MATCH" >>/etc/ssh/sshd_config
+      echo "sshd \$STUB_APT_SSHD_MATCH" >>"\$STUB_STATE/apt_hooks"
+    fi
+    ;;
+esac
 exit 0
 EOF
+  # Records the answers (stdin) in STUB_STATE/debconf.
   cat >"$dir/debconf-set-selections" <<EOF
 #!/bin/bash
 $log
-cat >/dev/null
+cat >>"\${STUB_STATE:-/dev/null}/debconf"
 EOF
   cat >"$dir/timedatectl" <<EOF
 #!/bin/bash
@@ -2367,6 +2485,331 @@ t_dry_run_sshd() { # SCENARIO
   return $((1 - ok))
 }
 
+# --- tests: login with a key alone (PubkeyAuthentication, AuthenticationMethods) ---
+
+SSHD_DROPIN=/etc/ssh/sshd_config.d/10-haertung.conf
+
+# The checks stop the run before any change (t_aborts_because: exit != 0, nothing
+# changed, no modifying command, REGEX on stderr), with the abort message of the checks
+# ("Abbruch, nichts geändert") naming REGEX. The fixture is in effect: after the run
+# sshd -T (VIEW global) or sshd -T -C for ubuntu (VIEW admin; then the global view must
+# not have it, only the Match block sets it) has LINE.
+t_auth_precheck_abort() { # SCENARIO REGEX VIEW LINE
+  local ok=1 a
+  t_aborts_because "$1" "$2" || ok=0
+  a=$(art "$1")
+  grep -E '^Abbruch, nichts geändert' "$a/err1" | grep -qE -- "$2" ||
+    no "no abort of the checks ('Abbruch, nichts geändert') naming /$2/:" "$(cat "$a/err1")"
+  if [[ $3 == global ]]; then
+    grep -qxF -- "$4" "$a/sshd_T" || no "fixture not in effect: sshd -T lacks '$4'"
+  else
+    grep -qxF -- "$4" "$a/sshd_T_admin" || no "fixture not in effect: sshd -T -C for ubuntu lacks '$4'"
+    ! grep -qxF -- "$4" "$a/sshd_T" || no "fixture: global sshd -T has '$4' as well (only the Match block should set it)"
+  fi
+  return $((1 - ok))
+}
+
+# A package update in step 1 adds "Match User ubuntu / PubkeyAuthentication no" (apt-get
+# stub), after the checks before the packages passed. The check after writing the drop-in
+# catches it; this run wrote the drop-in, so it is removed again, ssh is not reloaded and
+# the run stops (t_sshd_rollback_because). The hook ran and is in effect.
+t_auth_after_packages() { # SCENARIO
+  local ok=1 a
+  t_sshd_rollback_because "$1" 'PubkeyAuthentication' || ok=0
+  a=$(art "$1")
+  grep -qx 'sshd PubkeyAuthentication no' "$a/state/apt_hooks" 2>/dev/null ||
+    no "fixture: the apt-get stub did not add the Match block"
+  grep -qx 'pubkeyauthentication no' "$a/sshd_T_admin" ||
+    no "fixture not in effect: sshd -T -C for ubuntu lacks 'pubkeyauthentication no'"
+  ! grep -q '^Abbruch, nichts geändert' "$a/err1" ||
+    no "the checks before the packages aborted already (this test is about the check after the drop-in):" "$(cat "$a/err1")"
+  return $((1 - ok))
+}
+
+# --- tests: sshd checks on every run --------------------------------------------
+
+# Run 2 leaves the drop-in unchanged and still runs the read-only checks of step 4:
+# sshd -t, after it sshd -T, sshd -T -C for ubuntu and for deploy (only step 4 asks for
+# deploy); exit 0.
+t_sshd_checks_every_run() { # SCENARIO
+  local ok=1 a t d after
+  have_run "$1" 2 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 2) == 0 ]] || no "run 2: expected exit code 0, got: $(rc_of "$1" 2)"
+  [[ -n $(snap_of "$1" 1 "$SSHD_DROPIN") ]] || no "fixture: $SSHD_DROPIN is not there after run 1"
+  d=$(diff <(snap_of "$1" 1 "$SSHD_DROPIN") <(snap_of "$1" 2 "$SSHD_DROPIN")) || no "fixture: run 2 changed $SSHD_DROPIN:" "$d"
+  t=$(grep -nxF 'sshd -t' "$a/log2" | head -1 | cut -d: -f1)
+  if [[ -z $t ]]; then
+    no "run 2 (drop-in unchanged) did not run sshd -t"
+  else
+    after=$(tail -n "+$t" "$a/log2")
+    grep -qxF 'sshd -T' <<<"$after" || no "run 2: no sshd -T after sshd -t"
+    grep -qxF 'sshd -T -C user=ubuntu,host=localhost,addr=127.0.0.1' <<<"$after" || no "run 2: no sshd -T -C for ubuntu after sshd -t"
+    grep -qxF 'sshd -T -C user=deploy,host=localhost,addr=127.0.0.1' <<<"$after" || no "run 2: no sshd -T -C for deploy after sshd -t"
+  fi
+  return $((1 - ok))
+}
+
+# Between run 1 and run 2 the sshd configuration changed elsewhere (SC_BETWEEN_SSHD_*), so
+# that ubuntu would be locked out. Run 2 leaves its drop-in unchanged, runs the checks
+# anyway (sshd -t) and aborts naming REGEX. The drop-in stays exactly as it was (inode,
+# mode, times, content: no rollback), so does everything else in sshd_config.d and all
+# other files; ssh is not reloaded; the run stops there. The change is in effect: FILE
+# (sshd_T or sshd_T_admin, after the runs) has LINE.
+t_sshd_rerun_abort() { # SCENARIO REGEX FILE LINE
+  local ok=1 a rc s1 d
+  have_run "$1" 2 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 1) == 0 ]] || no "run 1: expected exit code 0, got: $(rc_of "$1" 1)" "$(tail -3 "$a/err1")"
+  rc=$(rc_of "$1" 2)
+  [[ $rc =~ ^[0-9]+$ && $rc -ne 0 ]] || no "run 2: expected exit code != 0, got: $rc"
+  grep -E '^Abbruch' "$a/err2" | grep -qE -- "$2" ||
+    no "run 2: the abort message does not name the reason (/$2/):" "$(cat "$a/err2")"
+  grep -qxF 'sshd -t' "$a/log2" || no "run 2 did not run sshd -t"
+  s1=$(snap_of "$1" 1 "$SSHD_DROPIN")
+  [[ -n $s1 ]] || no "$SSHD_DROPIN is not there after run 1"
+  d=$(diff <(printf '%s\n' "$s1") <(snap_of "$1" 2 "$SSHD_DROPIN")) || no "run 2 changed, reset or removed $SSHD_DROPIN:" "$d"
+  d=$(diff "$a/sshd_state1" "$a/sshd_state_end") || no "run 2 changed /etc/ssh/sshd_config.d (name mode owner sha256):" "$d"
+  d=$(diff "$a/snap1" "$a/snap2") || no "run 2 changed files:" "$d"
+  ! grep -qE '^systemctl [a-z-]*(reload|restart)[a-z-]* ssh' "$a/log2" ||
+    no "run 2 reloaded ssh:" "$(grep -E '^systemctl .* ssh' "$a/log2")"
+  ! grep -qE '^fail2ban-client ' "$a/log2" || no "run 2 went on after the failed check (fail2ban-client ran)"
+  ! grep -q 'Änderungen in diesem Lauf' "$a/out2" || no "run 2 went on to the end"
+  grep -qxF -- "$4" "$a/$3" || no "fixture not in effect: $3 after run 2 lacks '$4'"
+  return $((1 - ok))
+}
+
+# --- tests: audit login UID (sudo su -, sudo -i) -----------------------------------
+
+# Fixture: run 1 of SCENARIO had the audit login UID of USER ("-": a UID without user).
+loginuid_fixture() { # SCENARIO USER
+  local a u
+  a=$(art "$1")
+  u=$(cat "$a/loginuid_user1" 2>/dev/null)
+  if [[ $2 == - ]]; then
+    [[ -z $u ]] || no "fixture: the audit login UID $(cat "$a/loginuid1") of the run belongs to $u, expected a UID without user"
+  else
+    [[ $u == "$2" ]] || no "fixture: the run had the audit login UID $(cat "$a/loginuid1" 2>/dev/null) (user '${u}'), expected that of $2"
+  fi
+}
+
+t_loginuid_aborts() { # SCENARIO USER REGEX: login UID of USER; aborts like t_aborts_because
+  local ok=1
+  t_aborts_because "$1" "$3" || ok=0
+  loginuid_fixture "$1" "$2"
+  return $((1 - ok))
+}
+
+t_loginuid_runs() { # SCENARIO USER: login UID of USER; the run goes through (exit 0)
+  local ok=1
+  t_runs_ok "$1" || ok=0
+  loginuid_fixture "$1" "$2"
+  grep -qE 'Änderungen in diesem Lauf: [0-9]' "$(art "$1")/out1" || no "the run did not reach the end"
+  return $((1 - ok))
+}
+
+# --- tests: firewall changed by the package installation ------------------------------
+
+# Calls of the script that change or save firewall rules.
+FW_WRITE_RE='^(ip6?tables( [^ ]+)* -[IAPDRFX] |ip6?tables-restore( |$)|netfilter-persistent( |$))'
+
+# The package installation (apt-get stub, STUB_APT_FW=HOOK) changed INPUT of TOOL so that
+# it no longer turns other traffic away. The run aborts right after step 1: the abort
+# message names TOOL and REGEX (what changed), not the other tool; iptables-persistent
+# was installed, but no later step ran (no modifying command apart from apt-get and the
+# debconf answers), no rule was inserted and nothing saved (no netfilter-persistent, all
+# files as before, also /etc/iptables/rules.v* if SAVED is "saved").
+t_fw_apt_abort() { # SCENARIO HOOK TOOL REGEX [saved]
+  local ok=1 s=$1 a rc other ab calls d f
+  have_run "$s" 1 || return 1
+  a=$(art "$s")
+  if [[ $3 == iptables ]]; then other=ip6tables; else other=iptables; fi
+  grep -qx "fw $2" "$a/state/apt_hooks" 2>/dev/null || no "fixture: the apt-get stub did not change the firewall ($2)"
+  rc=$(rc_of "$s" 1)
+  [[ $rc =~ ^[0-9]+$ && $rc -ne 0 ]] || no "expected exit code != 0, got: $rc"
+  ab=$(grep -E '^Abbruch' "$a/err1")
+  grep -qE "(^|[ (])${3}[ :]" <<<"$ab" || no "the abort message does not name $3:" "$(cat "$a/err1")"
+  ! grep -qE "(^|[ (])${other}[ :]" <<<"$ab" || no "the abort message names $other, whose INPUT did not change:" "$ab"
+  grep -qE -- "$4" <<<"$ab" || no "the abort message does not say what changed (/$4/):" "${ab:-no abort message}"
+  grep -qE '^apt-get .* install .*iptables-persistent' "$a/log1" || no "step 1 did not install iptables-persistent"
+  calls=$(grep -E "$FW_WRITE_RE" "$a/log1")
+  [[ -z $calls ]] || no "the script changed or saved firewall rules:" "$calls"
+  calls=$(modifying_calls "$a/log1" rerun)
+  [[ -z $calls ]] || no "the run went on after step 1 (modifying commands):" "$calls"
+  d=$(diff "$a/snap0" "$a/snap1") || no "files changed (nothing may be saved or written):" "$d"
+  if [[ ${5:-} == saved ]]; then
+    for f in /etc/iptables/rules.v4 /etc/iptables/rules.v6; do
+      [[ -n $(snap_of "$s" 0 "$f") ]] || no "fixture: no saved $f before the run"
+    done
+  fi
+  ! grep -q 'Änderungen in diesem Lauf' "$a/out1" || no "the run went on to the end"
+  return $((1 - ok))
+}
+
+# Warnings in run 1 of SCENARIO that INPUT of TOOL does not filter incoming connections.
+open_warnings() { # SCENARIO TOOL
+  grep -E "WARNUNG: $2: " "$(art "$1")/err1" | grep -E 'INPUT' | grep -cE 'gefiltert'
+}
+
+# Before the run INPUT of each of the TOOLS ("iptables", "ip6tables", both separated by a
+# space, or "" for none) has neither a final REJECT or DROP rule nor policy DROP: one
+# warning that it does not filter for each of them, none for the other tool; exit 0 and
+# the run reaches the end.
+t_fw_open_warns() { # SCENARIO TOOLS
+  local ok=1 a tool want w
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)" "$(grep -E '^Abbruch' -A2 "$a/err1")"
+  for tool in iptables ip6tables; do
+    want=0
+    [[ " $2 " == *" $tool "* ]] && want=1
+    w=$(open_warnings "$1" "$tool")
+    ((w == want)) || no "$w warnings that $tool INPUT does not filter, expected $want:" "$(grep 'WARNUNG' "$a/err1")"
+  done
+  grep -qE 'Änderungen in diesem Lauf: [0-9]' "$a/out1" || no "the run did not reach the end"
+  return $((1 - ok))
+}
+
+# Step 1 answers the questions of iptables-persistent before installing it, with
+# autosave_v4 and autosave_v6 false (never true), and the checks read INPUT of both tools
+# before the first apt-get.
+t_fw_before_packages() { # SCENARIO
+  local ok=1 a deb fam first i4 i6 dcs inst
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  deb=$(cat "$a/state/debconf" 2>/dev/null)
+  for fam in v4 v6; do
+    grep -qxE "iptables-persistent[[:space:]]+iptables-persistent/autosave_${fam}[[:space:]]+boolean[[:space:]]+false" <<<"$deb" ||
+      no "debconf answers lack 'iptables-persistent/autosave_$fam boolean false':" "${deb:-none}"
+  done
+  ! grep -qiE 'autosave_v[46][[:space:]]+boolean[[:space:]]+true' <<<"$deb" || no "debconf answers contain autosave true:" "$deb"
+  first=$(grep -nE '^apt-get ' "$a/log1" | head -1 | cut -d: -f1)
+  i4=$(grep -nxF 'iptables -S INPUT' "$a/log1" | head -1 | cut -d: -f1)
+  i6=$(grep -nxF 'ip6tables -S INPUT' "$a/log1" | head -1 | cut -d: -f1)
+  dcs=$(grep -nE '^debconf-set-selections' "$a/log1" | head -1 | cut -d: -f1)
+  inst=$(grep -nE '^apt-get .* install .*iptables-persistent' "$a/log1" | head -1 | cut -d: -f1)
+  if [[ -z $first || -z $inst ]]; then
+    no "no apt-get call or no installation of iptables-persistent"
+    return 1
+  fi
+  if [[ -z $i4 ]] || ((i4 > first)); then no "iptables INPUT not read before the first apt-get (log line ${i4:-none}, apt-get in line $first)"; fi
+  if [[ -z $i6 ]] || ((i6 > first)); then no "ip6tables INPUT not read before the first apt-get (log line ${i6:-none}, apt-get in line $first)"; fi
+  if [[ -z $dcs ]] || ((dcs > inst)); then no "debconf answers (log line ${dcs:-none}) not given before installing iptables-persistent (line $inst)"; fi
+  return $((1 - ok))
+}
+
+# --- tests: final unconditional DROP like REJECT --------------------------------------
+
+# INPUT of FAMILY ends with "-A INPUT -j DROP" and has a conditional DROP (one address) at
+# the top. Run 1 inserts the missing ACCEPT rules for 22/80/443 right before the final
+# DROP: INPUT afterwards is INPUT before with exactly these rules there (nothing before the
+# conditional DROP, nothing lost or moved). Run 2: exit 0, 0 changes, rules unchanged.
+t_fw_final_drop() { # SCENARIO FAMILY(v4|v6)
+  local ok=1 a f0 f1 port ins want line done=0 d r
+  have_run "$1" 2 || return 1
+  a=$(art "$1")
+  f0="$a/$2_0" f1="$a/$2_1"
+  grep -qxF -- '-A INPUT -j DROP' "$f0" || no "fixture: $2 INPUT has no final '-A INPUT -j DROP' before the run"
+  grep -qE -- '^-A INPUT -s [^ ]+ -j DROP$' "$f0" || no "fixture: $2 INPUT has no conditional DROP before the run"
+  ! grep -qF -- '-j REJECT' "$f0" || no "fixture: $2 INPUT has a REJECT rule"
+  ((ok)) || return 1
+  for r in 1 2; do
+    [[ $(rc_of "$1" "$r") == 0 ]] || no "run $r: expected exit code 0, got: $(rc_of "$1" "$r")" "$(tail -3 "$a/err$r")"
+  done
+  ins=""
+  for port in 22 80 443; do
+    grep -qxF -- "$(fw_rule "$port")" "$f0" || ins+="$(fw_rule "$port")"$'\n'
+  done
+  [[ -n $ins ]] || no "fixture: no ACCEPT rule missing before the run"
+  want=""
+  while IFS= read -r line; do
+    if [[ $line == "-A INPUT -j DROP" && $done == 0 ]]; then
+      want+=$ins
+      done=1
+    fi
+    want+="$line"$'\n'
+  done <"$f0"
+  d=$(diff <(printf '%s' "$want") "$f1") ||
+    no "$2 INPUT after run 1 is not INPUT before with the missing ACCEPT rules right before the final DROP (< expected, > got):" "$d"
+  d=$(diff "$a/fw1" "$a/fw2") || no "run 2 changed firewall rules:" "$d"
+  grep -qE 'Änderungen in diesem Lauf: 0([^0-9]|$)' "$a/out2" ||
+    no "run 2 does not report 0 changes:" "$(grep 'Änderungen' "$a/out2")"
+  return $((1 - ok))
+}
+
+# --- tests: other fail2ban jails ----------------------------------------------------
+
+# Names of the jails in a fail2ban-client -d dump (['add', NAME, BACKEND]), sorted.
+f2b_jails() { # FILE
+  grep -oE "^\['add', '[^']+'" "$1" | sed -E "s/^\['add', '//; s/'$//" | LC_ALL=C sort
+}
+
+# A jail other than sshd is enabled (fixture jail.d/zz.local): fail2ban-client -d shows
+# it next to sshd, the values of sshd still pass (exit 0, the run reaches the end), and a
+# warning names JAIL.
+t_f2b_other_jail_warns() { # SCENARIO JAIL
+  local ok=1 a w
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)" "$(grep -E '^Abbruch' -A3 "$a/err1")"
+  [[ $(f2b_jails "$a/f2b_dump" | tr '\n' ' ') == *"$2 "* ]] || no "fixture not in effect: fail2ban-client -d shows the jails: $(f2b_jails "$a/f2b_dump" | tr '\n' ' ')"
+  w=$(grep -E 'WARNUNG:' "$a/err1" | grep -wF -- "$2")
+  [[ -n $w ]] || no "no warning that names the jail $2:" "$(grep 'WARNUNG' "$a/err1")"
+  grep -qE 'Änderungen in diesem Lauf: [0-9]' "$a/out1" || no "the run did not reach the end"
+  return $((1 - ok))
+}
+
+# Only the jail sshd is enabled (fail2ban-client -d after the run): exit 0 and no warning
+# about other jails (none that names "Jail" or any jail of the DISABLED list).
+t_f2b_only_sshd() { # SCENARIO [DISABLED_JAIL...]
+  local ok=1 s=$1 a j
+  shift
+  have_run "$s" 1 || return 1
+  a=$(art "$s")
+  [[ $(rc_of "$s" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$s" 1)"
+  [[ $(f2b_jails "$a/f2b_dump") == sshd ]] || no "fixture: fail2ban-client -d shows the jails: $(f2b_jails "$a/f2b_dump" | tr '\n' ' ')"
+  t_no_warning "$s" 'Jail' || ok=0
+  for j in "$@"; do t_no_warning "$s" "$j" || ok=0; done
+  return $((1 - ok))
+}
+
+# --- tests: home directory of deploy from getent passwd ------------------------------
+
+# deploy exists already with the home directory HOME (fixture). Run 1 creates HOME/.ssh
+# (700) with an empty authorized_keys (600), both deploy:deploy, and nothing under
+# /home/deploy; run 2: exit 0, 0 changes, no file changed.
+t_deploy_home() { # SCENARIO HOME
+  local ok=1 a r d
+  have_run "$1" 2 || return 1
+  a=$(art "$1")
+  for r in 1 2; do
+    [[ $(rc_of "$1" "$r") == 0 ]] || no "run $r: expected exit code 0, got: $(rc_of "$1" "$r")" "$(tail -3 "$a/err$r")"
+  done
+  [[ $(cut -d: -f6 "$a/deploy_passwd") == "$2" ]] || no "fixture: home directory of deploy is '$(cut -d: -f6 "$a/deploy_passwd")', expected $2"
+  grep -qxF "$2/.ssh deploy deploy 700" <(sed -E 's/ [0-9]+$//' "$a/deploy_home_stat" 2>/dev/null) ||
+    no "$2/.ssh is not a directory deploy:deploy 700:" "$(cat "$a/deploy_home_stat" 2>/dev/null)"
+  grep -qxF "$2/.ssh/authorized_keys deploy deploy 600 0" "$a/deploy_home_stat" 2>/dev/null ||
+    no "$2/.ssh/authorized_keys is not an empty file deploy:deploy 600:" "$(cat "$a/deploy_home_stat" 2>/dev/null)"
+  [[ ! -e $(upper "$1" home)/deploy ]] || no "/home/deploy was created:" "$(find "$(upper "$1" home)/deploy" | head -5)"
+  grep -qE 'Änderungen in diesem Lauf: 0([^0-9]|$)' "$a/out2" || no "run 2 does not report 0 changes:" "$(grep 'Änderungen' "$a/out2")"
+  d=$(diff "$a/snap1" "$a/snap2") || no "run 2 changed files:" "$d"
+  return $((1 - ok))
+}
+
+# Dry run with deploy's home directory HOME: exit 0, nothing changed, it shows the
+# authorized_keys in HOME/.ssh and does not name /home/deploy.
+t_dry_deploy_home() { # SCENARIO HOME
+  local ok=1 a
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)"
+  assert_unchanged "$1" 1
+  grep -qE -- "\[Testlauf\] install .* $2/\.ssh/authorized_keys$" "$a/out1" ||
+    no "dry run does not show $2/.ssh/authorized_keys:" "$(grep -F 'authorized_keys' "$a/out1")"
+  ! grep -qF '/home/deploy' "$a/out1" "$a/err1" || no "dry run names /home/deploy:" "$(grep -hF '/home/deploy' "$a/out1" "$a/err1")"
+  return $((1 - ok))
+}
+
 # --- tests: the test sandbox itself -------------------------------------------
 
 t_guard_refuses() { # GUARD_CASE
@@ -2655,6 +3098,45 @@ PermitRootLogin yes"
   scenario key_wrong SC_DOCKER_KEY=wrong
   scenario key_two SC_DOCKER_KEY=two
   scenario key_invalid SC_DOCKER_KEY=invalid
+  # Login with a key alone (checks before any change; check after the drop-in)
+  scenario auth_pubkey_no "SC_SSHD_EARLY=PubkeyAuthentication no"
+  scenario auth_pubkey_match "SC_SSHD_MATCH=PubkeyAuthentication no"
+  scenario auth_methods_pw "SC_SSHD_EARLY=AuthenticationMethods publickey,password"
+  scenario auth_methods_match_kbd "SC_SSHD_MATCH=AuthenticationMethods publickey,keyboard-interactive"
+  scenario auth_methods_alt "SC_SSHD_EARLY=AuthenticationMethods publickey,password publickey"
+  scenario dry_auth_pubkey_no SC_DRY_RUN=1 "SC_SSHD_EARLY=PubkeyAuthentication no"
+  scenario auth_after_apt "SC_APT_SSHD_MATCH=PubkeyAuthentication no"
+  # sshd checks on every run: the configuration changes elsewhere between run 1 and run 2
+  scenario rerun_denyusers SC_RUNS=2 "SC_BETWEEN_SSHD_LATE=DenyUsers ubuntu"
+  scenario rerun_match_pw SC_RUNS=2 "SC_BETWEEN_SSHD_MATCH=PasswordAuthentication yes"
+  # Audit login UID of the session
+  scenario loginuid_other SC_LOGINUID=claude
+  scenario loginuid_other_sudo_root SC_LOGINUID=claude SC_SUDO_USER=root
+  scenario loginuid_other_sudo_admin SC_LOGINUID=claude SC_SUDO_USER=ubuntu
+  scenario loginuid_nouser "SC_LOGINUID=$LOGINUID_NOUSER"
+  scenario loginuid_admin SC_LOGINUID=ubuntu
+  scenario loginuid_root SC_LOGINUID=0
+  scenario loginuid_unset "SC_LOGINUID=$LOGINUID_UNSET"
+  scenario loginuid_alt_admin SC_LOGINUID=claude SC_ADMIN_USER=claude SC_KEY_USER=claude
+  scenario loginuid_alt_other SC_LOGINUID=ubuntu SC_ADMIN_USER=claude SC_KEY_USER=claude
+  scenario dry_loginuid_other SC_DRY_RUN=1 SC_LOGINUID=claude
+  # Firewall changed by the package installation; final DROP; nothing that filters
+  scenario fw_apt_flush_v4 SC_APT_FW=flush_v4 SC_RULES_SAVED=1
+  scenario fw_apt_flush_v6 SC_APT_FW=flush_v6 SC_RULES_SAVED=1
+  scenario fw_apt_policy_v4 SC_FW=drop_policy SC_V6=drop_policy SC_APT_FW=policy_v4
+  scenario fw_apt_policy_v6 SC_FW=drop_policy SC_V6=drop_policy SC_APT_FW=policy_v6
+  scenario fw_apt_del_drop SC_FW=drop_rule SC_V6=drop_rule SC_APT_FW=del_final_v4
+  scenario fw_apt_flush_comment SC_FW=oracle_comment SC_APT_FW=flush_v4
+  scenario fw_comment SC_FW=oracle_comment
+  scenario fw_open SC_FW=open SC_V6=open
+  scenario fw_drop_rule SC_FW=drop_rule SC_V6=drop_rule SC_RUNS=2
+  scenario fw_cond_drop SC_FW=cond_drop SC_V6=none
+  # Other fail2ban jails
+  scenario f2b_recidive 'SC_F2B_JAIL_D=[recidive]\nenabled = true'
+  scenario f2b_recidive_off 'SC_F2B_JAIL_D=[recidive]\nenabled = false'
+  # deploy with a home directory other than /home/deploy
+  scenario deploy_home SC_DEPLOY_HOME=/srv/deployhome SC_RUNS=2
+  scenario dry_deploy_home SC_DRY_RUN=1 SC_DEPLOY_HOME=/srv/deployhome
   # The sandbox itself
   guard_case guard_no_markers no_markers
   guard_case guard_caller_ns caller_ns
@@ -2887,6 +3369,82 @@ PermitRootLogin yes"
   check "Docker: Docker's key plus another key in the file aborts, Docker not set up" t_docker_key_rejected key_two
   check "Docker: download that is no key aborts, Docker not set up" t_docker_key_rejected key_invalid
   check "Docker: temporary files removed after the abort" t_tmp_cleaned key_wrong
+
+  check "key login: PubkeyAuthentication no (earlier drop-in): checks abort before any change, naming PubkeyAuthentication" \
+    t_auth_precheck_abort auth_pubkey_no 'PubkeyAuthentication' global 'pubkeyauthentication no'
+  check "key login: Match User ubuntu with PubkeyAuthentication no (only sshd -T -C sees it): checks abort before any change" \
+    t_auth_precheck_abort auth_pubkey_match 'PubkeyAuthentication' admin 'pubkeyauthentication no'
+  check "key login: AuthenticationMethods publickey,password: checks abort before any change, naming AuthenticationMethods" \
+    t_auth_precheck_abort auth_methods_pw 'AuthenticationMethods' global 'authenticationmethods publickey,password'
+  check "key login: Match User ubuntu with AuthenticationMethods publickey,keyboard-interactive: checks abort before any change" \
+    t_auth_precheck_abort auth_methods_match_kbd 'AuthenticationMethods' admin 'authenticationmethods publickey,keyboard-interactive'
+  check "key login: AuthenticationMethods publickey,password publickey (second list: key alone): runs, ssh reloaded" \
+    t_sshd_accepts auth_methods_alt 'authenticationmethods publickey,password publickey'
+  check "key login: dry run with PubkeyAuthentication no: nothing changed, says a real run would abort" \
+    t_dry_would_abort dry_auth_pubkey_no 'PubkeyAuthentication'
+  check "key login: package update in step 1 adds PubkeyAuthentication no for ubuntu: check after the drop-in aborts, drop-in removed, no reload" \
+    t_auth_after_packages auth_after_apt
+
+  check "sshd checks on every run: run 2 (drop-in unchanged) runs sshd -t and sshd -T for ubuntu and deploy" \
+    t_sshd_checks_every_run fresh
+  check "sshd checks on every run: DenyUsers ubuntu in a foreign drop-in before run 2: run 2 aborts, own drop-in unchanged (no rollback), no reload" \
+    t_sshd_rerun_abort rerun_denyusers 'DenyUsers' sshd_T 'denyusers ubuntu'
+  check "sshd checks on every run: Match User ubuntu with PasswordAuthentication yes before run 2: run 2 aborts, own drop-in unchanged, no reload" \
+    t_sshd_rerun_abort rerun_match_pw 'passwordauthentication' sshd_T_admin 'passwordauthentication yes'
+
+  check "login UID: logged in as claude (sudo su -), ADMIN_USER=ubuntu: abort before any change, naming claude" \
+    t_loginuid_aborts loginuid_other claude "'claude'"
+  check "login UID: logged in as claude, SUDO_USER=root: abort before any change" \
+    t_loginuid_aborts loginuid_other_sudo_root claude "'claude'"
+  check "login UID: logged in as claude, SUDO_USER=ubuntu (= ADMIN_USER): abort before any change" \
+    t_loginuid_aborts loginuid_other_sudo_admin claude "'claude'"
+  check "login UID: UID $LOGINUID_NOUSER without user: abort before any change, naming the UID" \
+    t_loginuid_aborts loginuid_nouser - "$LOGINUID_NOUSER"
+  check "login UID: logged in as claude, ADMIN_USER=claude: runs" t_loginuid_runs loginuid_alt_admin claude
+  check "login UID: logged in as ubuntu, ADMIN_USER=claude: abort before any change, naming ubuntu" \
+    t_loginuid_aborts loginuid_alt_other ubuntu "'ubuntu'"
+  check "login UID: logged in as ubuntu (= ADMIN_USER): runs" t_loginuid_runs loginuid_admin ubuntu
+  check "login UID 0 (root): runs" t_loginuid_runs loginuid_root root
+  check "login UID $LOGINUID_UNSET (not set): runs" t_loginuid_runs loginuid_unset -
+  check "login UID: dry run logged in as claude: nothing changed, says a real run would abort" \
+    t_dry_would_abort dry_loginuid_other "'claude'"
+
+  check "firewall: debconf autosave_v4/v6 false before installing iptables-persistent; INPUT read before the first apt-get" \
+    t_fw_before_packages fresh
+  check "firewall: package installation flushes IPv4 INPUT (final REJECT gone): abort after step 1, nothing saved, no later step" \
+    t_fw_apt_abort fw_apt_flush_v4 flush_v4 iptables 'REJECT' saved
+  check "firewall: package installation flushes IPv6 INPUT: abort after step 1 naming ip6tables, nothing saved" \
+    t_fw_apt_abort fw_apt_flush_v6 flush_v6 ip6tables 'REJECT' saved
+  check "firewall: package installation sets IPv4 policy DROP to ACCEPT: abort after step 1, nothing saved" \
+    t_fw_apt_abort fw_apt_policy_v4 policy_v4 iptables 'Policy'
+  check "firewall: package installation sets IPv6 policy DROP to ACCEPT: abort after step 1 naming ip6tables, nothing saved" \
+    t_fw_apt_abort fw_apt_policy_v6 policy_v6 ip6tables 'Policy'
+  check "firewall: package installation deletes the final -A INPUT -j DROP: abort after step 1, nothing saved" \
+    t_fw_apt_abort fw_apt_del_drop del_final_v4 iptables 'DROP'
+  check "firewall (edge case): package installation flushes INPUT whose final REJECT has a comment: abort after step 1, nothing saved" \
+    t_fw_apt_abort fw_apt_flush_comment flush_v4 iptables 'REJECT'
+  check "firewall (edge case): final REJECT with a comment: no warning that INPUT does not filter" t_fw_open_warns fw_comment ''
+  check "firewall: neither final REJECT/DROP nor policy DROP (IPv4 and IPv6): a warning for each, the run goes on" \
+    t_fw_open_warns fw_open 'iptables ip6tables'
+  check "firewall: Oracle rules (final REJECT): no warning that INPUT does not filter" t_fw_open_warns fresh ''
+  check "firewall: IPv4 policy DROP, IPv6 open: warning only for ip6tables" t_fw_open_warns fw_drop_policy 'ip6tables'
+  check "firewall IPv4: final -A INPUT -j DROP counts like REJECT: missing ACCEPT rules right before it, conditional DROP does not count, run 2 unchanged" \
+    t_fw_final_drop fw_drop_rule v4
+  check "firewall IPv6: final -A INPUT -j DROP counts like REJECT: missing ACCEPT rules right before it, conditional DROP does not count, run 2 unchanged" \
+    t_fw_final_drop fw_drop_rule v6
+  check "firewall: only conditional DROP rules, policy ACCEPT: no rule added" t_fw_family_unchanged fw_cond_drop v4
+  check "firewall: only conditional DROP rules, policy ACCEPT: warning that INPUT does not filter" \
+    t_fw_open_warns fw_cond_drop 'iptables ip6tables'
+
+  check "fail2ban: jail recidive enabled as well: warning naming recidive, the run goes on" \
+    t_f2b_other_jail_warns f2b_recidive recidive
+  check "fail2ban: jail recidive disabled: no warning about other jails" t_f2b_only_sshd f2b_recidive_off recidive
+  check "fail2ban: fresh server, only jail sshd: no warning about other jails" t_f2b_only_sshd fresh
+
+  check "user deploy with home /srv/deployhome (getent passwd): authorized_keys there, nothing under /home/deploy, run 2 unchanged" \
+    t_deploy_home deploy_home /srv/deployhome
+  check "dry run, deploy with home /srv/deployhome: shows authorized_keys there, not /home/deploy" \
+    t_dry_deploy_home dry_deploy_home /srv/deployhome
 
   check "sandbox: inner entry point without caller markers refuses, mounts nothing" t_guard_refuses guard_no_markers
   check "sandbox: inner entry point in its caller's namespaces refuses, mounts nothing" t_guard_refuses guard_caller_ns
