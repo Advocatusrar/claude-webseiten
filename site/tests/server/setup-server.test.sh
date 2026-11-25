@@ -593,7 +593,6 @@ EOF
   done
   # iptables, optionally with a simulated concurrent writer (like fail2ban's
   # "iptables -I INPUT 1 ..."), which inserts a foreign rule at the top of INPUT:
-  #   STUB_IPT_RACE=delete  right before "iptables -D INPUT <n>" is carried out,
   #   STUB_IPT_RACE=insert  right before "iptables -I INPUT <n> ..." is carried out
   #                         (the script read the REJECT position before).
   # Once per run. STUB_STATE/race_count counts the inserted rules.
@@ -610,9 +609,6 @@ inject() {
   echo "$n" >"$count_file"
   "$real" -I INPUT 1 -s "192.0.2.$n/32" -p tcp -j DROP
 }
-if [[ $mode == delete && $# -eq 3 && $1 == -D && $2 == INPUT && $3 =~ ^[0-9]+$ && ! -f $count_file ]]; then
-  inject
-fi
 if [[ $mode == insert && $# -gt 3 && $1 == -I && $2 == INPUT && $3 =~ ^[0-9]+$ && ! -f $count_file ]]; then
   inject
 fi
@@ -1212,40 +1208,6 @@ t_rerun_fw_unchanged() { # SCENARIO
   rc=$(rc_of "$1" 2)
   [[ $rc == 0 ]] || no "second run: expected exit code 0, got: $rc"
   d=$(diff "$(art "$1")/fw1" "$(art "$1")/fw2") || no "second run changed firewall rules:" "$d"
-  return $((1 - ok))
-}
-
-# Another program changes INPUT while the script removes the ineffective copy of
-# RACE_WANT behind REJECT (see the iptables stub). No rule may be lost except that
-# copy; the foreign rules stay; port 80 stays open before the REJECT.
-t_fw_no_rule_lost() { # SCENARIO MODE(delete)
-  local ok=1 a n i line c0 c1 acc rej cnt
-  have_run "$1" 1 || return 1
-  a=$(art "$1")
-  n=$(cat "$a/state/race_count" 2>/dev/null || echo 0)
-  if ((n == 0)) && grep -qE '^iptables -D INPUT [0-9]+$' "$a/log1"; then
-    no "rules were deleted by number, but the simulated concurrent insert did not fire"
-  fi
-  while IFS= read -r line; do
-    c0=$(grep -cxF -- "$line" "$a/v4_0")
-    c1=$(grep -cxF -- "$line" "$a/v4_1")
-    if [[ $line == "$RACE_WANT" ]]; then
-      ((c1 >= 1)) || no "no ACCEPT for tcp 80 left"
-    elif ((c1 < c0)); then
-      no "deleted a rule that is not the ineffective copy: $line"
-    fi
-  done < <(grep -E '^-A INPUT ' "$a/v4_0" | LC_ALL=C sort -u)
-  for ((i = 1; i <= n; i++)); do
-    grep -qxF -- "-A INPUT -s 192.0.2.$i/32 -p tcp -j DROP" "$a/v4_1" ||
-      no "deleted the foreign rule that was inserted concurrently (192.0.2.$i)"
-  done
-  read -r acc rej cnt < <(fw_facts "$a/v4_1" 80)
-  if ((acc == 0)) || ((rej > 0 && acc > rej)); then no "tcp 80 is no longer open before the REJECT"; fi
-  if ((ok == 0)); then
-    no "INPUT before the run:"$'\n'"$(cat "$a/v4_0")"
-    no "INPUT after the run:"$'\n'"$(cat "$a/v4_1")"
-    no "exit code $(rc_of "$1" 1), stderr (first lines of the abort):"$'\n'"$(grep -A3 -m1 'Abbruch' "$a/err1")"
-  fi
   return $((1 - ok))
 }
 
@@ -1854,7 +1816,6 @@ PermitRootLogin yes"
   scenario busy_apt SC_BUSY=/etc/apt/apt.conf.d/20auto-upgrades
   # Firewall
   scenario v6_drop SC_V6=drop_policy SC_RUNS=2
-  scenario race_delete SC_FW=accept_after_reject SC_V6=none SC_IPT_RACE=delete
   scenario fw_after_reject_v6 SC_V6=copies_after_reject SC_RUNS=2
   scenario dry_after_reject SC_DRY_RUN=1 SC_FW=accept_after_reject SC_V6=copies_after_reject
   scenario race_insert SC_FW=accept_after_reject SC_V6=none SC_IPT_RACE=insert
@@ -1974,7 +1935,6 @@ PermitRootLogin yes"
   check "firewall IPv6 policy DROP: second run changes nothing" t_rerun_fw_unchanged v6_drop
   check "firewall IPv6 policy ACCEPT without REJECT: no rule added" t_fw_family_unchanged fw_drop_policy v6
   check "firewall: no rule deleted, replaced, flushed or restored in any scenario (call logs and dry-run output)" t_fw_never_deletes
-  check "firewall: INPUT changes right before iptables -D: no other rule deleted" t_fw_no_rule_lost race_delete delete
 
   check "firewall IPv6: ACCEPT 443 only after REJECT, copy of 22 after REJECT too: one 443 inserted before REJECT, both copies stay, warning on every run, no -D/-R, second run 0 changes" \
     t_fw_copy_behind_reject fw_after_reject_v6 v6 ip6tables 22 443
