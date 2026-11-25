@@ -38,6 +38,15 @@ info() { printf '   %s\n' "$*"; }
 warn() { printf '   WARNUNG: %s\n' "$*" >&2; }
 changed() { CHANGES=$((CHANGES + 1)); }
 
+# pkg_installed NAME: true if dpkg has the package installed. Checks only the state
+# field of dpkg's status: "${Status}" is "WANT ERROR STATE", and WANT can be "hold" or
+# "deinstall" for a package that is still installed.
+pkg_installed() {
+  local state
+  state=$(dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null) || return 1
+  [[ $state == installed ]]
+}
+
 # Run a command that changes the system, or only print it in a dry run.
 run() {
   if dry; then
@@ -238,7 +247,7 @@ fi
 
 # Docker's own packages conflict with the unofficial ones from Ubuntu.
 for pkg in docker.io docker-compose docker-compose-v2 docker-doc podman-docker; do
-  if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep 'install ok installed' >/dev/null; then
+  if pkg_installed "$pkg"; then
     precondition_failed "Paket $pkg ist installiert und kollidiert mit Docker aus dem offiziellen Repository. Erst entfernen: sudo apt-get remove $pkg"
   fi
 done
@@ -345,7 +354,7 @@ rule_numbers() {
 # the number can then point to another rule, e.g. the REJECT, and the server would be
 # open. A copy behind the REJECT therefore stays; the script only warns about it.
 allow_port() {
-  local tool=$1 port=$2 pos n before=0 after=0
+  local tool=$1 port=$2 pos n before=0 after=0 open_note
   local rule=(-p tcp -m state --state NEW -m tcp --dport "$port" -j ACCEPT)
   pos=$(reject_pos "$tool")
   if "$tool" -C INPUT "${rule[@]}" 2>/dev/null; then
@@ -377,7 +386,13 @@ allow_port() {
   fi
   if ((after == 1)); then
     # Comes on every run as long as the copy is there; it is no change.
-    warn "$tool: Hinter der REJECT-Regel steht eine ACCEPT-Regel für Port $port. Sie ist wirkungslos (der Port ist durch die Regel davor offen) und kann von Hand entfernt werden. Das Skript löscht keine Firewall-Regeln. Regelnummer anzeigen mit: sudo $tool -L INPUT --line-numbers -n (danach speichern: sudo netfilter-persistent save)"
+    # In a dry run a rule the script would insert is not there yet.
+    if ((before == 0)) && dry; then
+      open_note="der Port wäre durch die eingefügte Regel davor offen"
+    else
+      open_note="der Port ist durch die Regel davor offen"
+    fi
+    warn "$tool: Hinter der REJECT-Regel steht eine ACCEPT-Regel für Port $port. Sie ist wirkungslos ($open_note) und kann von Hand entfernt werden. Das Skript löscht keine Firewall-Regeln. Regelnummer anzeigen mit: sudo $tool -L INPUT --line-numbers -n (danach speichern: sudo netfilter-persistent save)"
   fi
 }
 
@@ -566,7 +581,7 @@ MaxFileSec=1day
 CONF
   run systemctl restart systemd-journald
 fi
-if dpkg-query -W -f='${Status}' rsyslog 2>/dev/null | grep 'install ok installed' >/dev/null; then
+if pkg_installed rsyslog; then
   put /etc/logrotate.d/00-auth-log 0644 <<'CONF' || true
 # Managed by deploy/setup-server.sh
 /var/log/auth.log {
