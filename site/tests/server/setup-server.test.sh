@@ -510,16 +510,20 @@ $log
 exec /usr/sbin/$name "\$@"
 EOF
   done
+  # Logged so that the tests see a restored (replaced) rule set.
+  for name in iptables-restore ip6tables-restore; do
+    cat >"$dir/$name" <<EOF
+#!/bin/bash
+$log
+exec /usr/sbin/$name "\$@"
+EOF
+  done
   # iptables, optionally with a simulated concurrent writer (like fail2ban's
   # "iptables -I INPUT 1 ..."), which inserts a foreign rule at the top of INPUT:
-  #   STUB_IPT_RACE=scan    right after the script read INPUT while the ineffective
-  #                         copy of RULE sits behind REJECT and an effective one before
-  #                         it (the script is about to delete the copy by number),
   #   STUB_IPT_RACE=delete  right before "iptables -D INPUT <n>" is carried out.
   # Once per run. STUB_STATE/race_count counts the inserted rules.
   {
     printf '#!/bin/bash\n%s\n' "$log"
-    printf 'want=%q\n' "$RACE_WANT"
     cat <<'EOF'
 real=/usr/sbin/iptables
 mode=${STUB_IPT_RACE:-}
@@ -531,19 +535,8 @@ inject() {
   echo "$n" >"$count_file"
   "$real" -I INPUT 1 -s "192.0.2.$n/32" -p tcp -j DROP
 }
-copy_before_and_behind_reject() {
-  awk -v want="$want" '$1 == "-A" { if (!r && / -j REJECT( |$)/) r = 1; else if ($0 == want) { if (r) b = 1; else a = 1 } }
-    END { exit !(a && b) }'
-}
 if [[ $mode == delete && $# -eq 3 && $1 == -D && $2 == INPUT && $3 =~ ^[0-9]+$ && ! -f $count_file ]]; then
   inject
-fi
-if [[ $mode == scan && $# -eq 2 && $1 == -S && $2 == INPUT && ! -f $count_file ]]; then
-  out=$("$real" -S INPUT)
-  rc=$?
-  printf '%s\n' "$out"
-  if copy_before_and_behind_reject <<<"$out"; then inject; fi
-  exit "$rc"
 fi
 exec "$real" "$@"
 EOF
@@ -1147,17 +1140,13 @@ t_rerun_fw_unchanged() { # SCENARIO
 # Another program changes INPUT while the script removes the ineffective copy of
 # RACE_WANT behind REJECT (see the iptables stub). No rule may be lost except that
 # copy; the foreign rules stay; port 80 stays open before the REJECT.
-t_fw_no_rule_lost() { # SCENARIO MODE(scan|delete)
+t_fw_no_rule_lost() { # SCENARIO MODE(delete)
   local ok=1 a n i line c0 c1 acc rej cnt
   have_run "$1" 1 || return 1
   a=$(art "$1")
   n=$(cat "$a/state/race_count" 2>/dev/null || echo 0)
-  if ((n == 0)); then
-    if [[ $2 == scan ]]; then
-      no "the simulated concurrent insert did not fire; this test checks nothing (does the script still read INPUT with iptables -S before deleting?)"
-    elif grep -qE '^iptables -D INPUT [0-9]+$' "$a/log1"; then
-      no "rules were deleted by number, but the simulated concurrent insert did not fire"
-    fi
+  if ((n == 0)) && grep -qE '^iptables -D INPUT [0-9]+$' "$a/log1"; then
+    no "rules were deleted by number, but the simulated concurrent insert did not fire"
   fi
   while IFS= read -r line; do
     c0=$(grep -cxF -- "$line" "$a/v4_0")
@@ -1179,6 +1168,123 @@ t_fw_no_rule_lost() { # SCENARIO MODE(scan|delete)
     no "INPUT after the run:"$'\n'"$(cat "$a/v4_1")"
     no "exit code $(rc_of "$1" 1), stderr (first lines of the abort):"$'\n'"$(grep -A3 -m1 'Abbruch' "$a/err1")"
   fi
+  return $((1 - ok))
+}
+
+# The ACCEPT rule the script uses for tcp PORT, as iptables -S prints it.
+fw_rule() { echo "-A INPUT -p tcp -m state --state NEW -m tcp --dport $1 -j ACCEPT"; }
+
+# ACCEPT rules for tcp PORT before and behind the first REJECT, and the number of the
+# first REJECT (0 if there is none).
+fw_split() { # FILE(iptables -S INPUT) PORT
+  awk -v port="$2" '
+    /^-A INPUT/ { n++
+      if (!rej && / -j REJECT/) { rej = n; next }
+      if ($0 ~ ("-p tcp .*--dport " port "( |$)") && / -j ACCEPT/) { if (rej) behind++; else before++ } }
+    END { printf "%d %d %d\n", before, behind, rej }' "$1"
+}
+
+# Exact copies of RULE behind the first REJECT.
+fw_behind_reject() { # FILE(iptables -S INPUT) RULE
+  awk -v want="$2" '/^-A INPUT/ { if (!rej && / -j REJECT/) { rej = 1; next } if (rej && $0 == want) c++ }
+    END { print c + 0 }' "$1"
+}
+
+# Warnings in FILE (stderr of a run) about an ineffective ACCEPT for tcp PORT behind
+# the REJECT: lines that name TOOL, REJECT, the port and the command that shows the
+# rule numbers ("TOOL -L INPUT --line-numbers -n").
+copy_warnings() { # FILE TOOL PORT
+  grep -F "WARNUNG: $2:" "$1" | grep -F 'REJECT' | grep -E "Port $3([^0-9]|$)" |
+    grep -cF "$2 -L INPUT --line-numbers -n"
+}
+
+# Calls that delete, replace or flush firewall rules or chains (short or long option).
+FW_DELETE_RE='ip6?tables( [^ ]+)* (-D|--delete|-R|--replace|-F|--flush|-X|--delete-chain)( |$)'
+
+# INPUT of FAMILY had an ACCEPT for each PORT behind the REJECT (no effect there). The
+# script never deletes or replaces firewall rules (a rule number can point to the
+# REJECT by the time it is used), so after run 1: exactly one ACCEPT per port 22/80/443
+# before the REJECT, the copies behind it still there, no rule lost, only the missing
+# ACCEPT rules added. Run 1 and run 2 each warn once per copy and name
+# "TOOL -L INPUT --line-numbers -n", and no other port. No -D/-R in either run.
+# Run 2 reports 0 changes and changes no rule, file or service.
+t_fw_copy_behind_reject() { # SCENARIO FAMILY(v4|v6) TOOL PORT...
+  local ok=1 s=$1 fam=$2 tool=$3 a f0 f1 r port before behind rej before0 behind0 want w lost added exp calls d
+  shift 3
+  have_run "$s" 2 || return 1
+  a=$(art "$s")
+  f0="$a/${fam}_0" f1="$a/${fam}_1"
+  for port in "$@"; do
+    [[ $(fw_behind_reject "$f0" "$(fw_rule "$port")") == 1 ]] ||
+      no "fixture: $fam INPUT before the run has no copy of the ACCEPT for tcp $port behind REJECT"
+  done
+  ((ok)) || return 1
+  for r in 1 2; do
+    [[ $(rc_of "$s" "$r") == 0 ]] || no "run $r: expected exit code 0, got: $(rc_of "$s" "$r")" "$(tail -3 "$a/err$r")"
+  done
+  exp=""
+  for port in 22 80 443; do
+    read -r before0 behind0 _ < <(fw_split "$f0" "$port")
+    read -r before behind rej < <(fw_split "$f1" "$port")
+    ((rej > 0)) || no "$fam: no REJECT in INPUT after run 1"
+    ((before == 1)) || no "$fam: $before ACCEPT rules for tcp $port before REJECT after run 1 (expected exactly 1)"
+    ((behind == behind0)) || no "$fam: ACCEPT rules for tcp $port behind REJECT: $behind0 before the run, $behind after run 1 (the copy must stay)"
+    if ((before0 == 0)); then exp+="$(fw_rule "$port")"$'\n'; fi
+    want=0
+    [[ " $* " == *" $port "* ]] && want=1
+    for r in 1 2; do
+      w=$(copy_warnings "$a/err$r" "$tool" "$port")
+      ((w == want)) || no "run $r: $w warnings about an ACCEPT for tcp $port behind REJECT naming '$tool -L INPUT --line-numbers -n' (expected $want)"
+    done
+  done
+  for port in "$@"; do
+    [[ $(fw_behind_reject "$f1" "$(fw_rule "$port")") == 1 ]] ||
+      no "$fam: the copy '$(fw_rule "$port")' behind REJECT is gone or changed after run 1"
+  done
+  lost=$(comm -23 <(LC_ALL=C sort "$f0") <(LC_ALL=C sort "$f1"))
+  [[ -z $lost ]] || no "$fam: rules lost in run 1:" "$lost"
+  added=$(comm -13 <(LC_ALL=C sort "$f0") <(LC_ALL=C sort "$f1"))
+  [[ $added == "$(printf '%s' "$exp" | LC_ALL=C sort)" ]] ||
+    no "$fam: run 1 added other rules than the missing ACCEPT rules."$'\n'"added:"$'\n'"$added"$'\n'"expected:"$'\n'"$exp"
+  calls=$(cat "$a/log1" "$a/log2" | grep -E "^$FW_DELETE_RE")
+  [[ -z $calls ]] || no "rules deleted or replaced:" "$calls"
+  grep -qE 'Änderungen in diesem Lauf: 0([^0-9]|$)' "$a/out2" ||
+    no "run 2 does not report 0 changes:" "$(grep 'Änderungen' "$a/out2")"
+  d=$(diff "$a/fw1" "$a/fw2") || no "run 2 changed firewall rules:" "$d"
+  d=$(diff "$a/snap1" "$a/snap2") || no "run 2 changed files:" "$d"
+  calls=$(modifying_calls "$a/log2" rerun)
+  [[ -z $calls ]] || no "run 2 ran modifying commands:" "$calls"
+  if ((ok == 0)); then
+    no "$fam INPUT before the run:"$'\n'"$(cat "$f0")"
+    no "$fam INPUT after run 1:"$'\n'"$(cat "$f1")"
+  fi
+  return $((1 - ok))
+}
+
+# No scenario, real or dry run, deletes, replaces or flushes firewall rules or chains,
+# or restores a whole rule set: no "ip(6)tables -D/-R/-F/-X" (short or long option), no
+# ip(6)tables-restore and no netfilter-persistent other than "save" in the call logs,
+# none of them in the dry-run output either.
+t_fw_never_deletes() {
+  local ok=1 f logs=0 v4=0 v6=0 dry=0 hits
+  for f in "$WORK"/*/log[0-9]*; do
+    [[ -f $f ]] || continue
+    logs=$((logs + 1))
+    if grep -qE '^iptables -I INPUT [0-9]+ ' "$f"; then v4=$((v4 + 1)); fi
+    if grep -qE '^ip6tables -I INPUT [0-9]+ ' "$f"; then v6=$((v6 + 1)); fi
+    hits=$(grep -E "^($FW_DELETE_RE|ip6?tables-restore( |\$)|netfilter-persistent( |\$))" "$f" | grep -vx 'netfilter-persistent save')
+    [[ -z $hits ]] || no "${f#"$WORK"/}:" "$hits"
+  done
+  for f in "$WORK"/*/out[0-9]* "$WORK"/*/err[0-9]*; do
+    [[ -f $f ]] || continue
+    if grep -qE '\[Testlauf\] iptables -I INPUT [0-9]+ ' "$f"; then dry=$((dry + 1)); fi
+    hits=$(grep -E "\[Testlauf\] ($FW_DELETE_RE|ip6?tables-restore( |\$)|netfilter-persistent( |\$))" "$f" |
+      grep -vE '\[Testlauf\] netfilter-persistent save$')
+    [[ -z $hits ]] || no "${f#"$WORK"/}:" "$hits"
+  done
+  # Otherwise this test would look at nothing.
+  ((logs >= 20 && v4 >= 3 && v6 >= 3 && dry >= 1)) ||
+    no "too little to check: $logs call logs, $v4 with iptables -I, $v6 with ip6tables -I, $dry dry runs with iptables -I"
   return $((1 - ok))
 }
 
@@ -1403,7 +1509,7 @@ PermitRootLogin yes"
   scenario pre_admin_nokey SC_ADMIN_USER=claude SC_KEY_USER=ubuntu
   scenario alt_admin SC_ADMIN_USER=claude SC_KEY_USER=claude
   scenario sshd_t_fail SC_SSHD_T_FAIL=1
-  scenario fw_after_reject SC_FW=accept_after_reject
+  scenario fw_after_reject SC_FW=accept_after_reject SC_RUNS=2
   scenario fw_drop_policy SC_FW=drop_policy SC_V6=none
   scenario rerun_real SC_RUNS=2 SC_BETWEEN=1
   # Who may log in afterwards
@@ -1425,7 +1531,6 @@ PermitRootLogin yes"
   scenario busy_apt SC_BUSY=/etc/apt/apt.conf.d/20auto-upgrades
   # Firewall
   scenario v6_drop SC_V6=drop_policy SC_RUNS=2
-  scenario race_scan SC_FW=accept_after_reject SC_V6=none SC_IPT_RACE=scan
   scenario race_delete SC_FW=accept_after_reject SC_V6=none SC_IPT_RACE=delete
   # Docker key
   scenario key_wrong SC_DOCKER_KEY=wrong
@@ -1488,7 +1593,8 @@ PermitRootLogin yes"
   check "firewall IPv4 (Oracle rules): 22/80/443 ACCEPT before REJECT, no duplicates" t_fw_ports_before_reject fresh v4
   check "firewall IPv6 (Oracle rules): 22/80/443 ACCEPT before REJECT, no duplicates" t_fw_ports_before_reject fresh v6
   check "firewall: netfilter-persistent save after the inserts" t_fw_saved_after_insert
-  check "firewall: ACCEPT 80 that sits after REJECT gets one before REJECT" t_fw_ports_before_reject fw_after_reject v4
+  check "firewall: ACCEPT 80 only after REJECT: one inserted before REJECT, copy behind stays, warning on every run, no -D/-R, second run 0 changes" \
+    t_fw_copy_behind_reject fw_after_reject v4 iptables 80
   check "firewall: policy DROP without REJECT still opens 22/80/443" t_fw_ports_before_reject fw_drop_policy v4
   check "Docker: daemon.json valid, max-size and max-file, no hosts" t_daemon_json
   check "Docker: no TCP socket configured" t_docker_no_tcp
@@ -1535,7 +1641,7 @@ PermitRootLogin yes"
   check "firewall IPv6 policy DROP without REJECT: 22/80/443 opened, policy stays DROP" t_fw_v6_drop_policy v6_drop
   check "firewall IPv6 policy DROP: second run changes nothing" t_rerun_fw_unchanged v6_drop
   check "firewall IPv6 policy ACCEPT without REJECT: no rule added" t_fw_family_unchanged fw_drop_policy v6
-  check "firewall: INPUT changes before the re-check: no other rule deleted" t_fw_no_rule_lost race_scan scan
+  check "firewall: no rule deleted, replaced, flushed or restored in any scenario (call logs and dry-run output)" t_fw_never_deletes
   check "firewall: INPUT changes right before iptables -D: no other rule deleted" t_fw_no_rule_lost race_delete delete
 
   check "dry run shows: systemctl enable netfilter-persistent" t_dry_shows 'systemctl enable netfilter-persistent'
