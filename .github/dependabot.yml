@@ -23,7 +23,7 @@ updates:
     ignore:
       # Stay on nginx's stable line (even minor, e.g. 1.30); odd minors are mainline.
       # Patch updates still come in. Move to the next stable line by hand.
-      - dependency-name: nginxinc/nginx-unprivileged
+      - dependency-name: nginx
         update-types:
           - version-update:semver-minor
           - version-update:semver-major
