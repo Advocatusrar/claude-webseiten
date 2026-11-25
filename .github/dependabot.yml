@@ -9,11 +9,24 @@ updates:
       dev-tools:
         dependency-type: development
     open-pull-requests-limit: 5
+    ignore:
+      # TypeScript 7 (native compiler) breaks `astro check`; Astro's tooling stays on
+      # TypeScript 6 until a stable programmatic API exists. Remove once Astro supports 7.
+      - dependency-name: typescript
+        versions:
+          - '>= 7'
 
   - package-ecosystem: docker
     directory: /site
     schedule:
       interval: weekly
+    ignore:
+      # Stay on nginx's stable line (even minor, e.g. 1.30); odd minors are mainline.
+      # Patch updates still come in. Move to the next stable line by hand.
+      - dependency-name: nginxinc/nginx-unprivileged
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major
 
   - package-ecosystem: docker-compose
     directory: /deploy
