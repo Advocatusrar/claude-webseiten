@@ -62,18 +62,37 @@ Das Skript lässt sich gefahrlos ein zweites Mal ausführen und meldet dann 0 Ä
   `getent passwd`), im Normalfall `~/.ssh/authorized_keys`, beim Standardbenutzer also
   `/home/ubuntu/.ssh/authorized_keys`. Weicht `AuthorizedKeysFile` vom Standard ab,
   warnt das Skript.
+- `sshd -T` liefert für `ADMIN_USER` keine wirksame Konfiguration. Ohne sie lässt sich
+  die Schlüsseldatei nicht sicher bestimmen; das Skript rät dann nicht.
 - Eines der Pakete `docker.io`, `docker-compose`, `docker-compose-v2`, `docker-doc`
   oder `podman-docker` ist installiert. Sie kollidieren mit Docker aus dem offiziellen
   Repository; erst mit `sudo apt-get remove <paket>` entfernen.
+- UFW ist aktiv (`ufw status` zeigt `Status: active`) oder sein Status lässt sich nicht
+  ermitteln. `ufw` verträgt sich nicht mit `iptables-persistent`
+  (`Breaks: iptables-persistent, netfilter-persistent`); apt würde UFW bei der
+  Installation entfernen. Ist UFW installiert, aber nicht aktiv (Normalfall bei
+  Oracle), warnt das Skript nur: apt entfernt es dann.
+
+Einzige Ausnahme von „ohne jede Änderung“: Fehlt das Laufzeitverzeichnis `/run/sshd`
+(tmpfs, bei Socket-Aktivierung nicht immer vorhanden), legt das Skript es schon in der
+Prüfung an, weil `sshd -T` es braucht. sshd legt es bei jedem Start ohnehin selbst an.
 
 **Abbruch während des Laufs** (was bis dahin eingerichtet wurde, bleibt; nach der
 Ursache einfach erneut starten):
 
 - Eine Konfigurationsdatei lässt sich nicht schreiben. Die bisherige Datei bleibt.
-- `sshd -t` meldet einen Fehler, `sshd -T` scheitert, oder laut `sshd -T` stünde
-  `ADMIN_USER` danach nicht in `AllowUsers`. Dann wird
-  `/etc/ssh/sshd_config.d/10-haertung.conf` zurückgesetzt und SSH nicht neu geladen.
-- `fail2ban-client -t` meldet einen Fehler in `/etc/fail2ban/jail.local`.
+- `sshd -t` meldet einen Fehler, `sshd -T` scheitert, oder die wirksame Konfiguration
+  (`sshd -T` global und `sshd -T -C user=ADMIN_USER,…` nach `Match`-Blöcken) erfüllt
+  eine dieser Bedingungen nicht: `ADMIN_USER` steht in `AllowUsers`;
+  `PasswordAuthentication`, `KbdInteractiveAuthentication` und `PermitRootLogin` sind
+  `no`; `DenyUsers` nennt `ADMIN_USER` nicht; ist `AllowGroups` gesetzt, ist
+  `ADMIN_USER` in einer dieser Gruppen; `DenyGroups` nennt keine seiner Gruppen. Dann
+  wird `/etc/ssh/sshd_config.d/10-haertung.conf` zurückgesetzt und SSH nicht neu
+  geladen. Die Meldung nennt die Dateien, die den Wert vermutlich vorher setzen (sshd
+  nimmt den ersten Wert; Dateien in `sshd_config.d` mit früher sortiertem Namen werden
+  zuerst gelesen).
+- `fail2ban-client -t` meldet einen Fehler in `/etc/fail2ban/fail2ban.local` oder
+  `/etc/fail2ban/jail.local`.
 - Der Signaturschlüssel von Docker hat nicht den erwarteten Fingerabdruck
   `9DC8 5822 9FC7 DD38 854A E2D8 8D81 803C 0EBF CD88`. Dann wird nichts von Docker
   installiert.
@@ -86,12 +105,22 @@ Was es einrichtet:
   (Zeitzone des Servers: Europe/Berlin)
 - SSH nur mit Schlüssel, kein Root-Login, nur die Benutzer `ubuntu` und `deploy`
   (`/etc/ssh/sshd_config.d/10-haertung.conf`)
-- fail2ban für SSH
-- SSH-Protokolle werden nach 7 Tagen gelöscht: im Journal
-  (`/etc/systemd/journald.conf.d/10-aufbewahrung.conf`) und, falls rsyslog installiert
-  ist, in `/var/log/auth.log` (`/etc/logrotate.d/00-auth-log`), wie in der
-  Datenschutzerklärung angegeben.
-- Firewall über die iptables-Regeln des Oracle-Images (kein UFW): Ports 22, 80 und 443
+- fail2ban für SSH mit den Werten der Datenschutzerklärung, ausdrücklich gesetzt:
+  `maxretry = 5`, `findtime = 10m`, `bantime = 10m` (`/etc/fail2ban/jail.local`) und
+  `dbpurgeage = 1d`; fail2ban schreibt sein Protokoll statt nach
+  `/var/log/fail2ban.log` über syslog mit der Facility `authpriv` ins Journal und, falls
+  rsyslog installiert ist, nach `/var/log/auth.log`, nicht nach `/var/log/syslog`
+  (`logtarget = SYSLOG[facility=AUTHPRIV]` in `/etc/fail2ban/fail2ban.local`).
+- Protokolle mit IP-Adressen werden nach etwa 7 Tagen gelöscht, wie in der
+  Datenschutzerklärung angegeben: im Journal
+  (`/etc/systemd/journald.conf.d/10-aufbewahrung.conf`), falls rsyslog installiert ist
+  in `/var/log/auth.log` (`/etc/logrotate.d/00-auth-log`), und falls logrotate
+  installiert ist in `/var/log/btmp` und `/var/log/wtmp`
+  (`/etc/logrotate.d/00-login-logs`) sowie in `/var/log/fail2ban.log`
+  (`/etc/logrotate.d/00-fail2ban-log`; enthält nur noch Einträge von vor dem Wechsel
+  auf syslog). Die Dateien der Pakete in `/etc/logrotate.d` bleiben unverändert.
+- Firewall über die iptables-Regeln des Oracle-Images (kein UFW; ein installiertes,
+  inaktives UFW entfernt apt mit `iptables-persistent`): Ports 22, 80 und 443
   für IPv4 und IPv6, wenn `INPUT` andere Verbindungen abweist (`REJECT`-Regel oder
   Policy `DROP`). Das Skript fügt nur Regeln ein und löscht keine. Eine wirkungslose
   Kopie hinter `REJECT` bleibt stehen, das Skript warnt bei jedem Lauf; entfernen von

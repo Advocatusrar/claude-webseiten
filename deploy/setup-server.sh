@@ -7,9 +7,9 @@
 # What it does: system updates, automatic security updates with a reboot at 04:00
 # (Europe/Berlin), SSH login only with keys and only for ${ADMIN_USER} and deploy,
 # fail2ban for SSH, ports 22/80/443 in the iptables rules of the Oracle image (no UFW),
-# SSH logs (journal and /var/log/auth.log) kept for 7 days, Docker from the official
-# repository with log limits, and the user "deploy" (member of the group docker, empty
-# authorized_keys).
+# logs with IP addresses (journal, /var/log/auth.log, btmp, wtmp, fail2ban.log) kept for
+# about 7 days, Docker from the official repository with log limits, and the user
+# "deploy" (member of the group docker, empty authorized_keys).
 # It does not set up the website; that follows with the layout for live and staging.
 #
 # Variables:
@@ -27,6 +27,8 @@ ADMIN_USER="${ADMIN_USER:-ubuntu}"
 DRY_RUN="${DRY_RUN:-0}"
 DEPLOY_USER=deploy
 CHANGES=0
+# Connection that sshd -T -C evaluates Match blocks for (used once ADMIN_USER is checked).
+SSHD_TEST_SPEC="user=$ADMIN_USER,host=localhost,addr=127.0.0.1"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -120,7 +122,8 @@ precondition_failed() {
 }
 
 # ---------------------------------------------------------------------------
-# 0. Checks. Nothing is changed before all of them have passed.
+# 0. Checks. Nothing is changed before all of them have passed, except the runtime
+#    directory /run/sshd (see below).
 # ---------------------------------------------------------------------------
 
 step "Prüfungen"
@@ -197,17 +200,29 @@ if [[ $ADMIN_OK == 1 ]]; then
     precondition_failed "Home-Verzeichnis von $ADMIN_USER nicht ermittelbar (getent passwd $ADMIN_USER)."
   else
     AKF_DEFAULT=".ssh/authorized_keys .ssh/authorized_keys2"
+    # sshd -T and -t fail without the privilege separation directory /run/sshd. With
+    # socket activation (default on 24.04) it only exists while ssh.service has run.
+    # It lies on tmpfs and sshd creates it at every start (RuntimeDirectory of
+    # ssh.service), so creating it here changes nothing that lasts.
+    if [[ ! -d /run/sshd ]]; then
+      run install -d -m 0755 /run/sshd || precondition_failed "/run/sshd ließ sich nicht anlegen (nötig für sshd -T)."
+    fi
     akf=""
-    if sshd_eff=$(sshd -T -C "user=$ADMIN_USER,host=localhost,addr=127.0.0.1" 2>/dev/null); then
+    sshd_eff=""
+    if sshd_eff=$(sshd -T -C "$SSHD_TEST_SPEC" 2>&1); then
       akf=$(awk '$1 == "authorizedkeysfile" { $1 = ""; sub(/^ +/, ""); print }' <<<"$sshd_eff")
       if [[ -n "$(awk '$1 == "authorizedkeyscommand" && $2 != "none"' <<<"$sshd_eff")" ]]; then
         warn "sshd verwendet ein AuthorizedKeysCommand. Geprüft werden nur die Schlüsseldateien."
       fi
     fi
-    if [[ -z $akf ]]; then
-      if [[ $EUID -eq 0 ]]; then
-        warn "AuthorizedKeysFile ließ sich nicht mit sshd -T ermitteln. Geprüft wird der Standard ~/.ssh/authorized_keys."
-      fi
+    if [[ -z $akf ]] && dry && [[ $EUID -ne 0 || ! -d /run/sshd ]]; then
+      # Only a dry run gets here without root or without /run/sshd; a real run has both.
+      warn "sshd -T ist im Testlauf gescheitert (ohne root oder ohne /run/sshd). Ein echter Lauf bricht ab, wenn sshd -T dann auch scheitert. Hier geprüft wird nur der Standard ~/.ssh/authorized_keys."
+      akf=".ssh/authorized_keys"
+    elif [[ -z $akf ]]; then
+      # Without the effective AuthorizedKeysFile the key check would guess. Stop instead.
+      precondition_failed "sshd -T -C $SSHD_TEST_SPEC liefert keine wirksame Konfiguration (AuthorizedKeysFile unbekannt), der Schlüssel lässt sich nicht sicher prüfen. Ausgabe: $(tail -n 3 <<<"$sshd_eff")"
+      # Only a dry run continues here; it goes on with the default file.
       akf=".ssh/authorized_keys"
     elif [[ $akf != "$AKF_DEFAULT" ]]; then
       warn "AuthorizedKeysFile ist nicht der Standard ($AKF_DEFAULT), sondern: $akf"
@@ -251,6 +266,31 @@ for pkg in docker.io docker-compose docker-compose-v2 docker-doc podman-docker; 
     precondition_failed "Paket $pkg ist installiert und kollidiert mit Docker aus dem offiziellen Repository. Erst entfernen: sudo apt-get remove $pkg"
   fi
 done
+
+# ufw (0.36.2-6 on 24.04) has "Breaks: iptables-persistent, netfilter-persistent", so
+# installing iptables-persistent in step 1 makes apt remove ufw. An active ufw holds the
+# firewall rules of this server; removing it under the running rules must not happen
+# unattended. On Oracle ufw is normally installed but inactive (the firewall there is
+# the iptables rule set of the image). LC_ALL=C: ufw translates its output.
+if pkg_installed ufw || command -v ufw >/dev/null 2>&1; then
+  ufw_status=$(LC_ALL=C ufw status 2>&1) || true
+  ufw_line=$(grep -m 1 '^Status: ' <<<"$ufw_status") || ufw_line=""
+  case $ufw_line in
+    "Status: active")
+      precondition_failed "UFW ist aktiv. apt würde ufw bei der Installation von iptables-persistent entfernen (ufw: Breaks iptables-persistent, netfilter-persistent). Dieses Skript ist für die iptables-Regeln des Oracle-Images geschrieben. Erst klären, ob UFW gebraucht wird; UFW nicht einfach abschalten, solange keine anderen Regeln greifen, sonst ist der Server offen."
+      ;;
+    "Status: inactive")
+      warn "ufw ist installiert, aber nicht aktiv. apt entfernt ufw bei der Installation von iptables-persistent (ufw: Breaks iptables-persistent, netfilter-persistent)."
+      ;;
+    *)
+      if [[ $EUID -eq 0 ]]; then
+        precondition_failed "Status von UFW nicht ermittelbar (ufw status: $(head -n 1 <<<"$ufw_status"))."
+      else
+        warn "Status von UFW ohne root nicht ermittelbar. Ein echter Lauf bricht ab, wenn UFW aktiv ist."
+      fi
+      ;;
+  esac
+fi
 
 if [[ $PRE_FAILED == 0 ]]; then
   info "in Ordnung: root, Ubuntu $OS_VERSION, Schlüssel für $ADMIN_USER vorhanden"
@@ -317,6 +357,8 @@ CONF
 # with "REJECT --reject-with icmp-host-prohibited". New ACCEPT rules must go before it.
 # The script only inserts rules and never deletes one (reason at allow_port).
 # UFW is not used: it manages the same INPUT chain and would conflict with these rules.
+# It cannot stay installed either: ufw breaks iptables-persistent, so apt removed an
+# inactive ufw in step 1, and an active ufw stopped the script in the checks.
 #
 # Docker bypasses the INPUT chain for published container ports (DNAT, then FORWARD).
 # Therefore only Traefik publishes ports (80 and 443). Own rules for containers belong
@@ -326,10 +368,6 @@ CONF
 # Group of the VCN in the Oracle Console; 80 and 443 must be allowed there as well.
 
 step "Firewall: Ports 22, 80 und 443"
-if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep '^Status: active' >/dev/null; then
-  warn "UFW ist aktiv. Das Skript fasst UFW nicht an, aber UFW und die Oracle-Regeln vertragen sich nicht. Prüfe, ob du UFW wirklich brauchst."
-fi
-
 FW_CHANGED=0
 DRY_SHIFT=0
 
@@ -471,6 +509,62 @@ restore_sshd_conf() {
   fi
   exit 1
 }
+# sshd_candidates KEYWORD: config files that mention KEYWORD (case-insensitive), apart
+# from the drop-in of this script. Only a hint for the abort message.
+sshd_candidates() {
+  local f found=()
+  for f in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
+    [[ -f $f && $f != "$SSHD_CONF" ]] || continue
+    if grep -qiE "^[[:space:]]*$1([[:space:]]|=)" "$f" 2>/dev/null; then found+=("$f"); fi
+  done
+  if ((${#found[@]} > 0)); then printf '%s' "${found[*]}"; else printf 'keine gefunden'; fi
+}
+# check_sshd_effective VIEW OUTPUT: OUTPUT is what sshd -T (as VIEW) prints. Puts the
+# previous drop-in back and stops if the hardening does not take effect or ADMIN_USER
+# would be locked out. sshd takes the first value it reads for PasswordAuthentication
+# and the like; DenyUsers, AllowGroups and DenyGroups add up over all files.
+check_sshd_effective() {
+  local view=$1 eff=$2 allowed setting key pat g hit admin_groups
+  # Without ADMIN_USER in AllowUsers the next login fails: never reload like that.
+  if ! grep -qx "allowusers $ADMIN_USER" <<<"$eff"; then
+    allowed=$(awk '$1 == "allowusers" { printf "%s%s", sep, $2; sep = " " }' <<<"$eff")
+    restore_sshd_conf "sshd würde $ADMIN_USER nicht einlassen (AllowUsers laut $view: ${allowed:-kein Eintrag}; wird $SSHD_CONF überhaupt gelesen?)."
+  fi
+  for setting in "passwordauthentication no" "kbdinteractiveauthentication no" "permitrootlogin no"; do
+    if ! grep -qx "$setting" <<<"$eff"; then
+      key=${setting%% *}
+      restore_sshd_conf "sshd verwendet nicht '$setting' (laut $view: '$(awk -v k="$key" '$1 == k' <<<"$eff")'). Vermutlich setzt eine Datei, die vor $SSHD_CONF gelesen wird (Name sortiert früher), oder ein Match-Block den Wert zuerst. Dateien mit $key: $(sshd_candidates "$key")."
+    fi
+  done
+  # Patterns as in sshd (* and ?); "user@host" entries count for every host here.
+  while read -r pat; do
+    # shellcheck disable=SC2053 # the right side is a pattern on purpose
+    if [[ $ADMIN_USER == ${pat%%@*} ]]; then
+      restore_sshd_conf "DenyUsers schließt $ADMIN_USER aus (Eintrag '$pat' laut $view). Dateien mit DenyUsers: $(sshd_candidates denyusers)."
+    fi
+  done < <(awk '$1 == "denyusers" { print $2 }' <<<"$eff")
+  admin_groups=$(id -nG "$ADMIN_USER" 2>/dev/null) || admin_groups=""
+  while read -r pat; do
+    for g in $admin_groups; do
+      # shellcheck disable=SC2053 # the right side is a pattern on purpose
+      if [[ $g == $pat ]]; then
+        restore_sshd_conf "DenyGroups schließt $ADMIN_USER aus (Gruppe $g, Eintrag '$pat' laut $view). Dateien mit DenyGroups: $(sshd_candidates denygroups)."
+      fi
+    done
+  done < <(awk '$1 == "denygroups" { print $2 }' <<<"$eff")
+  if grep -q '^allowgroups ' <<<"$eff"; then
+    hit=0
+    while read -r pat; do
+      for g in $admin_groups; do
+        # shellcheck disable=SC2053 # the right side is a pattern on purpose
+        if [[ $g == $pat ]]; then hit=1; fi
+      done
+    done < <(awk '$1 == "allowgroups" { print $2 }' <<<"$eff")
+    if ((hit == 0)); then
+      restore_sshd_conf "AllowGroups ist gesetzt ($(awk '$1 == "allowgroups" { printf "%s%s", sep, $2; sep = " " }' <<<"$eff") laut $view), $ADMIN_USER ist in keiner dieser Gruppen (id -nG: ${admin_groups:-keine}). Dateien mit AllowGroups: $(sshd_candidates allowgroups)."
+    fi
+  fi
+}
 if put "$SSHD_CONF" 0644 <<CONF; then
 # Managed by deploy/setup-server.sh
 PasswordAuthentication no
@@ -478,21 +572,19 @@ KbdInteractiveAuthentication no
 PermitRootLogin no
 AllowUsers ${ADMIN_USER} ${DEPLOY_USER}
 CONF
-  # With socket activation (default on 24.04) /run/sshd may be missing, then sshd -t fails.
-  run install -d -m 0755 /run/sshd
+  # The checks created /run/sshd; a package update in step 1 may have stopped ssh since,
+  # which removes it again. Without it sshd -t fails.
+  [[ -d /run/sshd ]] || run install -d -m 0755 /run/sshd
   if ! dry; then
     sshd -t || restore_sshd_conf "sshd -t meldet einen Fehler."
     effective=$(sshd -T 2>/dev/null) || restore_sshd_conf "sshd -T meldet einen Fehler, die wirksame Konfiguration ist unbekannt."
-    # Without ADMIN_USER in AllowUsers the next login fails: never reload like that.
-    if ! grep -qx "allowusers $ADMIN_USER" <<<"$effective"; then
-      allowed=$(awk '$1 == "allowusers" { printf "%s%s", sep, $2; sep = " " }' <<<"$effective")
-      restore_sshd_conf "sshd würde $ADMIN_USER nicht einlassen (AllowUsers laut sshd -T: ${allowed:-kein Eintrag}; wird $SSHD_CONF überhaupt gelesen?)."
-    fi
-    for setting in "passwordauthentication no" "kbdinteractiveauthentication no" "permitrootlogin no"; do
-      grep -qx "$setting" <<<"$effective" || warn "sshd verwendet nicht '$setting'. Eine andere Datei in /etc/ssh/sshd_config.d setzt den Wert vorher."
-    done
+    effective_admin=$(sshd -T -C "$SSHD_TEST_SPEC" 2>/dev/null) ||
+      restore_sshd_conf "sshd -T -C $SSHD_TEST_SPEC meldet einen Fehler, die wirksame Konfiguration für $ADMIN_USER ist unbekannt."
+    # Global values, and the values for ADMIN_USER after Match blocks.
+    check_sshd_effective "sshd -T" "$effective"
+    check_sshd_effective "sshd -T -C $SSHD_TEST_SPEC" "$effective_admin"
   else
-    info "[Testlauf] sshd -t, danach Prüfung mit sshd -T (AllowUsers enthält $ADMIN_USER)"
+    info "[Testlauf] sshd -t, danach Prüfung mit sshd -T und sshd -T -C $SSHD_TEST_SPEC: AllowUsers enthält $ADMIN_USER, PasswordAuthentication, KbdInteractiveAuthentication und PermitRootLogin sind no, DenyUsers, AllowGroups und DenyGroups schließen $ADMIN_USER nicht aus"
   fi
   cat <<'TEXT'
 
@@ -517,17 +609,44 @@ fi
 step "fail2ban für SSH"
 # Ubuntu 24.04 sets banaction = nftables in jail.d/defaults-debian.conf. Docker does not
 # support rules created with nft next to its own, so fail2ban uses iptables here.
+# maxretry, findtime, bantime and dbpurgeage are named in the privacy policy (see
+# step 6), so they are set here instead of relying on the package defaults.
+# fail2ban logs bans with IP addresses. By default it writes them to
+# /var/log/fail2ban.log, which /etc/logrotate.d/fail2ban keeps for about five weeks.
+# logtarget = SYSLOG[facility=AUTHPRIV] (fail2ban 1.0.2, server/server.py) sends them
+# to syslog instead; syslogsocket = auto (package default) is /dev/log on Linux, the
+# socket of journald (systemd-journald-dev-log.socket). They end up in the journal and,
+# with rsyslog, in /var/log/auth.log (50-default.conf: auth,authpriv.*), both deleted
+# after 7 days (step 6). Not SYSTEMD-JOURNAL: its messages carry no facility, journald
+# forwards them to rsyslog as "user", and rsyslog writes them to /var/log/syslog, which
+# /etc/logrotate.d/rsyslog keeps for about five weeks. authpriv is left out there
+# (*.*;auth,authpriv.none).
+F2B_CHANGED=0
+if put /etc/fail2ban/fail2ban.local 0644 <<'CONF'; then
+# Managed by deploy/setup-server.sh
+[Definition]
+logtarget = SYSLOG[facility=AUTHPRIV]
+dbpurgeage = 1d
+CONF
+  F2B_CHANGED=1
+fi
 if put /etc/fail2ban/jail.local 0644 <<'CONF'; then
 # Managed by deploy/setup-server.sh
 [sshd]
 enabled = true
 backend = systemd
 port = ssh
+maxretry = 5
+findtime = 10m
+bantime = 10m
 banaction = iptables-multiport
 banaction_allports = iptables-allports
 CONF
+  F2B_CHANGED=1
+fi
+if [[ $F2B_CHANGED == 1 ]]; then
   if ! dry; then
-    fail2ban-client -t >/dev/null || { echo "Abbruch: fail2ban-client -t meldet einen Fehler in /etc/fail2ban/jail.local." >&2; exit 1; }
+    fail2ban-client -t >/dev/null || { echo "Abbruch: fail2ban-client -t meldet einen Fehler in /etc/fail2ban/fail2ban.local oder /etc/fail2ban/jail.local." >&2; exit 1; }
   fi
   run systemctl restart fail2ban
 fi
@@ -540,14 +659,18 @@ fi
 # ---------------------------------------------------------------------------
 # The privacy policy (site/src/texte/datenschutz.md, "Schutz des Servers vor
 # Angriffen") says: the server stores IP address, time and user name of SSH login
-# attempts, the SSH logs are deleted after 7 days; fail2ban reads them, bans whoever
-# fails 5 times within 10 minutes for 10 minutes, and deletes stored addresses after
-# one day. Change these values only together with the privacy policy.
+# attempts; fail2ban reads them, bans whoever fails 5 times within 10 minutes for
+# 10 minutes, and deletes its list of banned addresses after one day; logs of the server
+# with IP addresses, those of fail2ban included, are deleted after 7 days. Change these
+# values only together with the privacy policy.
 #
-# fail2ban: the values are the package defaults of Ubuntu 24.04 (fail2ban 1.0.2,
+# fail2ban: the values equal the package defaults of Ubuntu 24.04 (fail2ban 1.0.2,
 # /etc/fail2ban/jail.conf: bantime = 10m, findtime = 10m, maxretry = 5;
-# /etc/fail2ban/fail2ban.conf: dbpurgeage = 1d) and are deliberately not set in
-# jail.local. fail2ban reads the journal (backend = systemd), not /var/log/auth.log.
+# /etc/fail2ban/fail2ban.conf: dbpurgeage = 1d), but step 5 sets them explicitly in
+# jail.local and fail2ban.local, so a changed default cannot change them unnoticed.
+# fail2ban reads the journal (backend = systemd), not /var/log/auth.log, and logs to
+# syslog with facility authpriv (fail2ban.local), that is to the journal and, with
+# rsyslog, to /var/log/auth.log.
 #
 # journald: MaxRetentionSec only deletes archived journal files (systemd 255,
 # journal-vacuum.c), the file being written is archived after MaxFileSec, by default
@@ -571,6 +694,22 @@ fi
 # duplicate entry would be an error. "daily" with "rotate 6": the current file plus 6
 # old ones, so the oldest entries are 7 days old when deleted. "ifempty" keeps the
 # daily rotation going on a day without entries; otherwise old files would stay longer.
+#
+# btmp and wtmp: /var/log/btmp holds failed logins, /var/log/wtmp logins, both with the
+# remote address. The logrotate package (3.21.0-2build1) rotates them in its conffiles
+# /etc/logrotate.d/btmp (monthly, rotate 1) and /etc/logrotate.d/wtmp (monthly,
+# minsize 1M, rotate 1), so entries stay up to two months. 00-login-logs comes first
+# and overrides them with the same logic as 00-auth-log (without minsize, which would
+# delay the daily rotation); "create" keeps the modes and owners of the package files.
+#
+# fail2ban.log: with logtarget = SYSLOG fail2ban no longer writes it, but the
+# file stays: entries from before the switch (on a fresh server: from the installation
+# in step 1 until the restart in step 5), and the postinst of the package recreates it
+# on every update (touch). /etc/logrotate.d/fail2ban has "notifempty": after one more
+# rotation the new file stays empty, so it is never rotated again and fail2ban.log.1
+# with the old entries would never be deleted. 00-fail2ban-log rotates it daily with
+# "ifempty" and "rotate 6", so old entries are gone after 7 days. Nothing is deleted
+# directly.
 
 step "Protokolle: Aufbewahrung 7 Tage"
 if put /etc/systemd/journald.conf.d/10-aufbewahrung.conf 0644 <<'CONF'; then
@@ -602,6 +741,48 @@ CONF
   fi
 else
   info "rsyslog ist nicht installiert, es gibt kein /var/log/auth.log"
+fi
+if pkg_installed logrotate; then
+  put /etc/logrotate.d/00-login-logs 0644 <<'CONF' || true
+# Managed by deploy/setup-server.sh
+/var/log/btmp {
+  daily
+  rotate 6
+  ifempty
+  missingok
+  ignoreduplicates
+  create 0660 root utmp
+}
+/var/log/wtmp {
+  daily
+  rotate 6
+  ifempty
+  missingok
+  ignoreduplicates
+  create 0664 root utmp
+}
+CONF
+  put /etc/logrotate.d/00-fail2ban-log 0644 <<'CONF' || true
+# Managed by deploy/setup-server.sh
+/var/log/fail2ban.log {
+  daily
+  rotate 6
+  ifempty
+  missingok
+  compress
+  delaycompress
+  ignoreduplicates
+  create 640 root adm
+  postrotate
+    fail2ban-client flushlogs >/dev/null 2>&1 || true
+  endscript
+}
+CONF
+  if [[ -s /var/log/fail2ban.log ]]; then
+    info "/var/log/fail2ban.log enthält Einträge von vor dem Wechsel auf syslog; sie sind nach spätestens 7 Tagen gelöscht (00-fail2ban-log). Sofort löschen von Hand: sudo truncate -s 0 /var/log/fail2ban.log; sudo rm -f /var/log/fail2ban.log.*"
+  fi
+else
+  warn "logrotate ist nicht installiert: /var/log/btmp, /var/log/wtmp und /var/log/fail2ban.log werden nicht nach 7 Tagen gelöscht: sudo apt-get install logrotate"
 fi
 
 # ---------------------------------------------------------------------------
