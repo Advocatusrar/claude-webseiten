@@ -7,8 +7,9 @@
 # What it does: system updates, automatic security updates with a reboot at 04:00
 # (Europe/Berlin), SSH login only with keys and only for ${ADMIN_USER} and deploy,
 # fail2ban for SSH, ports 22/80/443 in the iptables rules of the Oracle image (no UFW),
-# Docker from the official repository with log limits, and the user "deploy" (member of
-# the group docker, empty authorized_keys).
+# SSH logs (journal and /var/log/auth.log) kept for 7 days, Docker from the official
+# repository with log limits, and the user "deploy" (member of the group docker, empty
+# authorized_keys).
 # It does not set up the website; that follows with the layout for live and staging.
 #
 # Variables:
@@ -305,6 +306,7 @@ CONF
 # ---------------------------------------------------------------------------
 # Oracle's Ubuntu images ship iptables rules (/etc/iptables/rules.v4) that end INPUT
 # with "REJECT --reject-with icmp-host-prohibited". New ACCEPT rules must go before it.
+# The script only inserts rules and never deletes one (reason at allow_port).
 # UFW is not used: it manages the same INPUT chain and would conflict with these rules.
 #
 # Docker bypasses the INPUT chain for published container ports (DNAT, then FORWARD).
@@ -321,7 +323,6 @@ fi
 
 FW_CHANGED=0
 DRY_SHIFT=0
-DRY_DELETED=()
 
 # Line number of the first REJECT rule in INPUT, empty if there is none.
 reject_pos() {
@@ -335,86 +336,14 @@ rule_numbers() {
   "$tool" -S INPUT | awk -v want="-A INPUT $*" '$1 == "-A" { n++; if ($0 == want) print n }'
 }
 
-# nth_rule N: rule number N ("-A INPUT ...") of an "iptables -S INPUT" listing on stdin.
-nth_rule() { awk -v n="$1" '$1 == "-A" { i++; if (i == n) print }'; }
-# without_rule N: the listing on stdin without rule number N.
-without_rule() { awk -v n="$1" '$1 == "-A" { i++; if (i == n) next } { print }'; }
-
-# remove_behind_reject TOOL PORT RULE...: delete exact copies of RULE that sit behind
-# the first REJECT in INPUT. They have no effect (typical after "iptables -A" on Oracle).
-# Called only once an effective copy sits before the REJECT.
-# Rules are deleted by number. Other programs (fail2ban, Docker) may insert rules at
-# any time, so before every deletion the number is determined anew and the rule with
-# that number must equal RULE exactly; afterwards INPUT must equal the listing before
-# minus exactly that rule. Otherwise the script stops instead of guessing.
-remove_behind_reject() {
-  local tool=$1 port=$2 pos n d shown nums tries=0 before after
-  shift 2
-  local want="-A INPUT $*"
-  if dry; then
-    pos=$(reject_pos "$tool")
-    [[ -n $pos ]] || return 0
-    nums=$(rule_numbers "$tool" "$@" | sort -rn)
-    for n in $nums; do
-      ((n > pos)) || continue
-      if [[ "$("$tool" -S INPUT | nth_rule "$n")" != "$want" ]]; then
-        warn "$tool: Regel $n ist nicht mehr die gesuchte. Ein echter Lauf ermittelt die Nummern neu."
-        continue
-      fi
-      # Nothing was inserted or deleted, so shift the number like a real run would.
-      shown=$((n + DRY_SHIFT))
-      for d in "${DRY_DELETED[@]}"; do
-        if ((d < n)); then shown=$((shown - 1)); fi
-      done
-      DRY_DELETED+=("$n")
-      run "$tool" -D INPUT "$shown"
-      info "[Testlauf] $tool: würde die wirkungslose ACCEPT-Regel für Port $port hinter REJECT entfernen"
-      FW_CHANGED=1
-      changed
-    done
-    return 0
-  fi
-  while :; do
-    # Position of the first REJECT and of the copies, all from one listing.
-    before=$("$tool" -S INPUT)
-    pos=$(awk '$1 == "-A" { n++; if (!p && / -j REJECT( |$)/) p = n } END { if (p) print p }' <<<"$before")
-    [[ -n $pos ]] || return 0
-    # Highest number behind the REJECT first.
-    nums=$(awk -v want="$want" '$1 == "-A" { n++; if ($0 == want) print n }' <<<"$before" | sort -rn)
-    n=""
-    for d in $nums; do
-      if ((d > pos)); then
-        n=$d
-        break
-      fi
-    done
-    [[ -n $n ]] || return 0
-    # Read again right before deleting: rule n must still be exactly RULE.
-    if [[ "$("$tool" -S INPUT | nth_rule "$n")" != "$want" ]]; then
-      # INPUT changed in the meantime: determine the numbers again.
-      tries=$((tries + 1))
-      if ((tries >= 3)); then
-        echo "Abbruch: $tool INPUT ändert sich laufend, die wirkungslose Regel für Port $port wird nicht gelöscht. Prüfen mit: sudo $tool -S INPUT" >&2
-        exit 1
-      fi
-      continue
-    fi
-    run "$tool" -D INPUT "$n"
-    after=$("$tool" -S INPUT)
-    if [[ $after != "$(without_rule "$n" <<<"$before")" ]]; then
-      printf 'Abbruch: %s INPUT hat sich beim Löschen von Regel %s geändert. Prüfen mit: sudo %s -S INPUT\nVorher:\n%s\nJetzt:\n%s\n' \
-        "$tool" "$n" "$tool" "$before" "$after" >&2
-      exit 1
-    fi
-    warn "$tool: wirkungslose ACCEPT-Regel für Port $port hinter REJECT entfernt (war Regel $n)"
-    FW_CHANGED=1
-    changed
-  done
-}
-
 # allow_port TOOL PORT: accept new TCP connections to PORT, before the REJECT rule.
-# A rule only counts if it sits before the first REJECT; one behind it has no effect
-# and is removed once an effective one is in place.
+# A rule only counts if it sits before the first REJECT; one behind it has no effect.
+#
+# The script never deletes or replaces firewall rules (no -D, no -R), it only inserts.
+# iptables deletes and replaces by rule number, and other programs (fail2ban, Docker)
+# may insert rules into INPUT at any time. Between reading the number and deleting,
+# the number can then point to another rule, e.g. the REJECT, and the server would be
+# open. A copy behind the REJECT therefore stays; the script only warns about it.
 allow_port() {
   local tool=$1 port=$2 pos n before=0 after=0
   local rule=(-p tcp -m state --state NEW -m tcp --dport "$port" -j ACCEPT)
@@ -447,7 +376,8 @@ allow_port() {
     changed
   fi
   if ((after == 1)); then
-    remove_behind_reject "$tool" "$port" "${rule[@]}"
+    # Comes on every run as long as the copy is there; it is no change.
+    warn "$tool: Hinter der REJECT-Regel steht eine ACCEPT-Regel für Port $port. Sie ist wirkungslos (der Port ist durch die Regel davor offen) und kann von Hand entfernt werden. Das Skript löscht keine Firewall-Regeln. Regelnummer anzeigen mit: sudo $tool -L INPUT --line-numbers -n (danach speichern: sudo netfilter-persistent save)"
   fi
 }
 
@@ -456,7 +386,6 @@ allow_port() {
 open_ports() {
   local tool=$1 policy port
   DRY_SHIFT=0
-  DRY_DELETED=()
   policy=$("$tool" -S INPUT | awk '$1 == "-P" { print $3 }')
   if [[ -n "$(reject_pos "$tool")" || $policy != ACCEPT ]]; then
     for port in 22 80 443; do allow_port "$tool" "$port"; done
@@ -592,7 +521,76 @@ if dry || ! systemctl is-enabled --quiet fail2ban || ! systemctl is-active --qui
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Docker
+# 6. Log retention: 7 days
+# ---------------------------------------------------------------------------
+# The privacy policy (site/src/texte/datenschutz.md, "Schutz des Servers vor
+# Angriffen") says: the server stores IP address, time and user name of SSH login
+# attempts, the SSH logs are deleted after 7 days; fail2ban reads them, bans whoever
+# fails 5 times within 10 minutes for 10 minutes, and deletes stored addresses after
+# one day. Change these values only together with the privacy policy.
+#
+# fail2ban: the values are the package defaults of Ubuntu 24.04 (fail2ban 1.0.2,
+# /etc/fail2ban/jail.conf: bantime = 10m, findtime = 10m, maxretry = 5;
+# /etc/fail2ban/fail2ban.conf: dbpurgeage = 1d) and are deliberately not set in
+# jail.local. fail2ban reads the journal (backend = systemd), not /var/log/auth.log.
+#
+# journald: MaxRetentionSec only deletes archived journal files (systemd 255,
+# journal-vacuum.c), the file being written is archived after MaxFileSec, by default
+# one month. Entries could then stay for a month. MaxFileSec=1day archives the file
+# daily. An archived file is deleted once its first entry is older than
+# MaxRetentionSec, but only when journald cleans up, which it does when it archives,
+# that is about once a day. With 7day entries could therefore reach about 8 days;
+# MaxRetentionSec=6day plus at most one day until the next cleanup keeps them at
+# about 7 days at most, like "rotate 6" for /var/log/auth.log below.
+#
+# rsyslog: Ubuntu server and cloud images have it (priority important, recommended by
+# ubuntu-minimal). journald forwards to it (/usr/lib/systemd/journald.conf.d/syslog.conf
+# of the systemd package: ForwardToSyslog=yes), and /etc/rsyslog.d/50-default.conf
+# writes auth and authpriv, among them the messages of sshd, to /var/log/auth.log.
+# /etc/logrotate.d/rsyslog rotates that file weekly and keeps 4 old ones, about five
+# weeks. Own file instead of editing /etc/logrotate.d/rsyslog: that is a conffile of
+# the package, a change there makes dpkg ask about it on updates of rsyslog. logrotate
+# reads /etc/logrotate.d in name order, so 00-auth-log comes before rsyslog. Its
+# "ignoreduplicates" makes logrotate skip the later entry for /var/log/auth.log in
+# /etc/logrotate.d/rsyslog without an error (logrotate 3.21, config.c); without it the
+# duplicate entry would be an error. "daily" with "rotate 6": the current file plus 6
+# old ones, so the oldest entries are 7 days old when deleted. "ifempty" keeps the
+# daily rotation going on a day without entries; otherwise old files would stay longer.
+
+step "Protokolle: Aufbewahrung 7 Tage"
+if put /etc/systemd/journald.conf.d/10-aufbewahrung.conf 0644 <<'CONF'; then
+# Managed by deploy/setup-server.sh
+[Journal]
+MaxRetentionSec=6day
+MaxFileSec=1day
+CONF
+  run systemctl restart systemd-journald
+fi
+if dpkg-query -W -f='${Status}' rsyslog 2>/dev/null | grep 'install ok installed' >/dev/null; then
+  put /etc/logrotate.d/00-auth-log 0644 <<'CONF' || true
+# Managed by deploy/setup-server.sh
+/var/log/auth.log {
+  daily
+  rotate 6
+  ifempty
+  missingok
+  compress
+  delaycompress
+  ignoreduplicates
+  postrotate
+    if [ -x /usr/lib/rsyslog/rsyslog-rotate ]; then /usr/lib/rsyslog/rsyslog-rotate; fi
+  endscript
+}
+CONF
+  if ! command -v logrotate >/dev/null 2>&1; then
+    warn "rsyslog schreibt /var/log/auth.log, aber logrotate ist nicht installiert. Die Datei wird nicht nach 7 Tagen gelöscht: sudo apt-get install logrotate"
+  fi
+else
+  info "rsyslog ist nicht installiert, es gibt kein /var/log/auth.log"
+fi
+
+# ---------------------------------------------------------------------------
+# 7. Docker
 # ---------------------------------------------------------------------------
 
 step "Docker"
@@ -690,7 +688,7 @@ if ! dry; then
 fi
 
 # ---------------------------------------------------------------------------
-# 7. User deploy
+# 8. User deploy
 # ---------------------------------------------------------------------------
 
 step "Benutzer $DEPLOY_USER"
@@ -719,7 +717,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 8. Result and acceptance checks
+# 9. Result and acceptance checks
 # ---------------------------------------------------------------------------
 
 step "Fertig"

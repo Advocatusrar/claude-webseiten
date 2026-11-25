@@ -1,4 +1,4 @@
-> Entwurf, Stand 2026-10-22. Die Rechtsgrundlagen wurden nur über Suchauszüge geprüft. Vor Veröffentlichung Platzhalter ausfüllen und den Text rechtlich prüfen lassen.
+> Entwurf, Stand 2026-11-25. Die Rechtsgrundlagen wurden nur über Suchauszüge geprüft. Vor Veröffentlichung Platzhalter ausfüllen und den Text rechtlich prüfen lassen.
 >
 > Die genannten Vorschriften der DSGVO sind noch nicht am Gesetzestext geprüft. Wo eine Vorschrift oder eine Angabe der Betreiber fehlt, steht ein Platzhalter in eckigen Klammern.
 
@@ -8,7 +8,7 @@ Diese Datenschutzerklärung informiert dich nach Art. 13 DSGVO darüber, welche 
 
 - Diese Website setzt keine Cookies und nutzt kein Tracking und keine Analyse-Dienste.
 - Sie bindet keine Inhalte von fremden Servern ein, auch keine externen Schriften.
-- Die Website läuft auf einem eigenen Server in [Land des Rechenzentrums]. Unsere Server speichern keine Zugriffsprotokolle mit IP-Adressen.
+- Die Website läuft auf einem eigenen Server in [Land des Rechenzentrums]. Beim Besuch der Website speichern unsere Server keine Zugriffsprotokolle mit IP-Adressen.
 - Wenn du uns eine E-Mail schreibst, verarbeiten wir deine Angaben, um dir zu antworten.
 
 ## Verantwortlicher
@@ -28,13 +28,19 @@ Diese Website besteht aus statischen Seiten. Sie wird von einem Server ausgelief
 
 Damit dein Browser eine Seite anzeigen kann, muss unser Server deine IP-Adresse kennen und die Seite an sie zurückschicken. Die IP-Adresse wird dabei nur für die Dauer der Verbindung verarbeitet.
 
-Unsere Server schreiben keine Zugriffsprotokolle: Weder der Webserver noch der vorgeschaltete Proxy speichern IP-Adressen, aufgerufene Seiten oder Browserangaben. Technische Fehlermeldungen der Server-Software können in Einzelfällen eine IP-Adresse enthalten. Sie werden fortlaufend überschrieben, sobald höchstens 30 MB je Dienst erreicht sind.
+Beim Besuch der Website schreiben unsere Server keine Zugriffsprotokolle: Weder der Webserver noch der vorgeschaltete Proxy speichern IP-Adressen, aufgerufene Seiten oder Browserangaben. Technische Fehlermeldungen der Server-Software können in Einzelfällen eine IP-Adresse enthalten. Sie werden fortlaufend überschrieben, sobald höchstens 30 MB je Dienst erreicht sind.
 
 [Prüfen und eintragen: ob und wie lange der Hosting-Anbieter selbst Verbindungsdaten verarbeitet, etwa zur Abwehr von Angriffen.]
 
 ### Zweck und Rechtsgrundlage
 
 Zweck ist, diese Website zuverlässig und sicher auszuliefern. Rechtsgrundlage ist ein berechtigtes Interesse nach [Vorschrift nach rechtlicher Prüfung ergänzen].
+
+### Schutz des Servers vor Angriffen
+
+Der Server lässt Wartungszugriffe nur über SSH mit Schlüssel zu. Für Anmeldeversuche über SSH speichert der Server die IP-Adresse, den Zeitpunkt und den verwendeten Benutzernamen. Das Programm fail2ban liest diese Einträge: Wer innerhalb von 10 Minuten fünfmal scheitert, wird für 10 Minuten gesperrt. fail2ban löscht gespeicherte Adressen nach einem Tag, die SSH-Protokolle werden nach 7 Tagen gelöscht. Besuche der Website betrifft das nicht.
+
+Zweck ist die Abwehr von Angriffen auf den Server. Rechtsgrundlage ist ein berechtigtes Interesse nach [Vorschrift nach rechtlicher Prüfung ergänzen].
 
 ### Verschlüsselung
 
@@ -81,6 +87,6 @@ Du hast das Recht, dich bei einer Aufsichtsbehörde für den Datenschutz zu besc
 
 ## Stand
 
-Stand dieser Datenschutzerklärung: 22. Oktober 2026.
+Stand dieser Datenschutzerklärung: 25. November 2026.
 
 Die Angaben zum Server beruhen auf der Konfiguration in diesem Repository (Webserver und Proxy ohne Zugriffsprotokoll).

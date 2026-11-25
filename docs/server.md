@@ -77,9 +77,7 @@ Ursache einfach erneut starten):
 - Der Signaturschlüssel von Docker hat nicht den erwarteten Fingerabdruck
   `9DC8 5822 9FC7 DD38 854A E2D8 8D81 803C 0EBF CD88`. Dann wird nichts von Docker
   installiert.
-- iptables lässt sich nicht lesen, oder die Kette `INPUT` ändert sich, während das
-  Skript eine wirkungslose Regel hinter `REJECT` löscht. Es löscht nur eine Regel, die
-  es vorher unter genau dieser Nummer gefunden hat.
+- iptables lässt sich nicht lesen.
 
 Was es einrichtet:
 
@@ -89,9 +87,15 @@ Was es einrichtet:
 - SSH nur mit Schlüssel, kein Root-Login, nur die Benutzer `ubuntu` und `deploy`
   (`/etc/ssh/sshd_config.d/10-haertung.conf`)
 - fail2ban für SSH
+- SSH-Protokolle werden nach 7 Tagen gelöscht: im Journal
+  (`/etc/systemd/journald.conf.d/10-aufbewahrung.conf`) und, falls rsyslog installiert
+  ist, in `/var/log/auth.log` (`/etc/logrotate.d/00-auth-log`), wie in der
+  Datenschutzerklärung angegeben.
 - Firewall über die iptables-Regeln des Oracle-Images (kein UFW): Ports 22, 80 und 443
   für IPv4 und IPv6, wenn `INPUT` andere Verbindungen abweist (`REJECT`-Regel oder
-  Policy `DROP`)
+  Policy `DROP`). Das Skript fügt nur Regeln ein und löscht keine. Eine wirkungslose
+  Kopie hinter `REJECT` bleibt stehen, das Skript warnt bei jedem Lauf; entfernen von
+  Hand (Nummer mit `sudo iptables -L INPUT --line-numbers -n`).
 - Docker aus dem offiziellen Repository (Signaturschlüssel per Fingerabdruck geprüft)
   mit begrenzten Logs, ohne TCP-Socket
 - Benutzer `deploy` in der Gruppe `docker`, mit leerer `authorized_keys`
