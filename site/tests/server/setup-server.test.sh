@@ -367,6 +367,9 @@ EOF
       >/etc/fail2ban/jail.d/50-test-defaults.conf
     fail2ban-client -d >"$art/f2b_dump0" 2>/dev/null || true
   fi
+  # Foreign files in jail.d/ and fail2ban.d/ (see f2b_foreign), unless they come only
+  # between run 1 and run 2.
+  if [[ ${SC_F2B_FOREIGN_AT:-fixture} != between ]]; then f2b_foreign; fi
   # A journald drop-in from an earlier version, with other content and mode.
   if [[ ${SC_JOURNALD_OLD:-0} == 1 ]]; then
     mkdir -p /etc/systemd/journald.conf.d
@@ -474,6 +477,25 @@ f2b_edit() {
   esac
 }
 
+# f2b_foreign: files of someone else that fail2ban reads after jail.local and
+# fail2ban.local (the last value wins). SC_F2B_JAIL_D is the content of
+# /etc/fail2ban/jail.d/zz.local, SC_F2B_MAIN_D that of /etc/fail2ban/fail2ban.d/zz.local
+# ("\n" separates lines), each 644 root:root. Put in place by the fixture, or with
+# SC_F2B_FOREIGN_AT=between only between run 1 and run 2 (snap1_pre keeps the state
+# right after run 1).
+f2b_foreign() {
+  if [[ -n ${SC_F2B_JAIL_D:-} ]]; then
+    mkdir -p /etc/fail2ban/jail.d
+    printf '%b\n' "# Foreign file (test fixture)" "$SC_F2B_JAIL_D" >/etc/fail2ban/jail.d/zz.local
+    chmod 644 /etc/fail2ban/jail.d/zz.local
+  fi
+  if [[ -n ${SC_F2B_MAIN_D:-} ]]; then
+    mkdir -p /etc/fail2ban/fail2ban.d
+    printf '%b\n' "# Foreign file (test fixture)" "$SC_F2B_MAIN_D" >/etc/fail2ban/fail2ban.d/zz.local
+    chmod 644 /etc/fail2ban/fail2ban.d/zz.local
+  fi
+}
+
 # inner_guard ARTDIR: refuse to run outside a sandbox. Called directly (for example
 # "sudo bash THIS __inner /tmp/x"), inner would lay overlays over the host's /etc and
 # others and replace the host's firewall rules. scenario() passes the namespaces it
@@ -534,6 +556,11 @@ inner() {
     if ((i == 1)) && [[ -n ${SC_F2B_EDIT:-} ]]; then
       cp "$art/snap1" "$art/snap1_pre"
       f2b_edit "$SC_F2B_EDIT"
+      snapshot "$art" >"$art/snap1"
+    fi
+    if ((i == 1)) && [[ ${SC_F2B_FOREIGN_AT:-} == between ]]; then
+      cp "$art/snap1" "$art/snap1_pre"
+      f2b_foreign
       snapshot "$art" >"$art/snap1"
     fi
   done
@@ -1922,6 +1949,72 @@ t_f2b_restart() { # SCENARIO none|local|jail
   return $((1 - ok))
 }
 
+# Lines of snapshot N of SCENARIO for /etc/fail2ban/jail.d, /etc/fail2ban/fail2ban.d
+# and everything in them (stat and sha256 lines).
+f2b_d_lines() { # SCENARIO N
+  grep -E '(^|  )\./etc/u/fail2ban/(jail|fail2ban)\.d(/|\||$)' "$(art "$1")/snap$2"
+}
+
+# Lines of a call log that start or enable fail2ban.
+F2B_START_RE='^systemctl (start|enable|reenable)( .*)? fail2ban(\.service)?( |$)'
+
+# A foreign FILE (/etc/fail2ban/jail.d/zz.local or fail2ban.d/zz.local) that overrides a
+# value of the privacy policy is there before run RUN. Run RUN asks fail2ban-client -d,
+# aborts (exit != 0, "Abbruch") and names FILE on stderr; it neither restarts nor
+# starts fail2ban (after run 1 fail2ban is not active); FILE and everything else in
+# jail.d and fail2ban.d stay as they were (inode, mode, times, content); the run stops
+# there (no summary). Earlier runs exit 0. fail2ban-client -d after the run contains
+# DUMP_LINE: the foreign value is the one in effect.
+t_f2b_foreign_abort() { # SCENARIO RUN FILE DUMP_LINE
+  local ok=1 s=$1 n=$2 file=$3 a r rc calls d
+  have_run "$s" "$n" || return 1
+  a=$(art "$s")
+  for ((r = 1; r < n; r++)); do
+    [[ $(rc_of "$s" "$r") == 0 ]] || no "run $r: expected exit code 0, got: $(rc_of "$s" "$r")" "$(tail -3 "$a/err$r")"
+  done
+  rc=$(rc_of "$s" "$n")
+  [[ $rc =~ ^[0-9]+$ && $rc -ne 0 ]] || no "run $n: expected exit code != 0, got: $rc"
+  grep -q '^Abbruch' "$a/err$n" || no "run $n: no abort message on stderr:" "$(cat "$a/err$n")"
+  grep -qF -- "$file" "$a/err$n" || no "run $n: stderr does not name $file:" "$(cat "$a/err$n")"
+  grep -qE '^fail2ban-client -d( |$)' "$a/log$n" || no "run $n did not call fail2ban-client -d"
+  calls=$(grep -E "$F2B_RESTART_RE|$F2B_START_RE" "$a/log$n")
+  [[ -z $calls ]] || no "run $n restarted or started fail2ban:" "$calls"
+  if ((n == 1)) && [[ -e $a/state/active.fail2ban ]]; then no "fail2ban is active after the aborted run 1"; fi
+  [[ -n $(snap_of "$s" $((n - 1)) "$file") ]] || no "fixture: $file is not there before run $n"
+  d=$(diff <(f2b_d_lines "$s" $((n - 1))) <(f2b_d_lines "$s" "$n")) || no "run $n changed jail.d or fail2ban.d:" "$d"
+  ! grep -q 'Änderungen in diesem Lauf' "$a/out$n" || no "run $n went on to the end after the abort"
+  grep -qxF -- "$4" "$a/f2b_dump" || no "fixture not in effect: fail2ban-client -d after the run lacks $4:" \
+    "$(grep -E "dbpurgeage|logtarget|'sshd', '(bantime|findtime|maxretry)" "$a/f2b_dump")"
+  return $((1 - ok))
+}
+
+# Foreign jail.d/zz.local and fail2ban.d/zz.local whose values equal those of the
+# privacy policy in another notation: both runs exit 0 with the effective values of
+# t_f2b_effective, fail2ban is restarted once in run 1 and not in run 2 (t_f2b_restart)
+# and is enabled and active, both runs ask fail2ban-client -d, the foreign files stay as
+# they were. fail2ban-client -d shows every DUMP_LINE: the foreign values are the ones in
+# effect.
+t_f2b_equiv() { # SCENARIO DUMP_LINE...
+  local ok=1 s=$1 a r f d l
+  shift
+  t_f2b_effective "$s" 2 || ok=0
+  t_f2b_restart "$s" none || ok=0
+  a=$(art "$s")
+  [[ -e $a/state/enabled.fail2ban && -e $a/state/active.fail2ban ]] || no "fail2ban is not enabled and active"
+  for r in 1 2; do
+    grep -qE '^fail2ban-client -d( |$)' "$a/log$r" || no "run $r did not call fail2ban-client -d"
+    ! grep -q '^Abbruch' "$a/err$r" || no "run $r: abort message:" "$(grep '^Abbruch' -A3 "$a/err$r")"
+  done
+  for f in /etc/fail2ban/jail.d/zz.local /etc/fail2ban/fail2ban.d/zz.local; do
+    [[ -n $(snap_of "$s" 0 "$f") ]] || no "fixture: $f is not there before run 1"
+  done
+  d=$(diff <(f2b_d_lines "$s" 0) <(f2b_d_lines "$s" 2)) || no "the runs changed jail.d or fail2ban.d:" "$d"
+  for l in "$@"; do
+    grep -qxF -- "$l" "$a/f2b_dump" || no "fixture not in effect: fail2ban-client -d after the runs lacks $l"
+  done
+  return $((1 - ok))
+}
+
 # --- tests: logrotate for btmp, wtmp and fail2ban.log -----------------------------
 
 LOGIN_LOGROTATE=/etc/logrotate.d/00-login-logs
@@ -2051,6 +2144,29 @@ t_dry_lr() { # SCENARIO
   return $((1 - ok))
 }
 
+# logrotate counts as missing although half of it is there (package installed without
+# program, or program without package), rsyslog is installed: as t_no_lr (no
+# 00-login-logs, no 00-fail2ban-log, a warning that names logrotate, package files
+# unchanged), no 00-auth-log either, and the warning about logrotate matches REGEX and
+# not NOT_REGEX (it says which half is missing). BIN is what the fixture provides:
+# "none" (no program in the PATH of the script) or "present".
+t_lr_half() { # SCENARIO BIN REGEX NOT_REGEX
+  local ok=1 a bin w
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  bin=$(cat "$a/lr_bin" 2>/dev/null)
+  case $2 in
+    none) [[ $bin == none ]] || no "fixture: logrotate program in the PATH of the script: ${bin:-lr_bin missing}" ;;
+    present) [[ $bin == /* ]] || no "fixture: no logrotate program in the PATH of the script: ${bin:-lr_bin missing}" ;;
+  esac
+  t_no_lr "$1" || ok=0
+  [[ ! -e "$(upper "$1" etc)${AUTH_LOGROTATE#/etc}" ]] || no "$AUTH_LOGROTATE written although logrotate counts as missing"
+  w=$(grep -E 'WARNUNG:' "$a/err1" | grep -F logrotate)
+  grep -qE -- "$3" <<<"$w" || no "the warning about logrotate does not match /$3/:" "${w:-no such warning}"
+  ! grep -qE -- "$4" <<<"$w" || no "the warning about logrotate matches /$4/:" "$w"
+  return $((1 - ok))
+}
+
 # --- tests: UFW -------------------------------------------------------------------
 
 # ufw installed and inactive (Oracle's image): a warning that names ufw, and the run
@@ -2121,6 +2237,23 @@ t_sshd_accepts() { # SCENARIO LINE...
   for l in "$@"; do
     grep -qxF -- "$l" <<<"$eff" || no "fixture not in effect: sshd -T lacks '$l'"
   done
+  return $((1 - ok))
+}
+
+# A rule that keeps out deploy (the CI), but not ubuntu: as t_sshd_accepts (exit 0, ssh
+# reloaded, hardening and every LINE in effect), plus a warning that names deploy and
+# matches REGEX (the rule), no abort message, the run goes on to the end and creates
+# deploy.
+t_sshd_deploy_warns() { # SCENARIO REGEX LINE...
+  local ok=1 s=$1 re=$2 a w
+  shift 2
+  t_sshd_accepts "$s" "$@" || ok=0
+  a=$(art "$s")
+  w=$(grep -E 'WARNUNG:' "$a/err1" | grep -wF deploy)
+  grep -qE -- "$re" <<<"$w" || no "no warning that names deploy and /$re/:" "$(grep 'WARNUNG' "$a/err1")"
+  ! grep -q '^Abbruch' "$a/err1" || no "abort message:" "$(grep '^Abbruch' "$a/err1")"
+  grep -qE 'Änderungen in diesem Lauf: [0-9]' "$a/out1" || no "the run did not reach the end"
+  grep -qE '^useradd( .*)? deploy$' "$a/log1" || no "user deploy was not created"
   return $((1 - ok))
 }
 
@@ -2379,10 +2512,24 @@ PermitRootLogin yes"
     SC_LOGROTATE_BIN=1 SC_LOGROTATE_PKG=1 SC_LOGROTATE_RSYSLOG=1
   scenario lr_removed "SC_DPKG=logrotate=deinstall ok config-files" SC_LOGROTATE_PKG=1
   scenario dry_lr SC_DRY_RUN=1 "SC_DPKG=logrotate=install ok installed" SC_LOGROTATE_BIN=1 SC_LOGROTATE_PKG=1
+  # Only half of logrotate: package without program, program without package.
+  scenario lr_nobin "SC_DPKG=$(printf '%s\n' 'rsyslog=install ok installed' 'logrotate=install ok installed')" \
+    SC_LOGROTATE_PKG=1 SC_LOGROTATE_RSYSLOG=1
+  scenario lr_binonly "SC_DPKG=rsyslog=install ok installed" SC_LOGROTATE_BIN=1 SC_LOGROTATE_RSYSLOG=1
   # fail2ban values of the privacy policy
   scenario f2b_defaults SC_F2B_DEFAULTS=1
   scenario f2b_edit_local SC_RUNS=2 SC_F2B_EDIT=local
   scenario f2b_edit_jail SC_RUNS=2 SC_F2B_EDIT=jail
+  # Foreign jail.d/*.local and fail2ban.d/*.local that override them, or not.
+  scenario f2b_jail_bantime 'SC_F2B_JAIL_D=[sshd]\nbantime = 1h'
+  scenario f2b_jail_increment 'SC_F2B_JAIL_D=[DEFAULT]\nbantime.increment = true'
+  scenario f2b_main_dbpurgeage 'SC_F2B_MAIN_D=[Definition]\ndbpurgeage = 30d'
+  scenario f2b_jail_findtime 'SC_F2B_JAIL_D=[sshd]\nfindtime = 1h'
+  scenario f2b_main_logtarget 'SC_F2B_MAIN_D=[Definition]\nlogtarget = /var/log/fail2ban.log'
+  scenario f2b_rerun_maxretry SC_RUNS=2 SC_F2B_FOREIGN_AT=between 'SC_F2B_JAIL_D=[sshd]\nmaxretry = 3'
+  scenario f2b_equiv SC_RUNS=2 \
+    'SC_F2B_JAIL_D=[DEFAULT]\nbantime.increment = false\n\n[sshd]\nbantime = 600\nfindtime = 10 minutes\nmaxretry = 5' \
+    'SC_F2B_MAIN_D=[Definition]\ndbpurgeage = 24h'
   # UFW
   scenario ufw_active "SC_DPKG=ufw=install ok installed" SC_UFW=active
   scenario ufw_unclear "SC_DPKG=ufw=install ok installed" SC_UFW=unclear
@@ -2399,6 +2546,12 @@ PermitRootLogin yes"
   scenario ssh_denygroups SC_GROUPS=sshdeny:ubuntu "SC_SSHD_LATE=DenyGroups sshdeny"
   scenario ssh_groups_ok "SC_GROUPS=sshlogin:ubuntu sshdeny" "SC_SSHD_EARLY=PasswordAuthentication no" \
     'SC_SSHD_LATE=AllowGroups sshlogin\nDenyGroups sshdeny\nDenyUsers ub? root'
+  # Rules that keep out deploy (on a fresh server it will be in the groups deploy and
+  # docker), but not ubuntu.
+  scenario ssh_deploy_denyusers "SC_SSHD_LATE=DenyUsers deploy"
+  scenario ssh_deploy_allowgroups SC_GROUPS=sshlogin:ubuntu "SC_SSHD_LATE=AllowGroups sshlogin"
+  scenario ssh_deploy_denygroups "SC_SSHD_LATE=DenyGroups docker"
+  scenario ssh_deploy_docker_ok SC_GROUPS=sshlogin:ubuntu "SC_SSHD_LATE=AllowGroups sshlogin docker"
   # /run/sshd missing
   scenario run_sshd_missing SC_RUN_SSHD=missing
   scenario run_sshd_abort SC_RUN_SSHD=missing "SC_DPKG=ufw=install ok installed" SC_UFW=active
@@ -2552,6 +2705,11 @@ PermitRootLogin yes"
   check "log retention: logrotate removed, conffiles left: no 00-login-logs, no 00-fail2ban-log, warning, package files unchanged" \
     t_no_lr lr_removed
   check "dry run with logrotate: shows 00-login-logs and 00-fail2ban-log, changes nothing" t_dry_lr dry_lr
+  check "log retention: logrotate installed, rsyslog not installed: no 00-auth-log" t_no_auth_logrotate lr
+  check "log retention: package logrotate installed, program missing (rsyslog installed): no 00-auth-log, 00-login-logs, 00-fail2ban-log; warning that the program is missing" \
+    t_lr_half lr_nobin none 'Programm' 'nicht installiert'
+  check "log retention: program logrotate there, package not installed (rsyslog installed): no 00-auth-log, 00-login-logs, 00-fail2ban-log; warning that the package is missing" \
+    t_lr_half lr_binonly present 'nicht installiert' 'Programm[^.]*fehlt'
 
   check "fail2ban: effective values (fail2ban-client -d): logtarget SYSLOG[facility=AUTHPRIV], dbpurgeage 1d, sshd maxretry 5, findtime 10m, bantime 10m, systemd, iptables-multiport; files 644" \
     t_f2b_effective fresh 2
@@ -2565,6 +2723,21 @@ PermitRootLogin yes"
   check "dry run shows step: fail2ban.local and the values of the privacy policy" t_dry_shows \
     '/etc/fail2ban/fail2ban\.local' '\|[[:space:]]+\[Definition\]$' '\|[[:space:]]+logtarget = SYSLOG\[facility=AUTHPRIV\]$' \
     '\|[[:space:]]+dbpurgeage = 1d$' '\|[[:space:]]+maxretry = 5$' '\|[[:space:]]+findtime = 10m$' '\|[[:space:]]+bantime = 10m$'
+  check "fail2ban: foreign jail.d/zz.local with [sshd] bantime = 1h: abort naming the file, fail2ban neither restarted nor started, foreign file unchanged" \
+    t_f2b_foreign_abort f2b_jail_bantime 1 /etc/fail2ban/jail.d/zz.local "['set', 'sshd', 'bantime', '1h']"
+  check "fail2ban: foreign jail.d/zz.local with [DEFAULT] bantime.increment = true: abort naming the file, fail2ban neither restarted nor started, foreign file unchanged" \
+    t_f2b_foreign_abort f2b_jail_increment 1 /etc/fail2ban/jail.d/zz.local "['set', 'sshd', 'bantime.increment', True]"
+  check "fail2ban: foreign fail2ban.d/zz.local with dbpurgeage = 30d: abort naming the file, fail2ban neither restarted nor started, foreign file unchanged" \
+    t_f2b_foreign_abort f2b_main_dbpurgeage 1 /etc/fail2ban/fail2ban.d/zz.local "['set', 'dbpurgeage', '30d']"
+  check "fail2ban: foreign jail.d/zz.local with [sshd] findtime = 1h: abort naming the file, fail2ban neither restarted nor started, foreign file unchanged" \
+    t_f2b_foreign_abort f2b_jail_findtime 1 /etc/fail2ban/jail.d/zz.local "['set', 'sshd', 'findtime', '1h']"
+  check "fail2ban: foreign fail2ban.d/zz.local with logtarget = /var/log/fail2ban.log: abort naming the file, fail2ban neither restarted nor started, foreign file unchanged" \
+    t_f2b_foreign_abort f2b_main_logtarget 1 /etc/fail2ban/fail2ban.d/zz.local "['set', 'logtarget', '/var/log/fail2ban.log']"
+  check "fail2ban: foreign jail.d/zz.local with [sshd] maxretry = 3 added before run 2 (own files unchanged): run 2 aborts naming the file, no restart or start, foreign file unchanged" \
+    t_f2b_foreign_abort f2b_rerun_maxretry 2 /etc/fail2ban/jail.d/zz.local "['set', 'sshd', 'maxretry', 3]"
+  check "fail2ban: foreign files with equivalent values (bantime 600, findtime 10 minutes, maxretry 5, dbpurgeage 24h, bantime.increment false): no abort, restarted once in run 1, files unchanged" \
+    t_f2b_equiv f2b_equiv "['set', 'sshd', 'bantime', '600']" "['set', 'sshd', 'findtime', '10 minutes']" \
+    "['set', 'dbpurgeage', '24h']" "['set', 'sshd', 'bantime.increment', False]"
 
   check "UFW installed and active: abort before any change" t_aborts_because ufw_active '^Abbruch.*(UFW|ufw)'
   check "UFW status unclear (ufw status fails) as root: abort before any change" t_aborts_because ufw_unclear '^Abbruch.*(UFW|ufw)'
@@ -2590,6 +2763,16 @@ PermitRootLogin yes"
     t_sshd_rollback_because ssh_denygroups 'DenyGroups'
   check "SSH: AllowGroups with ubuntu's group, DenyGroups and DenyUsers ub? without ubuntu, earlier drop-in with PasswordAuthentication no: runs, reloads" \
     t_sshd_accepts ssh_groups_ok "allowgroups sshlogin" "denygroups sshdeny" "denyusers ub?" "denyusers root"
+  check "SSH: DenyUsers deploy (ubuntu not affected): warning naming deploy and DenyUsers, no abort, ssh reloaded, the run goes on" \
+    t_sshd_deploy_warns ssh_deploy_denyusers 'DenyUsers' "denyusers deploy"
+  check "SSH: AllowGroups sshlogin, ubuntu a member, deploy (groups deploy, docker) not: warning naming deploy and AllowGroups, no abort, ssh reloaded, the run goes on" \
+    t_sshd_deploy_warns ssh_deploy_allowgroups 'AllowGroups' "allowgroups sshlogin"
+  check "SSH: DenyGroups docker (deploy will be in docker, ubuntu is not): warning naming deploy and DenyGroups, no abort, ssh reloaded, the run goes on" \
+    t_sshd_deploy_warns ssh_deploy_denygroups 'DenyGroups' "denygroups docker"
+  check "SSH: AllowGroups sshlogin docker (ubuntu in sshlogin, deploy will be in docker): ssh reloaded" \
+    t_sshd_accepts ssh_deploy_docker_ok "allowgroups sshlogin" "allowgroups docker"
+  check "SSH: AllowGroups sshlogin docker: no warning about deploy" t_no_warning ssh_deploy_docker_ok '(^|[^[:alnum:]_])deploy([^[:alnum:]_]|$)'
+  check "SSH: fresh server without user or group rules: no warning about deploy" t_no_warning fresh '(^|[^[:alnum:]_])deploy([^[:alnum:]_]|$)'
 
   check "/run/sshd missing: created in the checks (owner root, not group or world writable), the run goes through" \
     t_run_sshd_created run_sshd_missing
