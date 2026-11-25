@@ -19,11 +19,14 @@ ARG CHECK_LIVE=0
 ENV SITE_URL=$SITE_URL BASE_PATH=$BASE_PATH CHECK_LIVE=$CHECK_LIVE
 RUN npx astro build && node scripts/check-site.mjs
 
-FROM nginxinc/nginx-unprivileged:1.30-alpine-slim
-# The upstream image is rebuilt irregularly; pull in Alpine security fixes
-# (nginx, musl, zlib, ...) at build time, then drop back to the unprivileged user.
-USER root
-RUN apk upgrade --no-cache
+# Official nginx image: it gets security releases promptly (nginx-unprivileged was not
+# rebuilt for weeks, see #33). Run it like nginx-unprivileged does: as user nginx (101),
+# port 8080 (docker/nginx.conf), pid and temp files in /tmp so the root filesystem can
+# stay read-only. apk upgrade picks up Alpine fixes published after the base image.
+FROM nginx:1.30-alpine-slim
+RUN apk upgrade --no-cache \
+ && sed -i -e '/^user /d' -e 's,^pid .*,pid /tmp/nginx.pid;,' /etc/nginx/nginx.conf \
+ && sed -i '/^http {/a\    client_body_temp_path /tmp/client_temp;\n    proxy_temp_path /tmp/proxy_temp;\n    fastcgi_temp_path /tmp/fastcgi_temp;\n    uwsgi_temp_path /tmp/uwsgi_temp;\n    scgi_temp_path /tmp/scgi_temp;' /etc/nginx/nginx.conf
 USER 101
 COPY docker/nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /app/dist /usr/share/nginx/html
