@@ -1,6 +1,6 @@
 # Website: Feuerstahl, Striker und Verbindung
 
-Unabhängige deutschsprachige Informationsquelle und Vergleichstest zu Feuerstahl
+Unabhängige, deutschsprachige Informationsquelle und Vergleichstest zu Feuerstahl
 (Ferrocerium-Stab), Striker (Schaber) und der Verbindung zwischen beiden
 (Shockcord, Schnur). Die Betreiber testen selbst. Keine Werbung, keine
 Affiliate-Links, kein Tracking, keine Cookies.
