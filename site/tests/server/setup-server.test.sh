@@ -227,7 +227,49 @@ fixture() {
   case ${SC_V6:-reject} in
     reject) oracle_v6 | ip6tables-restore ;;
     drop_policy) drop_policy_v6 | ip6tables-restore ;;
+    copies_after_reject)
+      oracle_v6 | ip6tables-restore
+      # Copies appended after the REJECT: 22 is open before it anyway, 443 is not.
+      ip6tables -A INPUT -p tcp -m state --state NEW -m tcp --dport 22 -j ACCEPT
+      ip6tables -A INPUT -p tcp -m state --state NEW -m tcp --dport 443 -j ACCEPT
+      ;;
   esac
+
+  # No log retention file of the host leaks into a scenario.
+  rm -f /etc/logrotate.d/00-auth-log /etc/systemd/journald.conf.d/10-aufbewahrung.conf
+  # rsyslog's logrotate file as shipped by Ubuntu's rsyslog package (a conffile, here
+  # a synthetic copy): the script must leave it as it is.
+  if [[ ${SC_LOGROTATE_RSYSLOG:-0} == 1 ]]; then
+    mkdir -p /etc/logrotate.d
+    cat >/etc/logrotate.d/rsyslog <<'CONF'
+/var/log/syslog
+/var/log/mail.log
+/var/log/kern.log
+/var/log/auth.log
+/var/log/user.log
+/var/log/cron.log
+{
+	rotate 4
+	weekly
+	missingok
+	notifempty
+	compress
+	delaycompress
+	sharedscripts
+	postrotate
+		/usr/lib/rsyslog/rsyslog-rotate
+	endscript
+}
+CONF
+    chmod 644 /etc/logrotate.d/rsyslog
+  fi
+  # A journald drop-in from an earlier version, with other content and mode.
+  if [[ ${SC_JOURNALD_OLD:-0} == 1 ]]; then
+    mkdir -p /etc/systemd/journald.conf.d
+    printf '# Older version (test fixture)\n[Journal]\nMaxRetentionSec=1month\n' \
+      >/etc/systemd/journald.conf.d/10-aufbewahrung.conf
+    chmod 600 /etc/systemd/journald.conf.d/10-aufbewahrung.conf
+  fi
 
   # Directories that cannot be written (read-only bind mount inside the sandbox).
   for d in ${SC_RO:-}; do
@@ -271,6 +313,7 @@ run_setup() {
     SSHD_T_FAIL="${SC_SSHD_T_FAIL:-0}"
     STUB_DOCKER_KEY="$KEYS/${SC_DOCKER_KEY:-docker}.asc"
     STUB_IPT_RACE="${SC_IPT_RACE:-}"
+    STUB_DPKG="${SC_DPKG:-}"
   )
   if [[ -n ${SC_DRY_RUN+x} ]]; then envs+=(DRY_RUN="$SC_DRY_RUN"); fi
   if [[ -n ${SC_ADMIN_USER+x} ]]; then envs+=(ADMIN_USER="$SC_ADMIN_USER"); fi
@@ -470,12 +513,42 @@ $log
 if [[ \${1:-} == --print-architecture ]]; then echo arm64; exit 0; fi
 exec /usr/bin/dpkg "\$@"
 EOF
-  # No conflicting package (docker.io, podman-docker, ...) is installed.
-  cat >"$dir/dpkg-query" <<EOF
-#!/bin/bash
-$log
-exit 1
+  # Package states from STUB_DPKG, lines "PACKAGE=STATUS" (for example
+  # "rsyslog=install ok installed"). Every other package is unknown, so no conflicting
+  # package (docker.io, podman-docker, ...) is installed.
+  {
+    printf '#!/bin/bash\n%s\n' "$log"
+    cat <<'EOF'
+fmt="" pkg=""
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -f | --showformat) fmt=$2; shift ;;
+    -f=* | --showformat=*) fmt=${1#*=} ;;
+    -*) ;;
+    *) pkg=$1 ;;
+  esac
+  shift
+done
+status=""
+while IFS= read -r line; do
+  if [[ -n $line && ${line%%=*} == "$pkg" ]]; then status=${line#*=}; fi
+done <<<"${STUB_DPKG:-}"
+if [[ -z $status ]]; then
+  echo "dpkg-query: no packages found matching $pkg" >&2
+  exit 1
+fi
+if [[ -n $fmt ]]; then
+  # STATUS is "WANT ERROR STATE", e.g. "hold ok installed".
+  read -r want _ state <<<"$status"
+  out=${fmt//'${Status}'/$status}
+  out=${out//'${db:Status-Want}'/$want}
+  out=${out//'${db:Status-Status}'/$state}
+  printf '%s' "${out//'${Package}'/$pkg}"
+else
+  printf '%s\t%s\n' "$pkg" "0.0-test"
+fi
 EOF
+  } >"$dir/dpkg-query"
   cat >"$dir/uname" <<EOF
 #!/bin/bash
 $log
@@ -520,7 +593,9 @@ EOF
   done
   # iptables, optionally with a simulated concurrent writer (like fail2ban's
   # "iptables -I INPUT 1 ..."), which inserts a foreign rule at the top of INPUT:
-  #   STUB_IPT_RACE=delete  right before "iptables -D INPUT <n>" is carried out.
+  #   STUB_IPT_RACE=delete  right before "iptables -D INPUT <n>" is carried out,
+  #   STUB_IPT_RACE=insert  right before "iptables -I INPUT <n> ..." is carried out
+  #                         (the script read the REJECT position before).
   # Once per run. STUB_STATE/race_count counts the inserted rules.
   {
     printf '#!/bin/bash\n%s\n' "$log"
@@ -536,6 +611,9 @@ inject() {
   "$real" -I INPUT 1 -s "192.0.2.$n/32" -p tcp -j DROP
 }
 if [[ $mode == delete && $# -eq 3 && $1 == -D && $2 == INPUT && $3 =~ ^[0-9]+$ && ! -f $count_file ]]; then
+  inject
+fi
+if [[ $mode == insert && $# -gt 3 && $1 == -I && $2 == INPUT && $3 =~ ^[0-9]+$ && ! -f $count_file ]]; then
   inject
 fi
 exec "$real" "$@"
@@ -1359,6 +1437,251 @@ t_full_upgrade() {
   return $((1 - ok))
 }
 
+# --- tests: firewall copies behind REJECT (dry run, concurrent insert) -----------
+
+# Dry run with copies behind REJECT in both families (iptables: 80; ip6tables: 22 and
+# 443): exit 0, nothing changed, one warning per copy as in a real run and none for
+# other ports, no insert for ip6tables 22 (open before REJECT already), and the insert
+# positions a real run produces (REAL_V4 and REAL_V6 have the same fixtures).
+t_dry_copy_behind_reject() { # DRY_SCENARIO REAL_V4_SCENARIO REAL_V6_SCENARIO
+  local ok=1 a out tool port want w f s sc fam p
+  have_run "$1" 1 || return 1
+  have_run "$2" 1 || return 1
+  have_run "$3" 1 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)"
+  assert_unchanged "$1" 1
+  for tool in iptables ip6tables; do
+    for port in 22 80 443; do
+      case "$tool $port" in
+        "iptables 80" | "ip6tables 22" | "ip6tables 443") want=1 ;;
+        *) want=0 ;;
+      esac
+      w=$(copy_warnings "$a/err1" "$tool" "$port")
+      ((w == want)) || no "$w warnings about an ACCEPT for tcp $port behind REJECT naming '$tool -L INPUT --line-numbers -n' (expected $want)"
+    done
+  done
+  out=$(cat "$a/out1")
+  ! grep -qE -- '\[Testlauf\] ip6tables -I INPUT [0-9]+ .*--dport 22 ' <<<"$out" ||
+    no "dry run inserts an ACCEPT for ip6tables tcp 22, which is open before REJECT already"
+  for s in "iptables $2 v4" "ip6tables $3 v6"; do
+    read -r tool sc fam <<<"$s"
+    f="$(art "$sc")/${fam}_1"
+    for port in 80 443; do
+      # iptables -S starts with the policy line, so the rule number is line - 1.
+      p=$(grep -nxF -- "$(fw_rule "$port")" "$f" | head -1 | cut -d: -f1)
+      if [[ -z $p ]]; then
+        no "real run ($f) has no ACCEPT for tcp $port"
+        continue
+      fi
+      grep -qE -- "\[Testlauf\] $tool -I INPUT $((p - 1)) -p tcp .*--dport $port -j ACCEPT" <<<"$out" ||
+        no "dry run does not show '$tool -I INPUT $((p - 1))' for tcp $port (a real run puts it there):" "$(grep -E "\[Testlauf\] $tool " <<<"$out")"
+    done
+  done
+  return $((1 - ok))
+}
+
+# Another program inserts a rule at the top of INPUT between the script reading the
+# REJECT position and "iptables -I INPUT <n>" (see the iptables stub). The ACCEPT
+# rules must still end up before the REJECT, no rule is lost (also not the copy
+# behind the REJECT), the foreign rule stays.
+t_fw_insert_race() { # SCENARIO
+  local ok=1 a n port before behind rej lost
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)"
+  n=$(cat "$a/state/race_count" 2>/dev/null || echo 0)
+  ((n >= 1)) || no "the simulated concurrent insert did not fire (no 'iptables -I INPUT <n>' call); this test checks nothing"
+  grep -qxF -- '-A INPUT -s 192.0.2.1/32 -p tcp -j DROP' "$a/v4_1" || no "the foreign rule inserted concurrently is gone"
+  for port in 22 80 443; do
+    read -r before behind rej < <(fw_split "$a/v4_1" "$port")
+    ((before == 1)) || no "$before ACCEPT rules for tcp $port before REJECT (expected exactly 1)"
+  done
+  lost=$(comm -23 <(LC_ALL=C sort "$a/v4_0") <(LC_ALL=C sort "$a/v4_1"))
+  [[ -z $lost ]] || no "rules lost:" "$lost"
+  # Same text as the inserted rule, so the comparison above does not see it go.
+  [[ $(fw_behind_reject "$a/v4_1" "$RACE_WANT") == 1 ]] || no "the copy '$RACE_WANT' behind REJECT is gone"
+  ((ok)) || no "INPUT before the run:"$'\n'"$(cat "$a/v4_0")" "INPUT after the run:"$'\n'"$(cat "$a/v4_1")"
+  return $((1 - ok))
+}
+
+# --- tests: log retention (7 days) ---------------------------------------------
+
+JOURNALD_DROPIN=/etc/systemd/journald.conf.d/10-aufbewahrung.conf
+AUTH_LOGROTATE=/etc/logrotate.d/00-auth-log
+RSYSLOG_LOGROTATE=/etc/logrotate.d/rsyslog
+
+# Stat line and sha256 line of PATH (under /etc) in snapshot N of SCENARIO; empty if
+# the file is not in the upper layer.
+snap_of() { # SCENARIO N PATH
+  awk -v p="./etc/u${3#/etc}" '{ split($0, f, "|") } f[1] == p || substr($0, 67) == p' "$(art "$1")/snap$2"
+}
+
+# Effective MaxRetentionSec and MaxFileSec in section [Journal] of a journald drop-in
+# (the last assignment wins; comments and other sections do not count), "-" if unset.
+journald_values() { # FILE
+  awk '
+    /^[[:space:]]*[#;]/ || /^[[:space:]]*$/ { next }
+    /^[[:space:]]*\[/ { sec = $0; gsub(/[[:space:]]/, "", sec); next }
+    sec == "[Journal]" && /=/ {
+      k = $0; sub(/=.*/, "", k); gsub(/[[:space:]]/, "", k)
+      v = $0; sub(/^[^=]*=/, "", v); gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+      val[k] = v }
+    END {
+      r = ("MaxRetentionSec" in val) ? val["MaxRetentionSec"] : "-"
+      f = ("MaxFileSec" in val) ? val["MaxFileSec"] : "-"
+      print r, f }' "$1"
+}
+
+# The journald drop-in of SCENARIO after its run 1: [Journal] with MaxRetentionSec=6day
+# and MaxFileSec=1day, mode 644, owner root, directory mode 755; systemd-journald
+# restarted exactly once in run 1.
+journald_written() { # SCENARIO
+  local f r
+  f="$(upper "$1" etc)${JOURNALD_DROPIN#/etc}"
+  if [[ ! -f $f ]]; then
+    no "$JOURNALD_DROPIN was not written"
+    return
+  fi
+  [[ $(journald_values "$f") == "6day 1day" ]] ||
+    no "[Journal] of $JOURNALD_DROPIN: MaxRetentionSec MaxFileSec = '$(journald_values "$f")', expected '6day 1day':" "$(cat "$f")"
+  [[ $(stat -c '%a %U:%G' "$f") == "644 root:root" ]] || no "$JOURNALD_DROPIN: mode and owner $(stat -c '%a %U:%G' "$f"), expected 644 root:root"
+  [[ $(stat -c %a "$(dirname "$f")") == 755 ]] || no "$(dirname "$JOURNALD_DROPIN"): mode $(stat -c %a "$(dirname "$f")"), expected 755"
+  r=$(grep -E '^systemctl .*journald' "$(art "$1")/log1")
+  [[ $r =~ ^systemctl\ restart\ systemd-journald(\.service)?$ ]] ||
+    no "run 1 (drop-in written): expected exactly one 'systemctl restart systemd-journald', got:" "${r:-nothing}"
+}
+
+# Fresh server: journald keeps entries with IP addresses for about 7 days at most (see
+# journald_written). Run 2 leaves the drop-in as it is (inode, times, content) and does
+# not restart systemd-journald.
+t_journald_dropin() { # SCENARIO
+  local ok=1 a s1 d r
+  have_run "$1" 2 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 1) == 0 ]] || no "run 1: expected exit code 0, got: $(rc_of "$1" 1)"
+  journald_written "$1"
+  s1=$(snap_of "$1" 1 "$JOURNALD_DROPIN")
+  if [[ -z $s1 ]]; then
+    no "$JOURNALD_DROPIN is not in the snapshot after run 1"
+  else
+    d=$(diff <(printf '%s\n' "$s1") <(snap_of "$1" 2 "$JOURNALD_DROPIN")) || no "run 2 changed $JOURNALD_DROPIN:" "$d"
+  fi
+  r=$(grep -E '^systemctl .*journald' "$a/log2")
+  [[ -z $r ]] || no "run 2 (drop-in unchanged) touched systemd-journald:" "$r"
+  return $((1 - ok))
+}
+
+# A drop-in from an earlier version (other values, mode 600) is replaced (see
+# journald_written), and systemd-journald restarted once.
+t_journald_old_replaced() { # SCENARIO
+  local ok=1 s0
+  have_run "$1" 1 || return 1
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)"
+  s0=$(snap_of "$1" 0 "$JOURNALD_DROPIN")
+  grep -q '|600|' <<<"$s0" || no "fixture: no old $JOURNALD_DROPIN with mode 600 before the run:" "$s0"
+  journald_written "$1"
+  return $((1 - ok))
+}
+
+# Items of a logrotate file: "path P" for every log file named before "{", "dir D" for
+# every directive inside the block (words joined by one space); scripts (postrotate
+# ... endscript and the like) only by their first word.
+logrotate_items() { # FILE
+  awk '
+    /^[[:space:]]*#/ || NF == 0 { next }
+    script { if ($1 == "endscript") script = 0; next }
+    !block { for (i = 1; i <= NF; i++) { if ($i == "{") block = 1; else if (!block) print "path " $i }; next }
+    $1 == "}" { block = 0; next }
+    $1 ~ /^(prerotate|postrotate|firstaction|lastaction|preremove)$/ { script = 1; print "dir " $1; next }
+    { $1 = $1; print "dir " $0 }' "$1"
+}
+
+# rsyslog installed: /etc/logrotate.d/00-auth-log rotates only /var/log/auth.log, with
+# daily, rotate 6, ignoreduplicates, ifempty, missingok and nothing that keeps it
+# longer; mode 644, owner root. The package file /etc/logrotate.d/rsyslog stays as it
+# is (inode, times, content) in both runs; run 2 leaves 00-auth-log as it is.
+t_auth_logrotate() { # SCENARIO
+  local ok=1 a f items d bad r s0
+  have_run "$1" 2 || return 1
+  a=$(art "$1")
+  for r in 1 2; do
+    [[ $(rc_of "$1" "$r") == 0 ]] || no "run $r: expected exit code 0, got: $(rc_of "$1" "$r")"
+  done
+  f="$(upper "$1" etc)${AUTH_LOGROTATE#/etc}"
+  if [[ -f $f ]]; then
+    items=$(logrotate_items "$f")
+    [[ $(grep '^path ' <<<"$items") == "path /var/log/auth.log" ]] ||
+      no "$AUTH_LOGROTATE must name /var/log/auth.log and nothing else, names:" "$(grep '^path ' <<<"$items")"
+    for d in daily "rotate 6" ignoreduplicates ifempty missingok; do
+      grep -qxF "dir $d" <<<"$items" || no "$AUTH_LOGROTATE lacks: $d"
+    done
+    bad=$(grep -E '^dir (hourly|weekly|monthly|yearly|notifempty|size|minsize|minage)( |$)' <<<"$items")
+    [[ -z $bad ]] || no "$AUTH_LOGROTATE has directives that rotate less often or keep it longer:" "$bad"
+    [[ $(grep -c '^dir rotate ' <<<"$items") == 1 ]] || no "$AUTH_LOGROTATE: expected exactly one rotate, found:" "$(grep '^dir rotate ' <<<"$items")"
+    [[ $(stat -c '%a %U:%G' "$f") == "644 root:root" ]] || no "$AUTH_LOGROTATE: mode and owner $(stat -c '%a %U:%G' "$f"), expected 644 root:root"
+    d=$(diff <(snap_of "$1" 1 "$AUTH_LOGROTATE") <(snap_of "$1" 2 "$AUTH_LOGROTATE")) || no "run 2 changed $AUTH_LOGROTATE:" "$d"
+    ((ok)) || no "$AUTH_LOGROTATE:"$'\n'"$(cat "$f")"
+  else
+    no "$AUTH_LOGROTATE was not written although rsyslog is installed"
+  fi
+  s0=$(snap_of "$1" 0 "$RSYSLOG_LOGROTATE")
+  [[ -n $s0 ]] || no "fixture: no $RSYSLOG_LOGROTATE before the run"
+  for r in 1 2; do
+    d=$(diff <(printf '%s\n' "$s0") <(snap_of "$1" "$r" "$RSYSLOG_LOGROTATE")) || no "run $r changed $RSYSLOG_LOGROTATE:" "$d"
+  done
+  return $((1 - ok))
+}
+
+# rsyslog not installed (unknown to dpkg, or removed with only its conffiles left):
+# no 00-auth-log and no other new file in /etc/logrotate.d; a leftover
+# /etc/logrotate.d/rsyslog stays as it is. The run reached the log retention step and
+# asked dpkg-query about rsyslog.
+t_no_auth_logrotate() { # SCENARIO
+  local ok=1 a dir new s0 d
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)"
+  [[ -f "$(upper "$1" etc)${JOURNALD_DROPIN#/etc}" ]] || no "the run did not reach the log retention step (no $JOURNALD_DROPIN)"
+  grep -qE '^dpkg-query( .*)? rsyslog$' "$a/log1" || no "the script did not ask dpkg-query whether rsyslog is installed"
+  dir="$(upper "$1" etc)/logrotate.d"
+  [[ ! -f $dir/00-auth-log ]] || no "$AUTH_LOGROTATE written although rsyslog is not installed:" "$(cat "$dir/00-auth-log")"
+  new=$(find "$dir" -mindepth 1 -type f ! -name rsyslog 2>/dev/null)
+  [[ -z $new ]] || no "new files in /etc/logrotate.d:" "$new"
+  s0=$(snap_of "$1" 0 "$RSYSLOG_LOGROTATE")
+  if [[ -n $s0 ]]; then
+    d=$(diff <(printf '%s\n' "$s0") <(snap_of "$1" 1 "$RSYSLOG_LOGROTATE")) || no "run changed $RSYSLOG_LOGROTATE:" "$d"
+  fi
+  return $((1 - ok))
+}
+
+# Dry run: exit 0, nothing changed; it shows the journald drop-in with its content and
+# the restart, and the auth.log rotation with its content if WITH_AUTH is 1, or not at
+# all if WITH_AUTH is 0 (rsyslog not installed). /etc/logrotate.d/rsyslog never shows
+# up as written.
+t_dry_log_retention() { # SCENARIO WITH_AUTH(0|1)
+  local ok=1 all re
+  have_run "$1" 1 || return 1
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)"
+  assert_unchanged "$1" 1
+  all=$(cat "$(art "$1")/out1" "$(art "$1")/err1")
+  for re in "würde $JOURNALD_DROPIN schreiben" '\|[[:space:]]+\[Journal\]$' '\|[[:space:]]+MaxRetentionSec=6day$' \
+    '\|[[:space:]]+MaxFileSec=1day$' '\[Testlauf\] systemctl restart systemd-journald$'; do
+    grep -qE -- "$re" <<<"$all" || no "dry-run output lacks: $re"
+  done
+  if [[ $2 == 1 ]]; then
+    for re in "würde $AUTH_LOGROTATE schreiben" '\|[[:space:]]+/var/log/auth\.log \{$' '\|[[:space:]]+daily$' \
+      '\|[[:space:]]+rotate 6$' '\|[[:space:]]+ignoreduplicates$' '\|[[:space:]]+ifempty$' '\|[[:space:]]+missingok$'; do
+      grep -qE -- "$re" <<<"$all" || no "dry-run output lacks: $re"
+    done
+  else
+    ! grep -qF -- "$AUTH_LOGROTATE" <<<"$all" || no "dry run shows $AUTH_LOGROTATE although rsyslog is not installed:" "$(grep -F -- "$AUTH_LOGROTATE" <<<"$all")"
+  fi
+  ! grep -qE -- "würde $RSYSLOG_LOGROTATE|\[Testlauf\] .*$RSYSLOG_LOGROTATE" <<<"$all" ||
+    no "dry run would change $RSYSLOG_LOGROTATE:" "$(grep -F -- "$RSYSLOG_LOGROTATE" <<<"$all")"
+  return $((1 - ok))
+}
+
 # --- tests: the test sandbox itself -------------------------------------------
 
 t_guard_refuses() { # GUARD_CASE
@@ -1532,6 +1855,15 @@ PermitRootLogin yes"
   # Firewall
   scenario v6_drop SC_V6=drop_policy SC_RUNS=2
   scenario race_delete SC_FW=accept_after_reject SC_V6=none SC_IPT_RACE=delete
+  scenario fw_after_reject_v6 SC_V6=copies_after_reject SC_RUNS=2
+  scenario dry_after_reject SC_DRY_RUN=1 SC_FW=accept_after_reject SC_V6=copies_after_reject
+  scenario race_insert SC_FW=accept_after_reject SC_V6=none SC_IPT_RACE=insert
+  # Log retention
+  scenario rsyslog "SC_DPKG=rsyslog=install ok installed" SC_LOGROTATE_RSYSLOG=1 SC_RUNS=2
+  scenario rsyslog_removed "SC_DPKG=rsyslog=deinstall ok config-files" SC_LOGROTATE_RSYSLOG=1
+  scenario rsyslog_hold "SC_DPKG=rsyslog=hold ok installed" SC_LOGROTATE_RSYSLOG=1 SC_RUNS=2
+  scenario dry_rsyslog SC_DRY_RUN=1 "SC_DPKG=rsyslog=install ok installed" SC_LOGROTATE_RSYSLOG=1
+  scenario journald_old SC_JOURNALD_OLD=1
   # Docker key
   scenario key_wrong SC_DOCKER_KEY=wrong
   scenario key_two SC_DOCKER_KEY=two
@@ -1643,6 +1975,27 @@ PermitRootLogin yes"
   check "firewall IPv6 policy ACCEPT without REJECT: no rule added" t_fw_family_unchanged fw_drop_policy v6
   check "firewall: no rule deleted, replaced, flushed or restored in any scenario (call logs and dry-run output)" t_fw_never_deletes
   check "firewall: INPUT changes right before iptables -D: no other rule deleted" t_fw_no_rule_lost race_delete delete
+
+  check "firewall IPv6: ACCEPT 443 only after REJECT, copy of 22 after REJECT too: one 443 inserted before REJECT, both copies stay, warning on every run, no -D/-R, second run 0 changes" \
+    t_fw_copy_behind_reject fw_after_reject_v6 v6 ip6tables 22 443
+  check "dry run with copies behind REJECT (IPv4 and IPv6): nothing changed, same warnings and insert positions as a real run" \
+    t_dry_copy_behind_reject dry_after_reject fw_after_reject fw_after_reject_v6
+  check "firewall: INPUT changes right before iptables -I: ACCEPT still before REJECT, no rule lost" t_fw_insert_race race_insert
+
+  check "log retention: journald drop-in [Journal] MaxRetentionSec=6day MaxFileSec=1day, 644, restart only in the run that writes it" \
+    t_journald_dropin fresh
+  check "log retention: older journald drop-in (other values, mode 600) replaced, journald restarted once" \
+    t_journald_old_replaced journald_old
+  check "log retention: rsyslog installed: 00-auth-log daily, rotate 6, ignoreduplicates, ifempty, missingok; logrotate.d/rsyslog unchanged" \
+    t_auth_logrotate rsyslog
+  check "log retention: rsyslog installed and held (hold ok installed): 00-auth-log as above, logrotate.d/rsyslog unchanged" \
+    t_auth_logrotate rsyslog_hold
+  check "log retention: rsyslog not installed: no 00-auth-log" t_no_auth_logrotate fresh
+  check "log retention: rsyslog removed, conffiles left (deinstall ok config-files): no 00-auth-log, logrotate.d/rsyslog unchanged" \
+    t_no_auth_logrotate rsyslog_removed
+  check "dry run with rsyslog: shows journald drop-in and 00-auth-log with their content, changes nothing" \
+    t_dry_log_retention dry_rsyslog 1
+  check "dry run without rsyslog: shows journald drop-in, no 00-auth-log" t_dry_log_retention dry 0
 
   check "dry run shows: systemctl enable netfilter-persistent" t_dry_shows 'systemctl enable netfilter-persistent'
   check "packages: apt-get full-upgrade instead of upgrade (real and dry run)" t_full_upgrade
