@@ -19,6 +19,10 @@
 #   the negative tests a key generated for this run with another fingerprint.
 # - A fresh server has no group docker; the apt-get stub creates it when docker-ce
 #   is installed, like the real package. The host's group docker does not matter.
+# - Every run of the script gets a defined audit login UID (/proc/self/loginuid, which
+#   the script compares with ADMIN_USER): "not set" unless the scenario sets one. The
+#   session the tests are started from does not matter; if the kernel does not allow
+#   setting it, the tests do not run (exit code 2).
 # Nothing on the host changes; the temporary directory is removed at the end.
 #
 # Usage (as root): bash site/tests/server/setup-server.test.sh
@@ -41,6 +45,10 @@ SANDBOX_PATH_TAIL=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 DOCKER_FPR=9DC858229FC7DD38854AE2D88D81803C0EBFCD88
 # The ineffective rule the firewall race tests revolve around (fixture accept_after_reject).
 RACE_WANT='-A INPUT -p tcp -m state --state NEW -m tcp --dport 80 -j ACCEPT'
+# Audit login UID (/proc/self/loginuid) of the runs: "not set" unless a scenario sets
+# SC_LOGINUID (see run_setup). LOGINUID_NOUSER is a UID without a user.
+LOGINUID_UNSET=4294967295
+LOGINUID_NOUSER=3999999999
 
 # ===========================================================================
 # Inside the sandbox (called as: unshare -m -n ... bash THIS __inner ARTDIR)
@@ -406,8 +414,32 @@ dump_fw() {
   { iptables-save; ip6tables-save; } | grep -v '^#' | sed -E 's/\[[0-9]+:[0-9]+\]/[0:0]/g'
 }
 
+# set_loginuid UID: give the calling process the audit login UID UID (inherited by
+# everything it starts). Only writes if it differs: the kernel can refuse any change of
+# a login UID that is set (loginuid immutable, no CAP_AUDIT_CONTROL), even to the same
+# value. Call it in a subshell; /proc/self is that process then.
+set_loginuid() {
+  local cur
+  cur=$(loginuid_now) || return 1
+  [[ $cur == "$1" ]] && return 0
+  printf '%s' "$1" >/proc/self/loginuid || return 1
+  [[ $(loginuid_now) == "$1" ]]
+}
+
+# loginuid_now: the audit login UID of this process (the file ends without a newline).
+loginuid_now() {
+  local v=""
+  read -r v </proc/self/loginuid 2>/dev/null || true
+  [[ -n $v ]] && printf '%s\n' "$v"
+}
+
+# loginuid_of VALUE: VALUE as a UID: a number as it is, else the UID of the user VALUE.
+loginuid_of() {
+  if [[ $1 =~ ^[0-9]+$ ]]; then echo "$1"; else id -u -- "$1"; fi
+}
+
 run_setup() {
-  local art=$1 n=$2 rc=0 stubs=$STUBS
+  local art=$1 n=$2 rc=0 stubs=$STUBS lu
   local -a envs pre=()
   : >"$art/log$n"
   chmod 666 "$art/log$n"
@@ -431,8 +463,25 @@ run_setup() {
   if [[ ${SC_AS:-root} == nobody ]]; then
     pre=(setpriv --reuid=nobody --regid=nogroup --clear-groups --)
   fi
-  "${pre[@]}" env -i "${envs[@]}" bash "$art/setup-server.sh" >"$art/out$n" 2>"$art/err$n" || rc=$?
-  echo "$rc" >"$art/rc$n"
+  # The script compares the audit login UID (/proc/self/loginuid) with ADMIN_USER. Every
+  # process inherits it from the login session the tests were started in, so without
+  # this the result would depend on that session (e.g. "sudo su -" as claude). Each run
+  # gets a defined value instead: SC_LOGINUID (number or user name inside the sandbox),
+  # default "not set". loginuidN is what the run really had; without it (value could not
+  # be set) the script is not started and rcN is not written, so have_run fails.
+  lu=$(loginuid_of "${SC_LOGINUID:-$LOGINUID_UNSET}") || lu=""
+  echo "$lu" >"$art/loginuid_want$n"
+  getent passwd "$lu" | cut -d: -f1 >"$art/loginuid_user$n" || true
+  rm -f "$art/loginuid$n"
+  (
+    if [[ -z $lu ]] || ! set_loginuid "$lu" || ! got=$(loginuid_now); then
+      echo "test fixture: audit login UID '$lu' could not be set" >&2
+      exit 99
+    fi
+    echo "$got" >"$art/loginuid$n"
+    exec "${pre[@]}" env -i "${envs[@]}" bash "$art/setup-server.sh"
+  ) >"$art/out$n" 2>"$art/err$n" || rc=$?
+  if [[ -f $art/loginuid$n ]]; then echo "$rc" >"$art/rc$n"; fi
 }
 
 post_checks() {
@@ -872,10 +921,12 @@ art() { echo "$WORK/$1"; }
 upper() { echo "$WORK/$1/ovl/$2/u"; } # upper layer: SCENARIO DIR
 
 # Artifacts of run N must exist, otherwise a missing sandbox would look like success.
+# Run N must also have had the audit login UID the scenario defines (run_setup), so that
+# the result does not depend on the session the tests were started from.
 have_run() { # SCENARIO N
   local a f
   a=$(art "$1")
-  for f in inner_ok "rc$2" snap0 "snap$2" fw0 "fw$2" "log$2" "out$2" "err$2"; do
+  for f in inner_ok "rc$2" snap0 "snap$2" fw0 "fw$2" "log$2" "out$2" "err$2" "loginuid$2" "loginuid_want$2"; do
     [[ -f $a/$f ]] || {
       no "artifact $f of scenario $1 is missing (sandbox failed)"
       return 1
@@ -883,6 +934,10 @@ have_run() { # SCENARIO N
   done
   [[ -s $a/snap0 ]] || {
     no "snapshot before the run is empty (fixture missing)"
+    return 1
+  }
+  [[ -s $a/loginuid$2 && $(cat "$a/loginuid$2") == "$(cat "$a/loginuid_want$2")" ]] || {
+    no "run $2 of scenario $1 had the audit login UID '$(cat "$a/loginuid$2")', expected '$(cat "$a/loginuid_want$2")'"
     return 1
   }
 }
@@ -2328,6 +2383,27 @@ t_guard_refuses() { # GUARD_CASE
   return $((1 - ok))
 }
 
+# Every run of every scenario had a defined audit login UID: SC_LOGINUID or, without it,
+# 4294967295 (not set), whatever the session the tests were started from has (CALLER_LOGINUID).
+t_loginuid_defined() {
+  local ok=1 f n=0 want got sc
+  for f in "$WORK"/*/loginuid_want[0-9]*; do
+    [[ -f $f ]] || continue
+    n=$((n + 1))
+    want=$(cat "$f")
+    got=$(cat "${f/loginuid_want/loginuid}" 2>/dev/null) || got="missing"
+    sc=${f#"$WORK"/}
+    [[ $got == "$want" ]] || no "${sc%%/*}: run had audit login UID '$got', expected '$want'"
+  done
+  # Otherwise this test would look at nothing.
+  ((n >= 50)) || no "too little to check: $n runs with a recorded audit login UID"
+  # The default is "not set", not the caller's UID; a scenario without SC_LOGINUID must
+  # have had it (fresh has none).
+  [[ $(cat "$WORK/fresh/loginuid1" 2>/dev/null) == "$LOGINUID_UNSET" ]] ||
+    no "fresh: run 1 had audit login UID '$(cat "$WORK/fresh/loginuid1" 2>/dev/null)', expected $LOGINUID_UNSET (the caller's is $CALLER_LOGINUID)"
+  return $((1 - ok))
+}
+
 # --- tests: host untouched --------------------------------------------------
 
 host_state() {
@@ -2426,6 +2502,23 @@ main() {
     echo "CANNOT RUN: /proc/self/ns not readable"
     exit 2
   fi
+  # The runs get a defined audit login UID (run_setup); the result must not depend on
+  # the session the tests are started from. Every value the scenarios use must be
+  # settable from here.
+  if ! CALLER_LOGINUID=$(loginuid_now); then
+    echo "CANNOT RUN: /proc/self/loginuid not readable (kernel without audit login UID); the runs cannot get a defined login UID"
+    exit 2
+  fi
+  if getent passwd "$LOGINUID_NOUSER" >/dev/null; then
+    echo "CANNOT RUN: UID $LOGINUID_NOUSER has a user on this host (the fixtures use it as a UID without a user)"
+    exit 2
+  fi
+  for c in "$LOGINUID_UNSET" 0 "$(id -u ubuntu)" "$(id -u claude)" "$LOGINUID_NOUSER"; do
+    if ! (set_loginuid "$c") 2>/dev/null; then
+      echo "CANNOT RUN: the audit login UID of this session ($CALLER_LOGINUID, /proc/self/loginuid) cannot be changed to $c for the runs (the kernel refuses: loginuid immutable, or no CAP_AUDIT_CONTROL). The script compares it with ADMIN_USER, so the results would depend on the session. Start the tests from a session without a login UID or with permission to change it."
+      exit 2
+    fi
+  done
 
   WORK=$(mktemp -d "${TMPDIR:-/tmp}/setup-server-test.XXXXXX")
   case $WORK in
@@ -2798,6 +2891,8 @@ PermitRootLogin yes"
   check "sandbox: inner entry point without caller markers refuses, mounts nothing" t_guard_refuses guard_no_markers
   check "sandbox: inner entry point in its caller's namespaces refuses, mounts nothing" t_guard_refuses guard_caller_ns
   check "sandbox: inner entry point in the namespaces of PID 1 refuses, mounts nothing" t_guard_refuses guard_pid1
+
+  check "sandbox: every run had a defined audit login UID (default not set), whatever the caller's session has" t_loginuid_defined
 
   check "host untouched after all scenarios" t_host_untouched
 
