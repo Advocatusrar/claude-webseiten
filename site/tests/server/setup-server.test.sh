@@ -12,6 +12,10 @@
 #   timedatectl, curl, netfilter-persistent, ...) are stubs that log their
 #   arguments. iptables, sshd, fail2ban-client, useradd and usermod are the real
 #   tools (inside the sandbox), wrapped so that their calls are logged too.
+# - The curl stub serves Docker's real public apt key (fixtures/docker.asc), or for
+#   the negative tests a key generated for this run with another fingerprint.
+# - A fresh server has no group docker; the apt-get stub creates it when docker-ce
+#   is installed, like the real package. The host's group docker does not matter.
 # Nothing on the host changes; the temporary directory is removed at the end.
 #
 # Usage (as root): bash site/tests/server/setup-server.test.sh
@@ -22,11 +26,18 @@ set -uo pipefail
 
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
 HERE=$(dirname "$SELF")
+FIXTURES="$HERE/fixtures"
 SETUP=$(readlink -f "${SETUP_SCRIPT:-$HERE/../../../deploy/setup-server.sh}")
 OVERLAY_DIRS=(etc home run var usr opt root srv)
 # Synthetic test key, not a real one.
 TEST_KEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyForTestsOnly000000000000000000000 test@example.invalid'
 SANDBOX_PATH_TAIL=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Fingerprint of Docker's apt signing key ("Docker Release (CE deb)", rsa4096,
+# 2017-02-22). fixtures/docker.asc was fetched on 2026-11-25 from
+# https://download.docker.com/linux/ubuntu/gpg and checked with gpg --show-keys.
+DOCKER_FPR=9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+# The ineffective rule the firewall race tests revolve around (fixture accept_after_reject).
+RACE_WANT='-A INPUT -p tcp -m state --state NEW -m tcp --dport 80 -j ACCEPT'
 
 # ===========================================================================
 # Inside the sandbox (called as: unshare -m -n ... bash THIS __inner ARTDIR)
@@ -83,17 +94,60 @@ COMMIT
 RULES
 }
 
-put_key() { # USER CONTENT
-  local user=$1 content=$2 group
+drop_policy_v6() {
+  cat <<'RULES'
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+-A INPUT -p ipv6-icmp -j ACCEPT
+-A INPUT -i lo -j ACCEPT
+-A INPUT -p tcp -m state --state NEW -m tcp --dport 22 -j ACCEPT
+COMMIT
+RULES
+}
+
+# put_key USER CONTENT [WHERE]: WHERE is "home" (home directory from getent passwd,
+# default), "legacy_home" (/home/USER, whatever passwd says) or "etc"
+# (/etc/ssh/authorized_keys/USER, owned by root).
+put_key() {
+  local user=$1 content=$2 at=${3:-home} group dir file
   group=$(id -gn "$user")
-  install -d -o "$user" -g "$group" -m 700 "/home/$user/.ssh"
-  printf '%b' "$content" >"/home/$user/.ssh/authorized_keys"
-  chown "$user:$group" "/home/$user/.ssh/authorized_keys"
-  chmod 600 "/home/$user/.ssh/authorized_keys"
+  case $at in
+    home) dir="$(getent passwd "$user" | cut -d: -f6)/.ssh" ;;
+    legacy_home) dir="/home/$user/.ssh" ;;
+    etc) dir=/etc/ssh/authorized_keys ;;
+    *)
+      echo "fixture: unknown key location $at" >&2
+      return 1
+      ;;
+  esac
+  if [[ $at == etc ]]; then
+    install -d -m 755 "$dir"
+    file="$dir/$user"
+    printf '%b' "$content" >"$file"
+    chmod 644 "$file"
+  else
+    install -d -o "$user" -g "$group" -m 700 "$dir"
+    file="$dir/authorized_keys"
+    printf '%b' "$content" >"$file"
+    chown "$user:$group" "$file"
+    chmod 600 "$file"
+  fi
+}
+
+# Name, mode, owner and content of every file in /etc/ssh/sshd_config.d.
+sshd_state() {
+  local f
+  for f in /etc/ssh/sshd_config.d/*; do
+    [[ -e $f ]] || continue
+    printf '%s %s\n' "$(stat -c '%n %a %U:%G' "$f")" "$(sha256sum <"$f" | cut -d' ' -f1)"
+  done
 }
 
 fixture() {
-  local art=$1 key_user=${SC_KEY_USER:-ubuntu} u
+  local art=$1 key_user=${SC_KEY_USER:-ubuntu} u d
 
   # Service and time zone state of a fresh server, used by the stubs.
   mkdir -p "$art/state"
@@ -101,10 +155,15 @@ fixture() {
   touch "$art/state/enabled.ssh" "$art/state/active.ssh"
   chmod -R a+rwX "$art/state"
 
+  # An admin user whose home directory is not /home/NAME.
+  if [[ -n ${SC_EXTRA_USER:-} ]]; then
+    useradd --create-home --home-dir "/srv/$SC_EXTRA_USER" --shell /bin/bash "$SC_EXTRA_USER"
+  fi
+
   # No authorized_keys of the host leaks into a scenario.
-  for u in ubuntu claude; do rm -f "/home/$u/.ssh/authorized_keys"; done
+  for u in ubuntu claude; do rm -f "/home/$u/.ssh/authorized_keys" "/home/$u/.ssh/authorized_keys2"; done
   case ${SC_KEY:-valid} in
-    valid) put_key "$key_user" "$TEST_KEY\n" ;;
+    valid) put_key "$key_user" "$TEST_KEY\n" "${SC_KEY_AT:-home}" ;;
     empty) put_key "$key_user" "" ;;
     comments) put_key "$key_user" "# no key here\n\n   \n# ssh-ed25519 commented out\n" ;;
     none) ;;
@@ -113,6 +172,30 @@ fixture() {
   # Cloud images ship drop-ins that enable passwords; the hardening must win.
   mkdir -p /etc/ssh/sshd_config.d
   printf 'PasswordAuthentication yes\n' >/etc/ssh/sshd_config.d/50-cloud-init.conf
+  # AuthorizedKeysFile other than the default.
+  case ${SC_AKF:-default} in
+    default) ;;
+    none) printf 'AuthorizedKeysFile none\n' >/etc/ssh/sshd_config.d/05-test-akf.conf ;;
+    custom) printf 'AuthorizedKeysFile /etc/ssh/authorized_keys/%%u\n' >/etc/ssh/sshd_config.d/05-test-akf.conf ;;
+  esac
+  # Only for ubuntu, via Match (at the end of sshd_config, where Match belongs).
+  if [[ ${SC_AKF_MATCH:-0} == 1 ]]; then
+    printf '\n# test fixture\nMatch User ubuntu\n    AuthorizedKeysFile /etc/ssh/authorized_keys/%%u\n' >>/etc/ssh/sshd_config
+  fi
+  # sshd_config without "Include sshd_config.d": the hardening drop-in is not read.
+  if [[ ${SC_SSHD_NOINCLUDE:-0} == 1 ]]; then
+    sed -i -E '/^[[:space:]]*Include[[:space:]]/d' /etc/ssh/sshd_config
+    if grep -qiE '^[[:space:]]*Include' /etc/ssh/sshd_config; then
+      echo "fixture: Include still in sshd_config" >&2
+      return 1
+    fi
+  fi
+  # A hardening drop-in from an earlier run, with its own content and mode.
+  if [[ ${SC_SSHD_OLD:-0} == 1 ]]; then
+    printf '# Older version (test fixture)\nPasswordAuthentication no\nAllowUsers ubuntu\n' \
+      >/etc/ssh/sshd_config.d/10-haertung.conf
+    chmod 640 /etc/ssh/sshd_config.d/10-haertung.conf
+  fi
   # A default that differs from the wanted values; the script's values must win.
   mkdir -p /etc/apt/apt.conf.d
   printf 'Unattended-Upgrade::Automatic-Reboot "false";\nUnattended-Upgrade::Automatic-Reboot-Time "02:00";\n' \
@@ -123,8 +206,14 @@ fixture() {
     printf 'PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"\nID=debian\nVERSION_ID="12"\nVERSION_CODENAME=bookworm\n' >/etc/os-release
   fi
 
-  # Fresh server: Docker is not installed yet.
-  if [[ ${SC_HIDE_DOCKER:-1} == 1 ]]; then rm -f /usr/bin/docker; fi
+  # Fresh server: Docker is not installed yet, so there is no group docker either
+  # (the docker-ce package creates it; here the apt-get stub does).
+  if [[ ${SC_HIDE_DOCKER:-1} == 1 ]]; then
+    rm -f /usr/bin/docker
+    if getent group docker >/dev/null; then groupdel docker; fi
+  elif ! getent group docker >/dev/null; then
+    groupadd --system docker
+  fi
 
   case ${SC_FW:-oracle} in
     oracle) oracle_v4 | iptables-restore ;;
@@ -135,7 +224,22 @@ fixture() {
       ;;
     drop_policy) drop_policy_v4 | iptables-restore ;;
   esac
-  if [[ ${SC_V6:-reject} == reject ]]; then oracle_v6 | ip6tables-restore; fi
+  case ${SC_V6:-reject} in
+    reject) oracle_v6 | ip6tables-restore ;;
+    drop_policy) drop_policy_v6 | ip6tables-restore ;;
+  esac
+
+  # Directories that cannot be written (read-only bind mount inside the sandbox).
+  for d in ${SC_RO:-}; do
+    mount --bind "$d" "$d"
+    mount -o remount,bind,ro "$d"
+  done
+  # Single files that cannot be replaced while their directory stays writable: with a
+  # bind mount on the file itself, renaming another file onto it fails (EBUSY).
+  for f in ${SC_BUSY:-}; do
+    printf '// placeholder (test fixture)\n' >"$f"
+    mount --bind "$f" "$f"
+  done
 }
 
 snapshot() {
@@ -158,13 +262,19 @@ run_setup() {
   local -a envs pre=()
   : >"$art/log$n"
   chmod 666 "$art/log$n"
+  # Own TMPDIR per scenario: the script's temporary files stay out of the host's /tmp
+  # and the tests can see whether they are removed.
+  install -d -m 1777 "$art/tmp"
   envs=(
-    PATH="$STUBS:$SANDBOX_PATH_TAIL" HOME=/root LANG=C.UTF-8
+    PATH="$STUBS:$SANDBOX_PATH_TAIL" HOME=/root LANG=C.UTF-8 TMPDIR="$art/tmp"
     STUB_LOG="$art/log$n" STUB_STATE="$art/state"
     SSHD_T_FAIL="${SC_SSHD_T_FAIL:-0}"
+    STUB_DOCKER_KEY="$KEYS/${SC_DOCKER_KEY:-docker}.asc"
+    STUB_IPT_RACE="${SC_IPT_RACE:-}"
   )
   if [[ -n ${SC_DRY_RUN+x} ]]; then envs+=(DRY_RUN="$SC_DRY_RUN"); fi
   if [[ -n ${SC_ADMIN_USER+x} ]]; then envs+=(ADMIN_USER="$SC_ADMIN_USER"); fi
+  if [[ -n ${SC_SUDO_USER+x} ]]; then envs+=(SUDO_USER="$SC_SUDO_USER"); fi
   if [[ ${SC_AS:-root} == nobody ]]; then
     pre=(setpriv --reuid=nobody --regid=nogroup --clear-groups --)
   fi
@@ -181,6 +291,7 @@ post_checks() {
   id -nG deploy >"$art/deploy_groups" 2>/dev/null || true
   stat -c '%n %U %G %a %s' /home/deploy/.ssh /home/deploy/.ssh/authorized_keys >"$art/deploy_stat" 2>&1 || true
   ls -1 /etc/ssh/sshd_config.d >"$art/sshd_dir" 2>&1 || true
+  sshd_state >"$art/sshd_state_end"
   if command -v dockerd >/dev/null 2>&1 && [[ -f /etc/docker/daemon.json ]]; then
     dockerd --validate --config-file=/etc/docker/daemon.json >"$art/dockerd_validate" 2>&1
     echo "rc=$?" >>"$art/dockerd_validate"
@@ -199,8 +310,40 @@ between_runs() {
   iptables -I FORWARD 1 -j DOCKER-USER
 }
 
+# inner_guard ARTDIR: refuse to run outside a sandbox. Called directly (for example
+# "sudo bash THIS __inner /tmp/x"), inner would lay overlays over the host's /etc and
+# others and replace the host's firewall rules. scenario() passes the namespaces it
+# runs in (SANDBOX_CALLER_NET, SANDBOX_CALLER_MNT); inner must run in other ones, and
+# not in those of PID 1 either (where /proc/1 is readable; in some containers it is not).
+inner_guard() {
+  local art=$1 kind var caller self ref
+  for kind in net mnt; do
+    var="SANDBOX_CALLER_${kind^^}"
+    caller=${!var:-}
+    self=$(readlink "/proc/self/ns/$kind" 2>/dev/null) || self=""
+    ref=$(readlink "/proc/1/ns/$kind" 2>/dev/null) || ref=""
+    if [[ -z $caller || -z $self ]]; then
+      echo "REFUSED: __inner is internal, run the tests without arguments ($var or /proc/self/ns/$kind missing)." >&2
+      return 1
+    fi
+    if [[ $self == "$caller" ]]; then
+      echo "REFUSED: __inner runs in the $kind namespace of its caller ($self), not in a sandbox." >&2
+      return 1
+    fi
+    if [[ -n $ref && $self == "$ref" ]]; then
+      echo "REFUSED: __inner runs in the $kind namespace of PID 1 ($self), not in a sandbox." >&2
+      return 1
+    fi
+  done
+  if [[ $art != /* || ! -f $art/setup-server.sh ]]; then
+    echo "REFUSED: '$art' is not a scenario directory." >&2
+    return 1
+  fi
+}
+
 inner() {
   local art=$1 d i
+  inner_guard "$art" || exit 3
   set -e
   for d in "${OVERLAY_DIRS[@]}"; do
     mkdir -p "$art/ovl/$d/u" "$art/ovl/$d/w"
@@ -209,6 +352,9 @@ inner() {
   fixture "$art"
   snapshot "$art" >"$art/snap0"
   dump_fw >"$art/fw0"
+  iptables -S INPUT >"$art/v4_0"
+  ip6tables -S INPUT >"$art/v6_0"
+  sshd_state >"$art/sshd_state0"
   for ((i = 1; i <= ${SC_RUNS:-1}; i++)); do
     run_setup "$art" "$i"
     snapshot "$art" >"$art/snap$i"
@@ -239,11 +385,13 @@ write_stubs() {
   cat >"$dir/apt-get" <<EOF
 #!/bin/bash
 $log
-# Installing docker-ce provides the docker command (inside the sandbox).
+# Installing docker-ce provides the docker command and, like the real package, the
+# group docker (inside the sandbox).
 for a in "\$@"; do
   if [[ \$a == docker-ce ]]; then
     printf '#!/bin/sh\necho "Docker version 0.0.0-test"\n' >/usr/bin/docker
     chmod 755 /usr/bin/docker
+    getent group docker >/dev/null || /usr/sbin/groupadd --system docker
   fi
 done
 exit 0
@@ -282,17 +430,30 @@ case \$verb in
   *) exit 0 ;;
 esac
 EOF
-  cat >"$dir/curl" <<EOF
-#!/bin/bash
-$log
-out=""
-while [[ \$# -gt 0 ]]; do
-  if [[ \$1 == -o ]]; then out=\$2; shift; fi
+  # Serves the key file STUB_DOCKER_KEY for Docker's key URL; anything else fails
+  # like "curl -f" on an HTTP error.
+  {
+    printf '#!/bin/bash\n%s\n' "$log"
+    cat <<'EOF'
+out="" url=""
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -o | --output) out=$2; shift ;;
+    http://* | https://*) url=$1 ;;
+  esac
   shift
 done
-[[ -n \$out ]] && echo "-----BEGIN PGP PUBLIC KEY BLOCK----- (test stub)" >"\$out"
-exit 0
+if [[ $url != https://download.docker.com/linux/ubuntu/gpg ]]; then
+  echo "curl (test stub): unexpected URL '$url'" >&2
+  exit 22
+fi
+if [[ -z ${STUB_DOCKER_KEY:-} || ! -f $STUB_DOCKER_KEY ]]; then
+  echo "curl (test stub): no key file configured" >&2
+  exit 22
+fi
+if [[ -n $out ]]; then cat -- "$STUB_DOCKER_KEY" >"$out"; else cat -- "$STUB_DOCKER_KEY"; fi
 EOF
+  } >"$dir/curl"
   cat >"$dir/netfilter-persistent" <<EOF
 #!/bin/bash
 $log
@@ -342,19 +503,63 @@ if [[ \${SSHD_T_FAIL:-0} == 1 && \${1:-} == -t ]]; then
 fi
 exec /usr/sbin/sshd "\$@"
 EOF
-  for name in iptables ip6tables useradd usermod groupadd; do
+  for name in ip6tables useradd usermod groupadd; do
     cat >"$dir/$name" <<EOF
 #!/bin/bash
 $log
 exec /usr/sbin/$name "\$@"
 EOF
   done
+  # iptables, optionally with a simulated concurrent writer (like fail2ban's
+  # "iptables -I INPUT 1 ..."), which inserts a foreign rule at the top of INPUT:
+  #   STUB_IPT_RACE=scan    right after the script read INPUT while the ineffective
+  #                         copy of RULE sits behind REJECT and an effective one before
+  #                         it (the script is about to delete the copy by number),
+  #   STUB_IPT_RACE=delete  right before "iptables -D INPUT <n>" is carried out.
+  # Once per run. STUB_STATE/race_count counts the inserted rules.
+  {
+    printf '#!/bin/bash\n%s\n' "$log"
+    printf 'want=%q\n' "$RACE_WANT"
+    cat <<'EOF'
+real=/usr/sbin/iptables
+mode=${STUB_IPT_RACE:-}
+count_file=${STUB_STATE:-/nonexistent}/race_count
+inject() {
+  local n=0
+  if [[ -f $count_file ]]; then n=$(<"$count_file"); fi
+  n=$((n + 1))
+  echo "$n" >"$count_file"
+  "$real" -I INPUT 1 -s "192.0.2.$n/32" -p tcp -j DROP
+}
+copy_before_and_behind_reject() {
+  awk -v want="$want" '$1 == "-A" { if (!r && / -j REJECT( |$)/) r = 1; else if ($0 == want) { if (r) b = 1; else a = 1 } }
+    END { exit !(a && b) }'
+}
+if [[ $mode == delete && $# -eq 3 && $1 == -D && $2 == INPUT && $3 =~ ^[0-9]+$ && ! -f $count_file ]]; then
+  inject
+fi
+if [[ $mode == scan && $# -eq 2 && $1 == -S && $2 == INPUT && ! -f $count_file ]]; then
+  out=$("$real" -S INPUT)
+  rc=$?
+  printf '%s\n' "$out"
+  if copy_before_and_behind_reject <<<"$out"; then inject; fi
+  exit "$rc"
+fi
+exec "$real" "$@"
+EOF
+  } >"$dir/iptables"
   cat >"$dir/fail2ban-client" <<EOF
 #!/bin/bash
 $log
 exec /usr/bin/fail2ban-client "\$@"
 EOF
   chmod 755 "$dir"/*
+}
+
+# Environment of the inner entry point: stubs, key files, namespaces of the caller.
+export_sandbox_env() {
+  export STUBS="$WORK/stubs" KEYS="$WORK/keys"
+  export SANDBOX_CALLER_NET="$CALLER_NET" SANDBOX_CALLER_MNT="$CALLER_MNT"
 }
 
 # scenario NAME [VAR=value ...]: run setup-server.sh in a fresh sandbox.
@@ -366,7 +571,7 @@ scenario() {
   chmod 755 "$art"
   install -m 0644 "$SETUP" "$art/setup-server.sh"
   (
-    export STUBS="$WORK/stubs"
+    export_sandbox_env
     for kv in "$@"; do export "${kv?}"; done
     unshare -m -n --propagation private -- bash "$SELF" __inner "$art"
   ) >"$art/inner.log" 2>&1
@@ -374,6 +579,40 @@ scenario() {
     echo "SANDBOX ERROR in scenario $name:"
     sed 's/^/      /' "$art/inner.log"
   fi
+}
+
+# guard_case NAME MODE: call the inner entry point the wrong way. Always inside a
+# protective sandbox of its own (new mount and network namespace), so that a missing
+# guard runs the scenario there and cannot touch the host.
+#   no_markers  as if called directly: SANDBOX_CALLER_* not set
+#   caller_ns   SANDBOX_CALLER_* name the namespaces inner itself runs in
+#   pid1        inner is PID 1 of a new PID namespace (with its own /proc), so it
+#               shares its namespaces with PID 1; the markers are right
+guard_case() {
+  local name=$1 mode=$2 art="$WORK/$1"
+  mkdir -p "$art"
+  chmod 755 "$art"
+  install -m 0644 "$SETUP" "$art/setup-server.sh"
+  (
+    export_sandbox_env
+    rc=0
+    case $mode in
+      no_markers)
+        unset SANDBOX_CALLER_NET SANDBOX_CALLER_MNT
+        unshare -m -n --propagation private -- bash "$SELF" __inner "$art" || rc=$?
+        ;;
+      caller_ns)
+        # shellcheck disable=SC2016 # expanded inside the sandbox
+        unshare -m -n --propagation private -- bash -c \
+          'export SANDBOX_CALLER_NET=$(readlink /proc/self/ns/net) SANDBOX_CALLER_MNT=$(readlink /proc/self/ns/mnt); exec bash "$0" __inner "$1"' \
+          "$SELF" "$art" || rc=$?
+        ;;
+      pid1)
+        unshare -m -n -p --fork --mount-proc --propagation private -- bash "$SELF" __inner "$art" || rc=$?
+        ;;
+    esac
+    echo "rc=$rc" >"$art/guard_rc"
+  ) >"$art/inner.log" 2>&1
 }
 
 PASS=0
@@ -810,6 +1049,226 @@ t_rerun_real_server() {
   return $((1 - ok))
 }
 
+# --- tests: who may log in afterwards (SUDO_USER, key files) -----------------
+
+# Aborts without any change, and for the expected reason: REGEX must appear on
+# stderr. Without it, a scenario that aborts for another reason (e.g. a broken
+# fixture without key) would pass as well.
+t_aborts_because() { # SCENARIO REGEX
+  local ok=1
+  t_aborts_unchanged "$1" || ok=0
+  grep -qE -- "$2" "$(art "$1")/err1" 2>/dev/null ||
+    no "stderr does not name the reason (/$2/):" "$(cat "$(art "$1")/err1" 2>/dev/null)"
+  return $((1 - ok))
+}
+
+t_runs_ok() { # SCENARIO
+  local ok=1 rc
+  have_run "$1" 1 || return 1
+  rc=$(rc_of "$1" 1)
+  [[ $rc == 0 ]] || no "expected exit code 0, got: $rc" "$(tail -5 "$(art "$1")/err1")"
+  return $((1 - ok))
+}
+
+# After writing the drop-in, sshd -T has no "allowusers ADMIN_USER": the SSH
+# directory must be as before (file removed or old file back, same mode and
+# content), ssh not reloaded, and the script stops there.
+t_sshd_rollback() { # SCENARIO
+  local ok=1 a rc d t
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  rc=$(rc_of "$1" 1)
+  [[ $rc =~ ^[0-9]+$ && $rc -ne 0 ]] || no "expected exit code != 0 (sshd -T has no 'allowusers ubuntu'), got: $rc"
+  t=$(grep -nE '^sshd -t( |$)' "$a/log1" | head -1 | cut -d: -f1)
+  if [[ -z $t ]]; then
+    no "sshd -t was not run (the new drop-in was never checked)"
+  elif ! tail -n "+$t" "$a/log1" | grep -qE '^sshd -T( |$)'; then
+    no "no sshd -T after sshd -t: the effective AllowUsers were not checked"
+  fi
+  ! grep -qE '^systemctl [a-z-]*(reload|restart)[a-z-]* ssh' "$a/log1" ||
+    no "ssh was reloaded:" "$(grep -E '^systemctl .* ssh' "$a/log1")"
+  d=$(diff "$a/sshd_state0" "$a/sshd_state_end") ||
+    no "/etc/ssh/sshd_config.d is not as before the run (name mode owner sha256):" "$d"
+  [[ ! -e $(upper "$1" etc)/fail2ban/jail.local ]] || no "the script went on after the failed check (jail.local written)"
+  ! grep -qE '^useradd ' "$a/log1" || no "the script went on after the failed check (useradd ran)"
+  return $((1 - ok))
+}
+
+# --- tests: write errors ----------------------------------------------------------
+
+# PATH (under /etc) cannot be written: exit != 0, error names PATH, no "geschrieben"
+# for it, PATH as before, no temporary file left next to it, nothing matching LATER
+# (calls of later steps) in the log.
+t_write_error() { # SCENARIO PATH LATER_REGEX
+  local ok=1 a rc later rel left
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  rel=${2#/etc/}
+  rc=$(rc_of "$1" 1)
+  [[ $rc =~ ^[0-9]+$ && $rc -ne 0 ]] || no "expected exit code != 0 when $2 cannot be written, got: $rc"
+  grep -qF -- "$2" "$a/err1" || no "stderr does not name $2:" "$(cat "$a/err1")"
+  ! grep -qE -- "geschrieben:? +$2" "$a/out1" || no "output reports $2 as written:" "$(grep -F -- "$2" "$a/out1")"
+  [[ "$(grep -F "./etc/u/$rel" "$a/snap0")" == "$(grep -F "./etc/u/$rel" "$a/snap1")" ]] ||
+    no "$2 changed:" "$(diff <(grep -F "./etc/u/$rel" "$a/snap0") <(grep -F "./etc/u/$rel" "$a/snap1"))"
+  left=$(find "$(upper "$1" etc)/$(dirname "$rel")" -maxdepth 1 -name "$(basename "$rel").tmp*" 2>/dev/null)
+  [[ -z $left ]] || no "temporary file left:" "$left"
+  later=$(grep -E -- "$3" "$a/log1")
+  [[ -z $later ]] || no "the script went on after the failed write:" "$later"
+  return $((1 - ok))
+}
+
+# --- tests: firewall (IPv6 policy DROP, concurrent changes) -------------------
+
+t_fw_v6_drop_policy() { # SCENARIO
+  local ok=1 f
+  have_run "$1" 1 || return 1
+  t_fw_ports_before_reject "$1" v6 || ok=0
+  f="$(art "$1")/v6_1"
+  grep -qx -- '-P INPUT DROP' "$f" || no "ip6tables INPUT policy is no longer DROP:" "$(head -1 "$f")"
+  return $((1 - ok))
+}
+
+t_fw_family_unchanged() { # SCENARIO FAMILY(v4|v6)
+  local ok=1 d
+  have_run "$1" 1 || return 1
+  d=$(diff "$(art "$1")/$2_0" "$(art "$1")/$2_1") || no "$2 INPUT changed:" "$d"
+  return $((1 - ok))
+}
+
+t_rerun_fw_unchanged() { # SCENARIO
+  local ok=1 rc d
+  have_run "$1" 2 || return 1
+  rc=$(rc_of "$1" 2)
+  [[ $rc == 0 ]] || no "second run: expected exit code 0, got: $rc"
+  d=$(diff "$(art "$1")/fw1" "$(art "$1")/fw2") || no "second run changed firewall rules:" "$d"
+  return $((1 - ok))
+}
+
+# Another program changes INPUT while the script removes the ineffective copy of
+# RACE_WANT behind REJECT (see the iptables stub). No rule may be lost except that
+# copy; the foreign rules stay; port 80 stays open before the REJECT.
+t_fw_no_rule_lost() { # SCENARIO MODE(scan|delete)
+  local ok=1 a n i line c0 c1 acc rej cnt
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  n=$(cat "$a/state/race_count" 2>/dev/null || echo 0)
+  if ((n == 0)); then
+    if [[ $2 == scan ]]; then
+      no "the simulated concurrent insert did not fire; this test checks nothing (does the script still read INPUT with iptables -S before deleting?)"
+    elif grep -qE '^iptables -D INPUT [0-9]+$' "$a/log1"; then
+      no "rules were deleted by number, but the simulated concurrent insert did not fire"
+    fi
+  fi
+  while IFS= read -r line; do
+    c0=$(grep -cxF -- "$line" "$a/v4_0")
+    c1=$(grep -cxF -- "$line" "$a/v4_1")
+    if [[ $line == "$RACE_WANT" ]]; then
+      ((c1 >= 1)) || no "no ACCEPT for tcp 80 left"
+    elif ((c1 < c0)); then
+      no "deleted a rule that is not the ineffective copy: $line"
+    fi
+  done < <(grep -E '^-A INPUT ' "$a/v4_0" | LC_ALL=C sort -u)
+  for ((i = 1; i <= n; i++)); do
+    grep -qxF -- "-A INPUT -s 192.0.2.$i/32 -p tcp -j DROP" "$a/v4_1" ||
+      no "deleted the foreign rule that was inserted concurrently (192.0.2.$i)"
+  done
+  read -r acc rej cnt < <(fw_facts "$a/v4_1" 80)
+  if ((acc == 0)) || ((rej > 0 && acc > rej)); then no "tcp 80 is no longer open before the REJECT"; fi
+  if ((ok == 0)); then
+    no "INPUT before the run:"$'\n'"$(cat "$a/v4_0")"
+    no "INPUT after the run:"$'\n'"$(cat "$a/v4_1")"
+    no "exit code $(rc_of "$1" 1), stderr (first lines of the abort):"$'\n'"$(grep -A3 -m1 'Abbruch' "$a/err1")"
+  fi
+  return $((1 - ok))
+}
+
+# --- tests: Docker key ------------------------------------------------------------
+
+key_fprs() { # FILE: fingerprints of the primary keys in FILE, one per line
+  local g
+  g=$(mktemp -d "$WORK/gpg-show.XXXXXX") || return 1
+  GNUPGHOME=$g gpg --batch --quiet --with-colons --show-keys "$1" 2>/dev/null |
+    awk -F: '$1 == "pub" { p = 1; next } p && $1 == "fpr" { print $10; p = 0 }'
+  rm -rf -- "$g"
+}
+
+t_fixture_docker_key() {
+  local ok=1 f
+  f=$(key_fprs "$FIXTURES/docker.asc")
+  [[ $f == "$DOCKER_FPR" ]] || no "fixtures/docker.asc: expected exactly one key $DOCKER_FPR, found:" "${f:-none}"
+  return $((1 - ok))
+}
+
+t_docker_keyring_is_checked_key() {
+  local ok=1 k
+  have_run fresh 1 || return 1
+  k="$(upper fresh etc)/apt/keyrings/docker.asc"
+  if [[ ! -f $k ]]; then
+    no "/etc/apt/keyrings/docker.asc was not installed"
+  elif ! cmp -s "$k" "$FIXTURES/docker.asc"; then
+    no "/etc/apt/keyrings/docker.asc differs from the key served for $DOCKER_FPR"
+  fi
+  return $((1 - ok))
+}
+
+# The served key is not (only) the expected one: stop, Docker not set up.
+t_docker_key_rejected() { # SCENARIO
+  local ok=1 a rc calls files
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  rc=$(rc_of "$1" 1)
+  [[ $rc =~ ^[0-9]+$ && $rc -ne 0 ]] || no "expected exit code != 0, got: $rc"
+  [[ -s $a/err1 ]] || no "no error message on stderr"
+  grep -qE '^curl .*https://download\.docker\.com/linux/ubuntu/gpg' "$a/log1" ||
+    no "the key was never fetched; the script stopped earlier for another reason:" "$(tail -5 "$a/err1")"
+  files=$(find "$(upper "$1" etc)/apt/keyrings" "$(upper "$1" etc)/apt/sources.list.d" -mindepth 1 2>/dev/null)
+  [[ -z $files ]] || no "key or apt source installed:" "$files"
+  calls=$(grep -E '^apt-get .*install.* docker|^systemctl .*docker|^useradd |^usermod ' "$a/log1")
+  [[ -z $calls ]] || no "Docker set up anyway, or the script went on:" "$calls"
+  # -f: removing /usr/bin/docker in the fixture leaves a whiteout (character device).
+  [[ ! -f $(upper "$1" usr)/bin/docker ]] || no "docker command installed"
+  return $((1 - ok))
+}
+
+t_tmp_cleaned() { # SCENARIO
+  local ok=1 left
+  have_run "$1" 1 || return 1
+  left=$(find "$(art "$1")/tmp" -mindepth 1 2>/dev/null)
+  [[ -z $left ]] || no "temporary files of the script left behind:" "$left"
+  return $((1 - ok))
+}
+
+# --- tests: dry run and packages -------------------------------------------------
+
+t_full_upgrade() {
+  local ok=1 calls
+  have_run fresh 1 || return 1
+  have_run dry 1 || return 1
+  grep -qE '^apt-get .* full-upgrade( |$)' "$(art fresh)/log1" || no "real run: no 'apt-get ... full-upgrade'"
+  calls=$(grep -E '^apt-get( .*)? upgrade( |$)' "$(art fresh)/log1")
+  [[ -z $calls ]] || no "real run still runs plain upgrade:" "$calls"
+  grep -qE 'apt-get .* full-upgrade( |$)' "$(art dry)/out1" || no "dry run does not show 'apt-get ... full-upgrade'"
+  calls=$(grep -E 'apt-get( [^ ]+)* upgrade( |$)' "$(art dry)/out1")
+  [[ -z $calls ]] || no "dry run shows plain upgrade:" "$calls"
+  return $((1 - ok))
+}
+
+# --- tests: the test sandbox itself -------------------------------------------
+
+t_guard_refuses() { # GUARD_CASE
+  local ok=1 a
+  a=$(art "$1")
+  [[ -f $a/guard_rc ]] || {
+    no "guard case $1 did not run"
+    return 1
+  }
+  ! grep -qx 'rc=0' "$a/guard_rc" || no "the inner entry point exited with 0"
+  [[ ! -e $a/inner_ok ]] || no "the inner entry point ran the scenario (inner_ok written)"
+  [[ ! -e $a/ovl ]] || no "the inner entry point prepared overlays before refusing ($a/ovl exists)"
+  grep -q 'REFUSED' "$a/inner.log" || no "no REFUSED message:" "$(cat "$a/inner.log")"
+  return $((1 - ok))
+}
+
 # --- tests: host untouched --------------------------------------------------
 
 host_state() {
@@ -834,6 +1293,36 @@ t_host_untouched() {
 # Main
 # ===========================================================================
 
+# prepare_keys DIR: key files the curl stub serves (SC_DOCKER_KEY=NAME -> DIR/NAME.asc):
+#   docker   Docker's key (fixture)
+#   wrong    a valid key with another fingerprint, generated for this run
+#   two      Docker's key followed by the wrong one in one file
+#   invalid  armor lines around something that is no key
+prepare_keys() {
+  local dir=$1 g rc=0 f
+  mkdir -p "$dir"
+  install -m 0644 "$FIXTURES/docker.asc" "$dir/docker.asc" || return 1
+  g=$(mktemp -d "$WORK/gpg-gen.XXXXXX") || return 1
+  GNUPGHOME=$g gpg --batch --quiet --pinentry-mode loopback --passphrase '' \
+    --quick-gen-key 'Test key with a wrong fingerprint <test@example.invalid>' ed25519 sign never \
+    >/dev/null 2>&1 || rc=1
+  if ((rc == 0)); then
+    GNUPGHOME=$g gpg --batch --armor --export >"$dir/wrong.asc" 2>/dev/null || rc=1
+  fi
+  # Stop the agent the key generation started and drop the secret key.
+  GNUPGHOME=$g gpgconf --kill all >/dev/null 2>&1
+  rm -rf -- "$g"
+  ((rc == 0)) || return 1
+  cat "$dir/docker.asc" "$dir/wrong.asc" >"$dir/two.asc"
+  printf '%s\n' '-----BEGIN PGP PUBLIC KEY BLOCK-----' '' 'not a key (test)' \
+    '-----END PGP PUBLIC KEY BLOCK-----' >"$dir/invalid.asc"
+  # Otherwise the negative tests would not test the fingerprint comparison.
+  f=$(key_fprs "$dir/wrong.asc")
+  [[ $f =~ ^[0-9A-F]{40}$ && $f != "$DOCKER_FPR" ]] || return 1
+  [[ $(key_fprs "$dir/two.asc" | wc -l) -eq 2 ]] || return 1
+  [[ -z $(key_fprs "$dir/invalid.asc") ]] || return 1
+}
+
 main() {
   local missing=() c
   if [[ $EUID -ne 0 ]]; then
@@ -841,7 +1330,8 @@ main() {
     exit 2
   fi
   for c in unshare setpriv iptables ip6tables iptables-save ip6tables-save iptables-restore \
-    ip6tables-restore /usr/sbin/sshd fail2ban-client apt-config shellcheck python3 diff; do
+    ip6tables-restore /usr/sbin/sshd fail2ban-client apt-config shellcheck python3 diff \
+    gpg gpgconf /usr/sbin/useradd /usr/sbin/groupadd /usr/sbin/groupdel mount readlink cmp; do
     command -v "$c" >/dev/null 2>&1 || missing+=("$c")
   done
   if ((${#missing[@]})); then
@@ -852,8 +1342,23 @@ main() {
     echo "CANNOT RUN: $SETUP not found"
     exit 2
   }
+  [[ -f $FIXTURES/docker.asc ]] || {
+    echo "CANNOT RUN: $FIXTURES/docker.asc not found"
+    exit 2
+  }
   if ! id ubuntu >/dev/null 2>&1 || ! id claude >/dev/null 2>&1; then
     echo "CANNOT RUN: users ubuntu and claude must exist (fixtures)"
+    exit 2
+  fi
+  if id srvadmin >/dev/null 2>&1; then
+    echo "CANNOT RUN: user srvadmin exists on this host (the fixtures create it)"
+    exit 2
+  fi
+  # Namespaces of this process; inner refuses to run in them (inner_guard).
+  CALLER_NET=$(readlink /proc/self/ns/net) || CALLER_NET=""
+  CALLER_MNT=$(readlink /proc/self/ns/mnt) || CALLER_MNT=""
+  if [[ -z $CALLER_NET || -z $CALLER_MNT ]]; then
+    echo "CANNOT RUN: /proc/self/ns not readable"
     exit 2
   fi
 
@@ -872,6 +1377,10 @@ main() {
     trap 'rm -rf "$WORK"' EXIT
   fi
   write_stubs "$WORK/stubs"
+  if ! prepare_keys "$WORK/keys"; then
+    echo "CANNOT RUN: test keys could not be prepared (gpg)"
+    exit 2
+  fi
   host_state >"$WORK/host_before"
 
   echo "Testing $SETUP"
@@ -897,6 +1406,35 @@ PermitRootLogin yes"
   scenario fw_after_reject SC_FW=accept_after_reject
   scenario fw_drop_policy SC_FW=drop_policy SC_V6=none
   scenario rerun_real SC_RUNS=2 SC_BETWEEN=1
+  # Who may log in afterwards
+  scenario sudo_other SC_SUDO_USER=claude
+  scenario sudo_admin SC_SUDO_USER=ubuntu
+  scenario sudo_root SC_SUDO_USER=root
+  scenario sudo_alt SC_SUDO_USER=claude SC_ADMIN_USER=claude SC_KEY_USER=claude
+  scenario akf_none SC_AKF=none
+  scenario akf_custom_nokey SC_AKF=custom
+  scenario akf_custom_key SC_AKF=custom SC_KEY_AT=etc
+  scenario akf_match_nokey SC_AKF_MATCH=1
+  scenario home_getent SC_EXTRA_USER=srvadmin SC_ADMIN_USER=srvadmin SC_KEY_USER=srvadmin
+  scenario home_getent_nokey SC_EXTRA_USER=srvadmin SC_ADMIN_USER=srvadmin SC_KEY_USER=srvadmin SC_KEY_AT=legacy_home
+  scenario sshd_noinclude SC_SSHD_NOINCLUDE=1
+  scenario sshd_noinclude_old SC_SSHD_NOINCLUDE=1 SC_SSHD_OLD=1
+  # Write errors
+  scenario ro_apt SC_RO=/etc/apt/apt.conf.d
+  scenario ro_sshd SC_RO=/etc/ssh/sshd_config.d
+  scenario busy_apt SC_BUSY=/etc/apt/apt.conf.d/20auto-upgrades
+  # Firewall
+  scenario v6_drop SC_V6=drop_policy SC_RUNS=2
+  scenario race_scan SC_FW=accept_after_reject SC_V6=none SC_IPT_RACE=scan
+  scenario race_delete SC_FW=accept_after_reject SC_V6=none SC_IPT_RACE=delete
+  # Docker key
+  scenario key_wrong SC_DOCKER_KEY=wrong
+  scenario key_two SC_DOCKER_KEY=two
+  scenario key_invalid SC_DOCKER_KEY=invalid
+  # The sandbox itself
+  guard_case guard_no_markers no_markers
+  guard_case guard_caller_ns caller_ns
+  guard_case guard_pid1 pid1
   echo
 
   check "shellcheck: no findings" t_shellcheck
@@ -966,6 +1504,55 @@ PermitRootLogin yes"
   check "second run on a used server (CI key, f2b and Docker chains): no change, key kept" t_rerun_real_server
   check "firewall: UFW not used (at most ufw status)" t_no_ufw
 
+  check "precondition: sudo called by claude, ADMIN_USER=ubuntu aborts, nothing changed" \
+    t_aborts_because sudo_other 'claude'
+  check "SUDO_USER=ubuntu (= ADMIN_USER) runs" t_runs_ok sudo_admin
+  check "SUDO_USER=root runs" t_runs_ok sudo_root
+  check "SUDO_USER=claude with ADMIN_USER=claude runs" t_runs_ok sudo_alt
+  check "precondition: AuthorizedKeysFile none aborts, nothing changed" t_aborts_because akf_none 'none'
+  check "precondition: AuthorizedKeysFile /etc/ssh/authorized_keys/%u without key there aborts, nothing changed" \
+    t_aborts_because akf_custom_nokey '/etc/ssh/authorized_keys/ubuntu'
+  check "AuthorizedKeysFile /etc/ssh/authorized_keys/%u with key there runs" t_runs_ok akf_custom_key
+  check "precondition: AuthorizedKeysFile via Match User ubuntu without key there aborts, nothing changed" \
+    t_aborts_because akf_match_nokey '/etc/ssh/authorized_keys/ubuntu'
+  check "home directory from getent passwd (/srv/srvadmin) with key there runs" t_runs_ok home_getent
+  check "home directory from getent passwd: AllowUsers srvadmin deploy (sshd -T)" t_sshd_effective home_getent srvadmin
+  check "precondition: key only in /home/srvadmin, home is /srv/srvadmin aborts, nothing changed" \
+    t_aborts_because home_getent_nokey '/srv/srvadmin'
+  check "SSH: sshd -T without allowusers ubuntu: drop-in removed, no reload, abort" t_sshd_rollback sshd_noinclude
+  check "SSH: sshd -T without allowusers ubuntu: previous drop-in back (content, mode), no reload, abort" \
+    t_sshd_rollback sshd_noinclude_old
+  check "SSH: temporary copy of the previous drop-in removed" t_tmp_cleaned sshd_noinclude_old
+
+  check "write error in /etc/apt/apt.conf.d: abort, no 'geschrieben', no later step" t_write_error ro_apt \
+    /etc/apt/apt.conf.d/20auto-upgrades '^(ip6?tables -[IAD] |netfilter-persistent|sshd -t|systemctl |useradd |usermod |curl )'
+  check "write error only for 20auto-upgrades (directory writable): abort, no 'geschrieben', no later step" \
+    t_write_error busy_apt /etc/apt/apt.conf.d/20auto-upgrades \
+    '^(ip6?tables -[IAD] |netfilter-persistent|sshd -t|systemctl |useradd |usermod |curl )'
+  check "write error in /etc/ssh/sshd_config.d: abort, no 'geschrieben', no reload, no later step" t_write_error ro_sshd \
+    /etc/ssh/sshd_config.d/10-haertung.conf '^(sshd -t|systemctl .*(ssh|fail2ban|docker)|fail2ban-client|useradd |usermod |curl )'
+
+  check "firewall IPv6 policy DROP without REJECT: 22/80/443 opened, policy stays DROP" t_fw_v6_drop_policy v6_drop
+  check "firewall IPv6 policy DROP: second run changes nothing" t_rerun_fw_unchanged v6_drop
+  check "firewall IPv6 policy ACCEPT without REJECT: no rule added" t_fw_family_unchanged fw_drop_policy v6
+  check "firewall: INPUT changes before the re-check: no other rule deleted" t_fw_no_rule_lost race_scan scan
+  check "firewall: INPUT changes right before iptables -D: no other rule deleted" t_fw_no_rule_lost race_delete delete
+
+  check "dry run shows: systemctl enable netfilter-persistent" t_dry_shows 'systemctl enable netfilter-persistent'
+  check "packages: apt-get full-upgrade instead of upgrade (real and dry run)" t_full_upgrade
+
+  check "fixture: docker.asc is Docker's key ($DOCKER_FPR)" t_fixture_docker_key
+  check "Docker: installed keyring is exactly the checked key" t_docker_keyring_is_checked_key
+  check "Docker: temporary files (key download) removed" t_tmp_cleaned fresh
+  check "Docker: key with another fingerprint aborts, Docker not set up" t_docker_key_rejected key_wrong
+  check "Docker: Docker's key plus another key in the file aborts, Docker not set up" t_docker_key_rejected key_two
+  check "Docker: download that is no key aborts, Docker not set up" t_docker_key_rejected key_invalid
+  check "Docker: temporary files removed after the abort" t_tmp_cleaned key_wrong
+
+  check "sandbox: inner entry point without caller markers refuses, mounts nothing" t_guard_refuses guard_no_markers
+  check "sandbox: inner entry point in its caller's namespaces refuses, mounts nothing" t_guard_refuses guard_caller_ns
+  check "sandbox: inner entry point in the namespaces of PID 1 refuses, mounts nothing" t_guard_refuses guard_pid1
+
   check "host untouched after all scenarios" t_host_untouched
 
   echo
@@ -974,7 +1561,7 @@ PermitRootLogin yes"
 }
 
 if [[ ${1:-} == __inner ]]; then
-  inner "$2"
+  inner "${2:-}"
   exit
 fi
 main "$@"
