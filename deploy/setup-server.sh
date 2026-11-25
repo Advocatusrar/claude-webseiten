@@ -29,6 +29,8 @@ DEPLOY_USER=deploy
 CHANGES=0
 # Connection that sshd -T -C evaluates Match blocks for (used once ADMIN_USER is checked).
 SSHD_TEST_SPEC="user=$ADMIN_USER,host=localhost,addr=127.0.0.1"
+# The same for the user deploy of the CI (only warnings, see check_sshd_deploy).
+SSHD_DEPLOY_SPEC="user=$DEPLOY_USER,host=localhost,addr=127.0.0.1"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -519,50 +521,84 @@ sshd_candidates() {
   done
   if ((${#found[@]} > 0)); then printf '%s' "${found[*]}"; else printf 'keine gefunden'; fi
 }
-# check_sshd_effective VIEW OUTPUT: OUTPUT is what sshd -T (as VIEW) prints. Puts the
-# previous drop-in back and stops if the hardening does not take effect or ADMIN_USER
-# would be locked out. sshd takes the first value it reads for PasswordAuthentication
-# and the like; DenyUsers, AllowGroups and DenyGroups add up over all files.
-check_sshd_effective() {
-  local view=$1 eff=$2 allowed setting key pat g hit admin_groups
-  # Without ADMIN_USER in AllowUsers the next login fails: never reload like that.
-  if ! grep -qx "allowusers $ADMIN_USER" <<<"$eff"; then
+# sshd_allowusers_problem VIEW OUTPUT USER: OUTPUT is what sshd -T (as VIEW) prints.
+# Prints why AllowUsers does not let USER in, nothing if it does.
+sshd_allowusers_problem() {
+  local view=$1 eff=$2 user=$3 allowed
+  if ! grep -qx "allowusers $user" <<<"$eff"; then
     allowed=$(awk '$1 == "allowusers" { printf "%s%s", sep, $2; sep = " " }' <<<"$eff")
-    restore_sshd_conf "sshd würde $ADMIN_USER nicht einlassen (AllowUsers laut $view: ${allowed:-kein Eintrag}; wird $SSHD_CONF überhaupt gelesen?)."
+    printf '%s' "sshd würde $user nicht einlassen (AllowUsers laut $view: ${allowed:-kein Eintrag}; wird $SSHD_CONF überhaupt gelesen?)."
   fi
-  for setting in "passwordauthentication no" "kbdinteractiveauthentication no" "permitrootlogin no"; do
-    if ! grep -qx "$setting" <<<"$eff"; then
-      key=${setting%% *}
-      restore_sshd_conf "sshd verwendet nicht '$setting' (laut $view: '$(awk -v k="$key" '$1 == k' <<<"$eff")'). Vermutlich setzt eine Datei, die vor $SSHD_CONF gelesen wird (Name sortiert früher), oder ein Match-Block den Wert zuerst. Dateien mit $key: $(sshd_candidates "$key")."
-    fi
-  done
-  # Patterns as in sshd (* and ?); "user@host" entries count for every host here.
+}
+# sshd_deny_problem VIEW OUTPUT USER GROUPS [SOURCE]: prints why DenyUsers, DenyGroups
+# or AllowGroups keep USER (member of GROUPS, separated by spaces; SOURCE says where they
+# come from, default "id -nG") out, nothing if they do not. DenyUsers, AllowGroups and DenyGroups add up over all files. Patterns as in sshd
+# (* and ?); "user@host" entries count for every host here.
+sshd_deny_problem() {
+  local view=$1 eff=$2 user=$3 groups=$4 source=${5:-id -nG} pat g hit
   while read -r pat; do
     # shellcheck disable=SC2053 # the right side is a pattern on purpose
-    if [[ $ADMIN_USER == ${pat%%@*} ]]; then
-      restore_sshd_conf "DenyUsers schließt $ADMIN_USER aus (Eintrag '$pat' laut $view). Dateien mit DenyUsers: $(sshd_candidates denyusers)."
+    if [[ $user == ${pat%%@*} ]]; then
+      printf '%s' "DenyUsers schließt $user aus (Eintrag '$pat' laut $view). Dateien mit DenyUsers: $(sshd_candidates denyusers)."
+      return 0
     fi
   done < <(awk '$1 == "denyusers" { print $2 }' <<<"$eff")
-  admin_groups=$(id -nG "$ADMIN_USER" 2>/dev/null) || admin_groups=""
   while read -r pat; do
-    for g in $admin_groups; do
+    for g in $groups; do
       # shellcheck disable=SC2053 # the right side is a pattern on purpose
       if [[ $g == $pat ]]; then
-        restore_sshd_conf "DenyGroups schließt $ADMIN_USER aus (Gruppe $g, Eintrag '$pat' laut $view). Dateien mit DenyGroups: $(sshd_candidates denygroups)."
+        printf '%s' "DenyGroups schließt $user aus (Gruppe $g, Eintrag '$pat' laut $view). Dateien mit DenyGroups: $(sshd_candidates denygroups)."
+        return 0
       fi
     done
   done < <(awk '$1 == "denygroups" { print $2 }' <<<"$eff")
   if grep -q '^allowgroups ' <<<"$eff"; then
     hit=0
     while read -r pat; do
-      for g in $admin_groups; do
+      for g in $groups; do
         # shellcheck disable=SC2053 # the right side is a pattern on purpose
         if [[ $g == $pat ]]; then hit=1; fi
       done
     done < <(awk '$1 == "allowgroups" { print $2 }' <<<"$eff")
     if ((hit == 0)); then
-      restore_sshd_conf "AllowGroups ist gesetzt ($(awk '$1 == "allowgroups" { printf "%s%s", sep, $2; sep = " " }' <<<"$eff") laut $view), $ADMIN_USER ist in keiner dieser Gruppen (id -nG: ${admin_groups:-keine}). Dateien mit AllowGroups: $(sshd_candidates allowgroups)."
+      printf '%s' "AllowGroups ist gesetzt ($(awk '$1 == "allowgroups" { printf "%s%s", sep, $2; sep = " " }' <<<"$eff") laut $view), $user ist in keiner dieser Gruppen ($source: ${groups:-keine}). Dateien mit AllowGroups: $(sshd_candidates allowgroups)."
     fi
+  fi
+}
+# check_sshd_effective VIEW OUTPUT: OUTPUT is what sshd -T (as VIEW) prints. Puts the
+# previous drop-in back and stops if the hardening does not take effect or ADMIN_USER
+# would be locked out. sshd takes the first value it reads for PasswordAuthentication
+# and the like.
+check_sshd_effective() {
+  local view=$1 eff=$2 setting key problem admin_groups
+  # Without ADMIN_USER in AllowUsers the next login fails: never reload like that.
+  problem=$(sshd_allowusers_problem "$view" "$eff" "$ADMIN_USER")
+  [[ -z $problem ]] || restore_sshd_conf "$problem"
+  for setting in "passwordauthentication no" "kbdinteractiveauthentication no" "permitrootlogin no"; do
+    if ! grep -qx "$setting" <<<"$eff"; then
+      key=${setting%% *}
+      restore_sshd_conf "sshd verwendet nicht '$setting' (laut $view: '$(awk -v k="$key" '$1 == k' <<<"$eff")'). Vermutlich setzt eine Datei, die vor $SSHD_CONF gelesen wird (Name sortiert früher), oder ein Match-Block den Wert zuerst. Dateien mit $key: $(sshd_candidates "$key")."
+    fi
+  done
+  admin_groups=$(id -nG "$ADMIN_USER" 2>/dev/null) || admin_groups=""
+  problem=$(sshd_deny_problem "$view" "$eff" "$ADMIN_USER" "$admin_groups")
+  [[ -z $problem ]] || restore_sshd_conf "$problem"
+}
+# check_sshd_deploy VIEW OUTPUT: the same access checks for the user deploy of the CI,
+# but only as a warning: the admin login is not affected, the deploy of the CI would
+# fail. On a fresh server deploy is created only in step 8, with its own group and in
+# the group docker; those are the groups checked then.
+check_sshd_deploy() {
+  local view=$1 eff=$2 groups source="id -nG" problem
+  if ! groups=$(id -nG "$DEPLOY_USER" 2>/dev/null); then
+    groups=$DEPLOY_USER
+    source="Gruppen nach dem Anlegen in Schritt 8"
+  fi
+  [[ " $groups " == *" docker "* ]] || groups="$groups docker"
+  problem=$(sshd_allowusers_problem "$view" "$eff" "$DEPLOY_USER")
+  [[ -n $problem ]] || problem=$(sshd_deny_problem "$view" "$eff" "$DEPLOY_USER" "$groups" "$source")
+  if [[ -n $problem ]]; then
+    warn "$problem Der Zugang für $ADMIN_USER ist nicht betroffen, aber das Deploy der CI als $DEPLOY_USER würde scheitern."
   fi
 }
 if put "$SSHD_CONF" 0644 <<CONF; then
@@ -583,8 +619,15 @@ CONF
     # Global values, and the values for ADMIN_USER after Match blocks.
     check_sshd_effective "sshd -T" "$effective"
     check_sshd_effective "sshd -T -C $SSHD_TEST_SPEC" "$effective_admin"
+    # The same for deploy, only as a warning (check_sshd_deploy).
+    if effective_deploy=$(sshd -T -C "$SSHD_DEPLOY_SPEC" 2>/dev/null); then
+      check_sshd_deploy "sshd -T" "$effective"
+      check_sshd_deploy "sshd -T -C $SSHD_DEPLOY_SPEC" "$effective_deploy"
+    else
+      warn "sshd -T -C $SSHD_DEPLOY_SPEC meldet einen Fehler, ob $DEPLOY_USER (CI) sich anmelden kann, ist ungeprüft."
+    fi
   else
-    info "[Testlauf] sshd -t, danach Prüfung mit sshd -T und sshd -T -C $SSHD_TEST_SPEC: AllowUsers enthält $ADMIN_USER, PasswordAuthentication, KbdInteractiveAuthentication und PermitRootLogin sind no, DenyUsers, AllowGroups und DenyGroups schließen $ADMIN_USER nicht aus"
+    info "[Testlauf] sshd -t, danach Prüfung mit sshd -T und sshd -T -C $SSHD_TEST_SPEC: AllowUsers enthält $ADMIN_USER, PasswordAuthentication, KbdInteractiveAuthentication und PermitRootLogin sind no, DenyUsers, AllowGroups und DenyGroups schließen $ADMIN_USER nicht aus; dasselbe für $DEPLOY_USER mit sshd -T -C $SSHD_DEPLOY_SPEC, dort nur als Warnung"
   fi
   cat <<'TEXT'
 
@@ -644,10 +687,113 @@ banaction_allports = iptables-allports
 CONF
   F2B_CHANGED=1
 fi
-if [[ $F2B_CHANGED == 1 ]]; then
-  if ! dry; then
-    fail2ban-client -t >/dev/null || { echo "Abbruch: fail2ban-client -t meldet einen Fehler in /etc/fail2ban/fail2ban.local oder /etc/fail2ban/jail.local." >&2; exit 1; }
+if [[ $F2B_CHANGED == 1 ]] && ! dry; then
+  fail2ban-client -t >/dev/null || { echo "Abbruch: fail2ban-client -t meldet einen Fehler in /etc/fail2ban/fail2ban.local oder /etc/fail2ban/jail.local." >&2; exit 1; }
+fi
+# The values must also take effect. fail2ban reads jail.conf, jail.d/*.conf, jail.local
+# and then jail.d/*.local (the same for fail2ban.conf, fail2ban.d/ and fail2ban.local),
+# and the last value wins. A file in jail.d/*.local or fail2ban.d/*.local can therefore
+# override the values above without a trace. fail2ban-client -d prints the commands
+# fail2ban would load, e.g. ['set', 'sshd', 'bantime', '10m'] and
+# ['set', 'dbpurgeage', '1d'] (fail2ban 1.0.2), times as written in the files. They
+# are converted to seconds with fail2ban's own parser (MyTime.str2seconds), so "600"
+# counts the same as "10m". Checked on every run, before fail2ban is (re)started;
+# foreign files are not touched.
+F2B_WANT=(
+  "logtarget=SYSLOG[facility=AUTHPRIV]"
+  "dbpurgeage=86400"
+  "sshd.maxretry=5"
+  "sshd.findtime=600"
+  "sshd.bantime=600"
+  "sshd.bantime.increment=false"
+)
+# Prints "key=value" for logtarget, dbpurgeage and maxretry, findtime, bantime and
+# bantime.increment of the jail sshd, read from the output of fail2ban-client -d on
+# stdin; times in seconds. A time fail2ban's parser does not accept is printed as it is
+# (and then differs). bantime.increment would make repeated bans longer than bantime;
+# the dump shows it only if it is set, as a boolean (['set', 'sshd',
+# 'bantime.increment', True], fail2ban 1.0.2), so a missing value counts as false.
+F2B_VALUES_PY=$(
+  cat <<'PY'
+import ast
+import sys
+
+from fail2ban.server.mytime import MyTime
+
+vals = {}
+for line in sys.stdin:
+    line = line.strip()
+    if not line.startswith("["):
+        continue
+    try:
+        c = ast.literal_eval(line)
+    except (ValueError, SyntaxError):
+        continue  # not a command line of the dump
+    if not isinstance(c, list):
+        continue
+    if len(c) == 3 and c[0] == "set" and c[1] in ("logtarget", "dbpurgeage"):
+        vals[c[1]] = str(c[2])
+    elif len(c) == 4 and c[:2] == ["set", "sshd"] and c[2] in ("maxretry", "findtime", "bantime"):
+        vals["sshd." + c[2]] = str(c[3])
+    elif len(c) == 4 and c[:3] == ["set", "sshd", "bantime.increment"]:
+        vals["sshd.bantime.increment"] = str(c[3]).lower()
+vals.setdefault("sshd.bantime.increment", "false")
+for k in ("dbpurgeage", "sshd.findtime", "sshd.bantime"):
+    if k in vals:
+        try:
+            vals[k] = str(int(MyTime.str2seconds(vals[k])))
+        except Exception:  # any parse error: keep the text, so the value differs
+            vals[k] = "unlesbar: " + vals[k]
+for k in sorted(vals):
+    print("%s=%s" % (k, vals[k]))
+PY
+)
+# f2b_candidates DIR KEY: files DIR/*.local that set KEY. Only a hint for the abort
+# message.
+f2b_candidates() {
+  local f found=()
+  for f in "$1"/*.local; do
+    [[ -f $f ]] || continue
+    if grep -qiE "^[[:space:]]*${2//./\\.}[[:space:]]*[=:]" "$f" 2>/dev/null; then found+=("$f"); fi
+  done
+  if ((${#found[@]} > 0)); then printf '%s' "${found[*]}"; else printf 'keine gefunden'; fi
+}
+if dry; then
+  info "[Testlauf] Prüfung mit fail2ban-client -d: logtarget = SYSLOG[facility=AUTHPRIV], dbpurgeage 1d, Jail sshd mit maxretry 5, findtime 10m, bantime 10m, ohne bantime.increment; bei Abweichung Abbruch ohne Neustart von fail2ban"
+else
+  f2b_dump=$(fail2ban-client -d 2>/dev/null) ||
+    { echo "Abbruch: fail2ban-client -d meldet einen Fehler, die wirksamen Werte von fail2ban sind unbekannt. fail2ban wurde nicht neu gestartet." >&2; exit 1; }
+  f2b_got=$(python3 -I -c "$F2B_VALUES_PY" <<<"$f2b_dump") ||
+    { echo "Abbruch: Die Ausgabe von fail2ban-client -d ließ sich nicht auswerten (python3 mit dem Modul fail2ban). fail2ban wurde nicht neu gestartet." >&2; exit 1; }
+  f2b_bad=()
+  for want in "${F2B_WANT[@]}"; do
+    key=${want%%=*}
+    got=$(awk -v k="$key" 'index($0, k "=") == 1 { print substr($0, length(k) + 2) }' <<<"$f2b_got")
+    [[ $got == "${want#*=}" ]] && continue
+    case $key in
+      sshd.*)
+        # No value at all: the jail sshd is not enabled; look for "enabled" then.
+        if [[ -z $got ]]; then
+          where=$(f2b_candidates /etc/fail2ban/jail.d enabled)
+        else
+          where=$(f2b_candidates /etc/fail2ban/jail.d "${key#sshd.}")
+        fi
+        ;;
+      *) where=$(f2b_candidates /etc/fail2ban/fail2ban.d "$key") ;;
+    esac
+    f2b_bad+=("$key: erwartet ${want#*=}, wirksam ${got:-nicht gesetzt (Jail sshd nicht aktiv?)}; Dateien, die den Wert vermutlich überstimmen: $where")
+  done
+  if ((${#f2b_bad[@]} > 0)); then
+    {
+      echo "Abbruch: fail2ban verwendet nicht die Werte der Datenschutzerklärung (laut fail2ban-client -d, Zeiten in Sekunden):"
+      printf '  %s\n' "${f2b_bad[@]}"
+      echo "fail2ban liest jail.d/*.local nach jail.local und fail2ban.d/*.local nach fail2ban.local; der zuletzt gelesene Wert gilt. Die eigenen Dateien fail2ban.local und jail.local bleiben, wie sie sind; fail2ban wurde nicht neu gestartet. Die genannte Datei anpassen oder entfernen und das Skript erneut starten."
+    } >&2
+    exit 1
   fi
+  info "in Ordnung: fail2ban-client -d zeigt logtarget SYSLOG[facility=AUTHPRIV], dbpurgeage 86400 s, sshd maxretry 5, findtime 600 s, bantime 600 s, bantime.increment aus"
+fi
+if [[ $F2B_CHANGED == 1 ]]; then
   run systemctl restart fail2ban
 fi
 if dry || ! systemctl is-enabled --quiet fail2ban || ! systemctl is-active --quiet fail2ban; then
@@ -720,8 +866,22 @@ MaxFileSec=1day
 CONF
   run systemctl restart systemd-journald
 fi
-if pkg_installed rsyslog; then
-  put /etc/logrotate.d/00-auth-log 0644 <<'CONF' || true
+# logrotate counts as there only if dpkg has the package installed and the program is
+# there; the same test for all three 00-* files. Without it none of them is written,
+# they would have no effect.
+HAVE_RSYSLOG=0
+if pkg_installed rsyslog; then HAVE_RSYSLOG=1; fi
+LR_MISSING="" LR_FIX=""
+if ! pkg_installed logrotate; then
+  LR_MISSING="das Paket logrotate ist nicht installiert"
+  LR_FIX="sudo apt-get install logrotate"
+elif ! command -v logrotate >/dev/null 2>&1; then
+  LR_MISSING="das Paket logrotate ist installiert, aber das Programm logrotate fehlt"
+  LR_FIX="sudo apt-get install --reinstall logrotate"
+fi
+if [[ -z $LR_MISSING ]]; then
+  if [[ $HAVE_RSYSLOG == 1 ]]; then
+    put /etc/logrotate.d/00-auth-log 0644 <<'CONF' || true
 # Managed by deploy/setup-server.sh
 /var/log/auth.log {
   daily
@@ -736,13 +896,9 @@ if pkg_installed rsyslog; then
   endscript
 }
 CONF
-  if ! command -v logrotate >/dev/null 2>&1; then
-    warn "rsyslog schreibt /var/log/auth.log, aber logrotate ist nicht installiert. Die Datei wird nicht nach 7 Tagen gelöscht: sudo apt-get install logrotate"
+  else
+    info "rsyslog ist nicht installiert, es gibt kein /var/log/auth.log"
   fi
-else
-  info "rsyslog ist nicht installiert, es gibt kein /var/log/auth.log"
-fi
-if pkg_installed logrotate; then
   put /etc/logrotate.d/00-login-logs 0644 <<'CONF' || true
 # Managed by deploy/setup-server.sh
 /var/log/btmp {
@@ -782,7 +938,13 @@ CONF
     info "/var/log/fail2ban.log enthält Einträge von vor dem Wechsel auf syslog; sie sind nach spätestens 7 Tagen gelöscht (00-fail2ban-log). Sofort löschen von Hand: sudo truncate -s 0 /var/log/fail2ban.log; sudo rm -f /var/log/fail2ban.log.*"
   fi
 else
-  warn "logrotate ist nicht installiert: /var/log/btmp, /var/log/wtmp und /var/log/fail2ban.log werden nicht nach 7 Tagen gelöscht: sudo apt-get install logrotate"
+  if [[ $HAVE_RSYSLOG == 1 ]]; then
+    lr_logs="/var/log/auth.log, /var/log/btmp, /var/log/wtmp und /var/log/fail2ban.log"
+  else
+    info "rsyslog ist nicht installiert, es gibt kein /var/log/auth.log"
+    lr_logs="/var/log/btmp, /var/log/wtmp und /var/log/fail2ban.log"
+  fi
+  warn "logrotate fehlt ($LR_MISSING): $lr_logs werden nicht nach 7 Tagen gelöscht, die Dateien in /etc/logrotate.d (00-auth-log, 00-login-logs, 00-fail2ban-log) werden nicht angelegt. Abhilfe: $LR_FIX, danach das Skript erneut starten."
 fi
 
 # ---------------------------------------------------------------------------

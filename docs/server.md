@@ -93,6 +93,17 @@ Ursache einfach erneut starten):
   zuerst gelesen).
 - `fail2ban-client -t` meldet einen Fehler in `/etc/fail2ban/fail2ban.local` oder
   `/etc/fail2ban/jail.local`.
+- Die wirksamen Werte von fail2ban laut `fail2ban-client -d` sind nicht die der
+  Datenschutzerklärung: `logtarget` `SYSLOG[facility=AUTHPRIV]`, `dbpurgeage` 86400
+  Sekunden, im Jail `sshd` `maxretry` 5, `findtime` und `bantime` je 600 Sekunden (Zeiten
+  mit dem Parser von fail2ban umgerechnet, `10m` gilt also wie `600`), `bantime.increment`
+  ist für `sshd` aktiv (das würde wiederholte Sperren verlängern), oder der Jail `sshd`
+  ist nicht aktiv. Geprüft wird bei jedem Lauf, vor dem Neustart von fail2ban.
+  fail2ban liest `jail.d/*.local` nach `jail.local` und `fail2ban.d/*.local` nach
+  `fail2ban.local`, der zuletzt gelesene Wert gilt; eine fremde Datei dort kann die Werte
+  also überstimmen. Die Meldung nennt die Dateien, die den Wert vermutlich setzen. Das
+  Skript ändert sie nicht und startet fail2ban nicht neu; die Datei anpassen oder
+  entfernen und das Skript erneut starten.
 - Der Signaturschlüssel von Docker hat nicht den erwarteten Fingerabdruck
   `9DC8 5822 9FC7 DD38 854A E2D8 8D81 803C 0EBF CD88`. Dann wird nichts von Docker
   installiert.
@@ -104,21 +115,29 @@ Was es einrichtet:
   Neustart um 04:00
   (Zeitzone des Servers: Europe/Berlin)
 - SSH nur mit Schlüssel, kein Root-Login, nur die Benutzer `ubuntu` und `deploy`
-  (`/etc/ssh/sshd_config.d/10-haertung.conf`)
+  (`/etc/ssh/sshd_config.d/10-haertung.conf`). Die Prüfungen von `AllowUsers`,
+  `DenyUsers`, `AllowGroups` und `DenyGroups` laufen auch für `deploy` (mit
+  `sshd -T -C user=deploy,…`; auf einem frischen Server, wo das Skript `deploy` erst
+  danach anlegt, mit den Gruppen `deploy` und `docker`, die er dann bekommt). Sperren
+  sie `deploy` aus, gibt das Skript nur eine Warnung: Der Zugang von `ADMIN_USER` ist
+  nicht betroffen, das Deploy der CI würde aber scheitern.
 - fail2ban für SSH mit den Werten der Datenschutzerklärung, ausdrücklich gesetzt:
   `maxretry = 5`, `findtime = 10m`, `bantime = 10m` (`/etc/fail2ban/jail.local`) und
   `dbpurgeage = 1d`; fail2ban schreibt sein Protokoll statt nach
   `/var/log/fail2ban.log` über syslog mit der Facility `authpriv` ins Journal und, falls
   rsyslog installiert ist, nach `/var/log/auth.log`, nicht nach `/var/log/syslog`
-  (`logtarget = SYSLOG[facility=AUTHPRIV]` in `/etc/fail2ban/fail2ban.local`).
+  (`logtarget = SYSLOG[facility=AUTHPRIV]` in `/etc/fail2ban/fail2ban.local`). Ob diese
+  Werte auch wirken, prüft das Skript mit `fail2ban-client -d` (siehe oben).
 - Protokolle mit IP-Adressen werden nach etwa 7 Tagen gelöscht, wie in der
   Datenschutzerklärung angegeben: im Journal
-  (`/etc/systemd/journald.conf.d/10-aufbewahrung.conf`), falls rsyslog installiert ist
-  in `/var/log/auth.log` (`/etc/logrotate.d/00-auth-log`), und falls logrotate
-  installiert ist in `/var/log/btmp` und `/var/log/wtmp`
-  (`/etc/logrotate.d/00-login-logs`) sowie in `/var/log/fail2ban.log`
-  (`/etc/logrotate.d/00-fail2ban-log`; enthält nur noch Einträge von vor dem Wechsel
-  auf syslog). Die Dateien der Pakete in `/etc/logrotate.d` bleiben unverändert.
+  (`/etc/systemd/journald.conf.d/10-aufbewahrung.conf`) und, falls logrotate vorhanden
+  ist, in `/var/log/btmp` und `/var/log/wtmp` (`/etc/logrotate.d/00-login-logs`), in
+  `/var/log/fail2ban.log` (`/etc/logrotate.d/00-fail2ban-log`; enthält nur noch
+  Einträge von vor dem Wechsel auf syslog) und, falls zusätzlich rsyslog installiert
+  ist, in `/var/log/auth.log` (`/etc/logrotate.d/00-auth-log`). logrotate gilt als
+  vorhanden, wenn das Paket laut dpkg installiert ist und das Programm `logrotate`
+  gefunden wird. Sonst legt das Skript keine der drei `00-*`-Dateien an und warnt.
+  Die Dateien der Pakete in `/etc/logrotate.d` bleiben unverändert.
 - Firewall über die iptables-Regeln des Oracle-Images (kein UFW; ein installiertes,
   inaktives UFW entfernt apt mit `iptables-persistent`): Ports 22, 80 und 443
   für IPv4 und IPv6, wenn `INPUT` andere Verbindungen abweist (`REJECT`-Regel oder
@@ -155,13 +174,30 @@ sudo bash site/tests/server/setup-server.test.sh
 
 Der Test spielt das Skript in Wegwerf-Umgebungen durch (eigener Mount- und
 Netz-Namespace mit `unshare`, Overlay über `/etc`, `/home` und weitere Verzeichnisse,
-iptables-Regeln wie im Oracle-Image). Auf dem Rechner selbst ändert sich nichts. Er
-braucht root, Netz-Namespaces und die Werkzeuge `unshare`, `setpriv`, iptables,
-`sshd`, `fail2ban-client`, `apt-config`, `shellcheck` und `python3`; außerdem müssen
-die Benutzer `ubuntu` und `claude` existieren. Exit-Code 0 heißt bestanden, 1 mindestens
-ein Fehler, 2 der Test kann hier nicht laufen (dann gilt er als nicht ausgeführt, nicht
-als bestanden). In der CI läuft er nicht (dort ist er nicht eingerichtet); er ist deshalb
-lokal Pflicht.
+iptables-Regeln wie im Oracle-Image). Auf dem Rechner selbst ändert sich nichts.
+
+Voraussetzungen auf dem Testrechner. Root, die Werkzeuge und die Benutzer und Gruppen
+prüft der Test vorab; fehlt etwas davon, endet er mit Exit-Code 2.
+
+- Aufruf als root.
+- Mount- und Netz-Namespaces (`unshare -m -n`) und Overlay-Dateisysteme; `/proc/self/ns`
+  muss lesbar sein.
+- Die Werkzeuge `unshare`, `setpriv`, `iptables`, `ip6tables`, `iptables-save`,
+  `ip6tables-save`, `iptables-restore`, `ip6tables-restore`, `/usr/sbin/sshd`,
+  `fail2ban-client`, `apt-config`, `shellcheck`, `python3` (mit dem Python-Modul von
+  fail2ban), `diff`, `gpg`, `gpgconf`, `/usr/sbin/useradd`, `/usr/sbin/groupadd`,
+  `/usr/sbin/groupdel`, `mount`, `readlink` und `cmp`.
+- Die Benutzer `ubuntu` und `claude` müssen existieren.
+- Der Benutzer `srvadmin` und die Gruppen `sshlogin` und `sshdeny` dürfen **nicht**
+  existieren; die Testfälle legen sie selbst an.
+- Das Arbeitsverzeichnis (`TMPDIR`, Standard `/tmp`) darf nicht unter `/etc`, `/home`,
+  `/run`, `/var`, `/usr`, `/opt`, `/root` oder `/srv` liegen, die der Test überlagert.
+- Die Datei `site/tests/server/fixtures/docker.asc` muss vorhanden sein, und `gpg` muss
+  einen Testschlüssel erzeugen können.
+
+Exit-Code 0 heißt bestanden, 1 mindestens ein Fehler, 2 der Test kann hier nicht laufen
+(dann gilt er als nicht ausgeführt, nicht als bestanden). In der CI läuft er nicht
+(dort ist er nicht eingerichtet); er ist deshalb lokal Pflicht.
 
 **Hinweis Docker und Firewall:** Docker leitet veröffentlichte Container-Ports an der
 INPUT-Kette vorbei. Deshalb veröffentlicht nur Traefik Ports (80, 443). Eigene Regeln
