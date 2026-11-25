@@ -147,7 +147,7 @@ sshd_state() {
 }
 
 fixture() {
-  local art=$1 key_user=${SC_KEY_USER:-ubuntu} u d
+  local art=$1 key_user=${SC_KEY_USER:-ubuntu} u d g members
 
   # Service and time zone state of a fresh server, used by the stubs.
   mkdir -p "$art/state"
@@ -196,6 +196,31 @@ fixture() {
       >/etc/ssh/sshd_config.d/10-haertung.conf
     chmod 640 /etc/ssh/sshd_config.d/10-haertung.conf
   fi
+  # Groups for AllowGroups and DenyGroups: "NAME[:MEMBER,MEMBER] ..." (only in the sandbox).
+  for g in ${SC_GROUPS:-}; do
+    groupadd "${g%%:*}"
+    if [[ $g == *:* ]]; then
+      IFS=, read -r -a members <<<"${g#*:}"
+      for u in "${members[@]}"; do usermod -aG "${g%%:*}" "$u"; done
+    fi
+  done
+  # A drop-in whose name sorts before 10-haertung.conf (sshd reads it first, so its
+  # PasswordAuthentication and the like win), one that sorts after it, and a Match block
+  # for ubuntu at the end of sshd_config. "\n" separates lines.
+  if [[ -n ${SC_SSHD_EARLY:-} ]]; then
+    printf '%b\n' "# test fixture" "$SC_SSHD_EARLY" >/etc/ssh/sshd_config.d/00-test.conf
+  fi
+  if [[ -n ${SC_SSHD_LATE:-} ]]; then
+    printf '%b\n' "# test fixture" "$SC_SSHD_LATE" >/etc/ssh/sshd_config.d/60-test.conf
+  fi
+  if [[ -n ${SC_SSHD_MATCH:-} ]]; then
+    printf '\n# test fixture\nMatch User ubuntu\n    %b\n' "$SC_SSHD_MATCH" >>/etc/ssh/sshd_config
+  fi
+  # No sshd privilege separation directory (socket activation, ssh.service not started).
+  if [[ ${SC_RUN_SSHD:-} == missing ]]; then
+    rm -rf /run/sshd
+    if [[ ! -e /run/sshd ]]; then touch "$art/run_sshd_absent"; fi
+  fi
   # A default that differs from the wanted values; the script's values must win.
   mkdir -p /etc/apt/apt.conf.d
   printf 'Unattended-Upgrade::Automatic-Reboot "false";\nUnattended-Upgrade::Automatic-Reboot-Time "02:00";\n' \
@@ -235,8 +260,10 @@ fixture() {
       ;;
   esac
 
-  # No log retention file of the host leaks into a scenario.
-  rm -f /etc/logrotate.d/00-auth-log /etc/systemd/journald.conf.d/10-aufbewahrung.conf
+  # No log retention or fail2ban file of the host leaks into a scenario.
+  rm -f /etc/logrotate.d/00-auth-log /etc/systemd/journald.conf.d/10-aufbewahrung.conf \
+    /etc/logrotate.d/00-login-logs /etc/logrotate.d/00-fail2ban-log \
+    /etc/fail2ban/fail2ban.local /etc/fail2ban/jail.local
   # rsyslog's logrotate file as shipped by Ubuntu's rsyslog package (a conffile, here
   # a synthetic copy): the script must leave it as it is.
   if [[ ${SC_LOGROTATE_RSYSLOG:-0} == 1 ]]; then
@@ -262,6 +289,63 @@ fixture() {
 }
 CONF
     chmod 644 /etc/logrotate.d/rsyslog
+  fi
+  # The logrotate files of the packages logrotate (3.21.0-2build1: btmp, wtmp) and
+  # fail2ban (1.0.2-3ubuntu0.1), as synthetic copies: the script must leave them as they are.
+  if [[ ${SC_LOGROTATE_PKG:-0} == 1 ]]; then
+    mkdir -p /etc/logrotate.d
+    cat >/etc/logrotate.d/btmp <<'CONF'
+# no packages own btmp -- we'll rotate it here
+/var/log/btmp {
+    missingok
+    monthly
+    create 0660 root utmp
+    rotate 1
+}
+CONF
+    cat >/etc/logrotate.d/wtmp <<'CONF'
+# no packages own wtmp -- we'll rotate it here
+/var/log/wtmp {
+    missingok
+    monthly
+    create 0664 root utmp
+    minsize 1M
+    rotate 1
+}
+CONF
+    cat >/etc/logrotate.d/fail2ban <<'CONF'
+/var/log/fail2ban.log {
+
+    weekly
+    rotate 4
+    compress
+    # Do not rotate if empty
+    notifempty
+
+    delaycompress
+    missingok
+    postrotate
+	fail2ban-client flushlogs 1>/dev/null
+    endscript
+
+    # If fail2ban runs as non-root it still needs to have write access
+    # to logfiles.
+    # create 640 fail2ban adm
+    create 640 root adm
+}
+CONF
+    chmod 644 /etc/logrotate.d/btmp /etc/logrotate.d/wtmp /etc/logrotate.d/fail2ban
+  fi
+  # Package defaults that differ from the values in the privacy policy (as after a
+  # changed default), in files fail2ban reads before fail2ban.local and jail.local.
+  # fail2ban-client -d before the run shows that they take effect.
+  if [[ ${SC_F2B_DEFAULTS:-0} == 1 ]]; then
+    mkdir -p /etc/fail2ban/fail2ban.d /etc/fail2ban/jail.d
+    printf '# Changed defaults (test fixture)\n[Definition]\nlogtarget = /var/log/fail2ban.log\ndbpurgeage = 7d\n' \
+      >/etc/fail2ban/fail2ban.d/50-test-defaults.conf
+    printf '# Changed defaults (test fixture)\n[DEFAULT]\nbantime = 1h\nfindtime = 1h\nmaxretry = 3\n\n[sshd]\nbantime = 2h\nfindtime = 30m\nmaxretry = 2\n' \
+      >/etc/fail2ban/jail.d/50-test-defaults.conf
+    fail2ban-client -d >"$art/f2b_dump0" 2>/dev/null || true
   fi
   # A journald drop-in from an earlier version, with other content and mode.
   if [[ ${SC_JOURNALD_OLD:-0} == 1 ]]; then
@@ -300,20 +384,23 @@ dump_fw() {
 }
 
 run_setup() {
-  local art=$1 n=$2 rc=0
+  local art=$1 n=$2 rc=0 stubs=$STUBS
   local -a envs pre=()
   : >"$art/log$n"
   chmod 666 "$art/log$n"
   # Own TMPDIR per scenario: the script's temporary files stay out of the host's /tmp
   # and the tests can see whether they are removed.
   install -d -m 1777 "$art/tmp"
+  # SC_UFW=absent: no ufw command at all (stubs without ufw).
+  if [[ ${SC_UFW:-} == absent ]]; then stubs="$STUBS-noufw"; fi
   envs=(
-    PATH="$STUBS:$SANDBOX_PATH_TAIL" HOME=/root LANG=C.UTF-8 TMPDIR="$art/tmp"
+    PATH="$stubs:$SANDBOX_PATH_TAIL" HOME=/root LANG=C.UTF-8 TMPDIR="$art/tmp"
     STUB_LOG="$art/log$n" STUB_STATE="$art/state"
     SSHD_T_FAIL="${SC_SSHD_T_FAIL:-0}"
     STUB_DOCKER_KEY="$KEYS/${SC_DOCKER_KEY:-docker}.asc"
     STUB_IPT_RACE="${SC_IPT_RACE:-}"
     STUB_DPKG="${SC_DPKG:-}"
+    STUB_UFW="${SC_UFW:-inactive}"
   )
   if [[ -n ${SC_DRY_RUN+x} ]]; then envs+=(DRY_RUN="$SC_DRY_RUN"); fi
   if [[ -n ${SC_ADMIN_USER+x} ]]; then envs+=(ADMIN_USER="$SC_ADMIN_USER"); fi
@@ -351,6 +438,20 @@ between_runs() {
   iptables -N DOCKER-USER
   iptables -A DOCKER-USER -j RETURN
   iptables -I FORWARD 1 -j DOCKER-USER
+}
+
+# f2b_edit local|jail: between run 1 and run 2, someone puts an older version of
+# fail2ban.local or jail.local in place (same inode, other content). snap1_pre keeps the
+# state right after run 1.
+f2b_edit() {
+  case $1 in
+    local) printf '# Older version (test fixture)\n[Definition]\nlogtarget = /var/log/fail2ban.log\n' >/etc/fail2ban/fail2ban.local ;;
+    jail) printf '# Older version (test fixture)\n[sshd]\nenabled = true\nbackend = systemd\n' >/etc/fail2ban/jail.local ;;
+    *)
+      echo "fixture: unknown SC_F2B_EDIT $1" >&2
+      return 1
+      ;;
+  esac
 }
 
 # inner_guard ARTDIR: refuse to run outside a sandbox. Called directly (for example
@@ -409,6 +510,11 @@ inner() {
       # State before the second run, including these changes.
       snapshot "$art" >"$art/snap$i"
       dump_fw >"$art/fw$i"
+    fi
+    if ((i == 1)) && [[ -n ${SC_F2B_EDIT:-} ]]; then
+      cp "$art/snap1" "$art/snap1_pre"
+      f2b_edit "$SC_F2B_EDIT"
+      snapshot "$art" >"$art/snap1"
     fi
   done
   post_checks "$art"
@@ -555,11 +661,20 @@ $log
 if [[ \${1:-} == -m ]]; then echo aarch64; exit 0; fi
 exec /usr/bin/uname "\$@"
 EOF
-  # Oracle's Ubuntu image has ufw installed but inactive.
+  # Oracle's Ubuntu image has ufw installed but inactive (STUB_UFW=inactive, default).
+  # STUB_UFW=active: ufw holds the firewall rules; STUB_UFW=unclear: "ufw status"
+  # fails without a status line. A server without ufw: PATH with stubs-noufw instead.
   cat >"$dir/ufw" <<EOF
 #!/bin/bash
 $log
-if [[ \${1:-} == status ]]; then echo "Status: inactive"; fi
+if [[ \${1:-} == status ]]; then
+  case \${STUB_UFW:-inactive} in
+    inactive) echo "Status: inactive" ;;
+    active) printf 'Status: active\n\nTo                         Action      From\n--                         ------      ----\n22/tcp                     ALLOW       Anywhere\n' ;;
+    unclear) echo "ERROR: Couldn't determine iptables version" >&2; exit 1 ;;
+    *) echo "ufw (test stub): unknown STUB_UFW '\$STUB_UFW'" >&2; exit 99 ;;
+  esac
+fi
 exit 0
 EOF
   cat >"$dir/ss" <<EOF
@@ -1644,6 +1759,400 @@ t_dry_log_retention() { # SCENARIO WITH_AUTH(0|1)
   return $((1 - ok))
 }
 
+# --- tests: fail2ban values of the privacy policy ------------------------------
+
+F2B_LOCAL=/etc/fail2ban/fail2ban.local
+F2B_JAIL=/etc/fail2ban/jail.local
+# Effective values the privacy policy names (times in seconds), plus backend and ban
+# action of the jail sshd, as f2b_values prints them.
+F2B_WANT='dbpurgeage=86400
+logtarget=SYSLOG[facility=AUTHPRIV]
+sshd.addaction=iptables-multiport
+sshd.backend=systemd
+sshd.bantime=600
+sshd.findtime=600
+sshd.maxretry=5'
+
+# f2b_values FILE: from the output of "fail2ban-client -d" (the commands fail2ban would
+# load), the values of logtarget and dbpurgeage, and of the jail sshd maxretry,
+# findtime, bantime, backend and actions; times converted to seconds with fail2ban's
+# own parser. One "key=value" per line, sorted.
+f2b_values() { # FILE
+  python3 -I - "$1" <<'PY'
+import ast
+import sys
+
+from fail2ban.server.mytime import MyTime
+
+out = {}
+actions = []
+with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
+    for line in f:
+        line = line.strip()
+        if not line.startswith("["):
+            continue
+        try:
+            c = ast.literal_eval(line)
+        except (ValueError, SyntaxError):
+            continue
+        if not isinstance(c, list):
+            continue
+        if len(c) == 3 and c[0] == "set" and c[1] in ("logtarget", "dbpurgeage"):
+            out[c[1]] = c[2]
+        elif len(c) == 3 and c[:2] == ["add", "sshd"]:
+            out["sshd.backend"] = c[2]
+        elif len(c) == 4 and c[:2] == ["set", "sshd"] and c[2] in ("maxretry", "findtime", "bantime"):
+            out["sshd." + c[2]] = c[3]
+        elif len(c) >= 4 and c[:3] == ["set", "sshd", "addaction"]:
+            actions.append(c[3])
+for k in ("dbpurgeage", "sshd.findtime", "sshd.bantime"):
+    if k in out:
+        out[k] = int(MyTime.str2seconds(str(out[k])))
+if actions:
+    out["sshd.addaction"] = ",".join(actions)
+for k in sorted(out):
+    print("%s=%s" % (k, out[k]))
+PY
+}
+
+# After the last run of SCENARIO, fail2ban-client -d has the values of F2B_WANT, so
+# they are what fail2ban loads, not only text in a file; fail2ban.local and jail.local
+# are 644 root:root. If the fixture changed the package defaults (f2b_dump0), each of
+# these values was different before the run.
+t_f2b_effective() { # SCENARIO RUNS
+  local ok=1 a r got k v0 f p
+  have_run "$1" "$2" || return 1
+  a=$(art "$1")
+  for ((r = 1; r <= $2; r++)); do
+    [[ $(rc_of "$1" "$r") == 0 ]] || no "run $r: expected exit code 0, got: $(rc_of "$1" "$r")" "$(tail -3 "$a/err$r")"
+  done
+  if [[ ! -s $a/f2b_dump ]]; then
+    no "fail2ban-client -d after the run printed nothing (configuration invalid?)"
+  else
+    got=$(f2b_values "$a/f2b_dump")
+    [[ $got == "$F2B_WANT" ]] ||
+      no "effective fail2ban values (fail2ban-client -d), expected < got >:" "$(diff <(printf '%s\n' "$F2B_WANT") <(printf '%s\n' "$got"))"
+  fi
+  if [[ -f $a/f2b_dump0 ]]; then
+    for k in dbpurgeage logtarget sshd.bantime sshd.findtime sshd.maxretry; do
+      v0=$(f2b_values "$a/f2b_dump0" | awk -F= -v k="$k" '$1 == k')
+      if [[ -z $v0 ]] || grep -qxF -- "$v0" <<<"$F2B_WANT"; then
+        no "fixture: changed default for $k not in effect before the run (${v0:-not set})"
+      fi
+    done
+  fi
+  for f in "$F2B_LOCAL" "$F2B_JAIL"; do
+    p="$(upper "$1" etc)${f#/etc}"
+    if [[ ! -f $p ]]; then
+      no "$f was not written"
+    elif [[ $(stat -c '%a %U:%G' "$p") != "644 root:root" ]]; then
+      no "$f: mode and owner $(stat -c '%a %U:%G' "$p"), expected 644 root:root"
+    fi
+  done
+  return $((1 - ok))
+}
+
+# Lines of a call log that restart or reload fail2ban.
+F2B_RESTART_RE='^systemctl (restart|try-restart|reload-or-restart|try-reload-or-restart|reload|force-reload) fail2ban(\.service)?$'
+
+# sha256 line of PATH in snapshot N of SCENARIO (content only, no inode or times).
+snap_sha() { snap_of "$@" | grep -v '|'; }
+
+# fail2ban is restarted in exactly the runs that change fail2ban.local or jail.local,
+# once, and after fail2ban-client -t:
+#   none   fresh server: run 1 writes both files and restarts, run 2 does not restart.
+#   local  between run 1 and 2 an older fail2ban.local was put in place: run 2 writes
+#          it back (content as after run 1), leaves jail.local as it is (inode, times,
+#          content) and restarts.
+#   jail   the same with jail.local.
+t_f2b_restart() { # SCENARIO none|local|jail
+  local ok=1 a r n t s changed kept d
+  local -a want
+  have_run "$1" 2 || return 1
+  a=$(art "$1")
+  for r in 1 2; do
+    [[ $(rc_of "$1" "$r") == 0 ]] || no "run $r: expected exit code 0, got: $(rc_of "$1" "$r")" "$(tail -3 "$a/err$r")"
+  done
+  if [[ $2 == none ]]; then want=(1 0); else want=(1 1); fi
+  for r in 1 2; do
+    n=$(grep -cE "$F2B_RESTART_RE" "$a/log$r")
+    ((n == want[r - 1])) ||
+      no "run $r: $n fail2ban restarts, expected ${want[r - 1]}:" "$(grep -E '^(systemctl .*fail2ban|fail2ban-client)' "$a/log$r")"
+    if ((n >= 1)); then
+      t=$(grep -nE '^fail2ban-client -t( |$)' "$a/log$r" | head -1 | cut -d: -f1)
+      s=$(grep -nE "$F2B_RESTART_RE" "$a/log$r" | head -1 | cut -d: -f1)
+      if [[ -z $t ]] || ((t > s)); then no "run $r: fail2ban restarted without fail2ban-client -t before it"; fi
+    fi
+  done
+  if [[ $2 != none ]]; then
+    if [[ $2 == local ]]; then changed=$F2B_LOCAL kept=$F2B_JAIL; else changed=$F2B_JAIL kept=$F2B_LOCAL; fi
+    [[ $(snap_sha "$1" 1_pre "$changed") != "$(snap_sha "$1" 1 "$changed")" ]] ||
+      no "fixture: $changed was not changed between run 1 and run 2"
+    [[ -n $(snap_sha "$1" 2 "$changed") && $(snap_sha "$1" 2 "$changed") == "$(snap_sha "$1" 1_pre "$changed")" ]] ||
+      no "run 2 did not put back the content of run 1 in $changed"
+    [[ -n $(snap_of "$1" 1 "$kept") ]] || no "$kept is not there after run 1"
+    d=$(diff <(snap_of "$1" 1 "$kept") <(snap_of "$1" 2 "$kept")) || no "run 2 changed $kept:" "$d"
+  fi
+  return $((1 - ok))
+}
+
+# --- tests: logrotate for btmp, wtmp and fail2ban.log -----------------------------
+
+LOGIN_LOGROTATE=/etc/logrotate.d/00-login-logs
+F2B_LOGROTATE=/etc/logrotate.d/00-fail2ban-log
+LOGROTATE_PKG_FILES="/etc/logrotate.d/btmp /etc/logrotate.d/wtmp /etc/logrotate.d/fail2ban"
+
+# Directives per log file of a logrotate file: "PATH<TAB>DIRECTIVE" for every path
+# named before "{" and every directive in its block (words joined by one space);
+# scripts (postrotate ... endscript and the like) only by their first word.
+logrotate_blocks() { # FILE
+  awk '
+    /^[[:space:]]*#/ || NF == 0 { next }
+    script { if ($1 == "endscript") script = 0; next }
+    !block { for (i = 1; i <= NF; i++) { if ($i == "{") block = 1; else if (!block) paths[++np] = $i }; next }
+    $1 == "}" { block = 0; np = 0; split("", paths); next }
+    { if ($1 ~ /^(prerotate|postrotate|firstaction|lastaction|preremove)$/) { script = 1; d = $1 } else { $1 = $1; d = $0 }
+      for (i = 1; i <= np; i++) print paths[i] "\t" d }' "$1"
+}
+
+# lr_block_ok ITEMS FILE "PATH MODE OWNER GROUP": in ITEMS (logrotate_blocks of FILE)
+# PATH has daily, exactly one rotate (rotate 6), ifempty, missingok, ignoreduplicates,
+# exactly one create (create MODE OWNER GROUP, mode with or without leading 0), and
+# nothing that rotates it less often or keeps it longer.
+lr_block_ok() {
+  local items=$1 file=$2 path mode owner group b d bad
+  read -r path mode owner group <<<"$3"
+  b=$(awk -F'\t' -v p="$path" '$1 == p { print $2 }' <<<"$items")
+  if [[ -z $b ]]; then
+    no "$file has no block for $path"
+    return
+  fi
+  for d in daily "rotate 6" ifempty missingok ignoreduplicates; do
+    grep -qxF -- "$d" <<<"$b" || no "$file, $path: lacks $d"
+  done
+  [[ $(grep -c '^rotate ' <<<"$b") == 1 ]] || no "$file, $path: expected exactly one rotate, found:" "$(grep '^rotate ' <<<"$b")"
+  if [[ $(grep -cE '^(no)?create( |$)' <<<"$b") != 1 ]] || ! grep -qxE -- "create 0?${mode#0} $owner $group" <<<"$b"; then
+    no "$file, $path: expected exactly one 'create $mode $owner $group', found:" "$(grep -E '^(no)?create( |$)' <<<"$b")"
+  fi
+  bad=$(grep -E '^(hourly|weekly|monthly|yearly|notifempty|size|minsize|minage)( |$)' <<<"$b")
+  [[ -z $bad ]] || no "$file, $path: directives that rotate less often or keep it longer:" "$bad"
+}
+
+# logrotate installed: FILE names exactly the paths of the SPECs ("PATH MODE OWNER
+# GROUP") and each block is as lr_block_ok wants it; mode 644 root:root; later runs
+# leave FILE as it is. The package files PKG ("/etc/logrotate.d/NAME ...") stay as
+# they are (inode, times, content) in every run.
+t_lr_file() { # SCENARIO RUNS FILE "PKG..." SPEC...
+  local ok=1 s=$1 runs=$2 file=$3 pkgs=$4 a f r d s0 pkg spec want paths
+  shift 4
+  have_run "$s" "$runs" || return 1
+  a=$(art "$s")
+  for ((r = 1; r <= runs; r++)); do
+    [[ $(rc_of "$s" "$r") == 0 ]] || no "run $r: expected exit code 0, got: $(rc_of "$s" "$r")" "$(tail -3 "$a/err$r")"
+  done
+  f="$(upper "$s" etc)${file#/etc}"
+  if [[ ! -f $f ]]; then
+    no "$file was not written although logrotate is installed"
+  else
+    want=$(for spec in "$@"; do echo "${spec%% *}"; done | LC_ALL=C sort)
+    paths=$(logrotate_items "$f" | sed -n 's/^path //p' | LC_ALL=C sort)
+    [[ $paths == "$want" ]] || no "$file must name exactly these log files:" "$want" "it names:" "$paths"
+    for spec in "$@"; do lr_block_ok "$(logrotate_blocks "$f")" "$file" "$spec"; done
+    [[ $(stat -c '%a %U:%G' "$f") == "644 root:root" ]] || no "$file: mode and owner $(stat -c '%a %U:%G' "$f"), expected 644 root:root"
+    for ((r = 2; r <= runs; r++)); do
+      d=$(diff <(snap_of "$s" 1 "$file") <(snap_of "$s" "$r" "$file")) || no "run $r changed $file:" "$d"
+    done
+    ((ok)) || no "$file:"$'\n'"$(cat "$f")"
+  fi
+  for pkg in $pkgs; do
+    s0=$(snap_of "$s" 0 "$pkg")
+    if [[ -z $s0 ]]; then
+      no "fixture: no $pkg before the run"
+      continue
+    fi
+    for ((r = 1; r <= runs; r++)); do
+      d=$(diff <(printf '%s\n' "$s0") <(snap_of "$s" "$r" "$pkg")) || no "run $r changed $pkg:" "$d"
+    done
+  done
+  return $((1 - ok))
+}
+
+t_no_warning() { # SCENARIO REGEX: no warning on stderr of run 1 matches REGEX
+  local ok=1 w
+  have_run "$1" 1 || return 1
+  w=$(grep -E 'WARNUNG:' "$(art "$1")/err1" | grep -E -- "$2")
+  [[ -z $w ]] || no "unexpected warning:" "$w"
+  return $((1 - ok))
+}
+
+# logrotate not installed (unknown to dpkg, or removed with only its conffiles left):
+# no 00-login-logs and no 00-fail2ban-log, a warning that names logrotate; package
+# files left in /etc/logrotate.d stay as they are. The run reached the log retention
+# step and asked dpkg-query about logrotate.
+t_no_lr() { # SCENARIO
+  local ok=1 a dir pkg s0 d
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)"
+  [[ -f "$(upper "$1" etc)${JOURNALD_DROPIN#/etc}" ]] || no "the run did not reach the log retention step (no $JOURNALD_DROPIN)"
+  grep -qE '^dpkg-query( .*)? logrotate$' "$a/log1" || no "the script did not ask dpkg-query whether logrotate is installed"
+  dir="$(upper "$1" etc)/logrotate.d"
+  [[ ! -e $dir/00-login-logs ]] || no "$LOGIN_LOGROTATE written although logrotate is not installed"
+  [[ ! -e $dir/00-fail2ban-log ]] || no "$F2B_LOGROTATE written although logrotate is not installed"
+  grep -E 'WARNUNG:' "$a/err1" | grep -q 'logrotate' || no "no warning that names logrotate:" "$(grep 'WARNUNG' "$a/err1")"
+  for pkg in $LOGROTATE_PKG_FILES; do
+    s0=$(snap_of "$1" 0 "$pkg")
+    [[ -n $s0 ]] || continue
+    d=$(diff <(printf '%s\n' "$s0") <(snap_of "$1" 1 "$pkg")) || no "run changed $pkg:" "$d"
+  done
+  return $((1 - ok))
+}
+
+# Dry run with logrotate installed: exit 0, nothing changed; it shows 00-login-logs and
+# 00-fail2ban-log with their blocks, and none of the package files as written.
+t_dry_lr() { # SCENARIO
+  local ok=1 all re
+  have_run "$1" 1 || return 1
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)"
+  assert_unchanged "$1" 1
+  all=$(cat "$(art "$1")/out1" "$(art "$1")/err1")
+  for re in "würde $LOGIN_LOGROTATE schreiben" "würde $F2B_LOGROTATE schreiben" '\|[[:space:]]+/var/log/btmp \{$' \
+    '\|[[:space:]]+/var/log/wtmp \{$' '\|[[:space:]]+/var/log/fail2ban\.log \{$'; do
+    grep -qE -- "$re" <<<"$all" || no "dry-run output lacks: $re"
+  done
+  ! grep -qE -- 'würde /etc/logrotate\.d/(btmp|wtmp|fail2ban|rsyslog) ' <<<"$all" ||
+    no "dry run would write a package file:" "$(grep -E 'würde /etc/logrotate\.d/' <<<"$all")"
+  return $((1 - ok))
+}
+
+# --- tests: UFW -------------------------------------------------------------------
+
+# ufw installed and inactive (Oracle's image): a warning that names ufw, and the run
+# goes on to the end with exit 0.
+t_ufw_inactive_warns() { # SCENARIO
+  local ok=1 a
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)" "$(tail -3 "$a/err1")"
+  grep -qx 'ufw status' "$a/log1" || no "the script did not ask 'ufw status'"
+  grep -E 'WARNUNG:' "$a/err1" | grep -qE 'ufw|UFW' || no "no warning that names ufw:" "$(grep 'WARNUNG' "$a/err1")"
+  grep -qE 'Änderungen in diesem Lauf: [0-9]' "$a/out1" || no "the run did not reach the end"
+  return $((1 - ok))
+}
+
+# No ufw on the server (unknown to dpkg, no command): the script does not call ufw,
+# does not warn about it and runs through.
+t_ufw_absent() { # SCENARIO
+  local ok=1 a
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  if PATH=$SANDBOX_PATH_TAIL command -v ufw >/dev/null 2>&1; then
+    no "fixture: the host has a ufw command in $SANDBOX_PATH_TAIL, this scenario cannot hide it"
+  fi
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)" "$(tail -3 "$a/err1")"
+  ! grep -qE '^ufw( |$)' "$a/log1" || no "ufw was called although it is not there:" "$(grep -E '^ufw' "$a/log1")"
+  t_no_warning "$1" 'ufw|UFW' || ok=0
+  return $((1 - ok))
+}
+
+# Dry run: exit 0, nothing changed, and stderr says that a real run would abort, for
+# the reason REGEX.
+t_dry_would_abort() { # SCENARIO REGEX
+  local ok=1 a
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)"
+  assert_unchanged "$1" 1
+  grep -E '\[Testlauf\].*abbrechen' "$a/err1" | grep -qE -- "$2" ||
+    no "dry run does not say that a real run would abort (/$2/):" "$(cat "$a/err1")"
+  return $((1 - ok))
+}
+
+# --- tests: SSH settings that do not take effect, admin locked out ----------------
+
+# As t_sshd_rollback (drop-in as before, no reload, abort right there), and the abort
+# message names the reason REGEX.
+t_sshd_rollback_because() { # SCENARIO REGEX
+  local ok=1
+  t_sshd_rollback "$1" || ok=0
+  grep -E '^Abbruch' "$(art "$1")/err1" | grep -qE -- "$2" ||
+    no "the abort message does not name the reason (/$2/):" "$(cat "$(art "$1")/err1")"
+  return $((1 - ok))
+}
+
+# DenyUsers, AllowGroups and DenyGroups that do not exclude ubuntu, and an earlier
+# drop-in that agrees: the run goes through, ssh is reloaded, sshd -T has the hardening
+# and every LINE (the fixture is in effect).
+t_sshd_accepts() { # SCENARIO LINE...
+  local ok=1 s=$1 a eff l
+  shift
+  have_run "$s" 1 || return 1
+  a=$(art "$s")
+  [[ $(rc_of "$s" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$s" 1)" "$(grep -E '^Abbruch' "$a/err1")"
+  grep -qE '^systemctl reload ssh(\.service)?$' "$a/log1" || no "ssh was not reloaded"
+  t_sshd_effective "$s" ubuntu || ok=0
+  eff=$(cat "$a/sshd_T")
+  for l in "$@"; do
+    grep -qxF -- "$l" <<<"$eff" || no "fixture not in effect: sshd -T lacks '$l'"
+  done
+  return $((1 - ok))
+}
+
+# --- tests: /run/sshd -------------------------------------------------------------
+
+t_run_sshd_fixture() { # SCENARIO: /run/sshd was missing before the run
+  [[ -f $(art "$1")/run_sshd_absent ]] || no "fixture: /run/sshd was there before the run"
+}
+
+# /run/sshd was missing: the run creates it and goes through. sshd accepts it only owned
+# by root and not writable by group or others.
+t_run_sshd_created() { # SCENARIO
+  local ok=1 p
+  have_run "$1" 1 || return 1
+  t_run_sshd_fixture "$1"
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)" "$(grep -E '^Abbruch' "$(art "$1")/err1")"
+  p="$(upper "$1" run)/sshd"
+  if [[ ! -d $p ]]; then
+    no "/run/sshd was not created"
+  elif [[ $(stat -c %U "$p") != root ]] || (($(stat -c '0%a' "$p") & 022)); then
+    no "/run/sshd: mode and owner $(stat -c '%a %U:%G' "$p"), expected owner root, not writable by group or others"
+  fi
+  return $((1 - ok))
+}
+
+# /run/sshd was missing and the checks stop the run (reason REGEX in the abort
+# message). The only change is /run/sshd, created in the checks: all other files as
+# before (content, inode, mode, owner, times), firewall unchanged, no modifying command.
+t_aborts_only_run_sshd() { # SCENARIO REGEX
+  local ok=1 a rc d calls
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  t_run_sshd_fixture "$1"
+  rc=$(rc_of "$1" 1)
+  [[ $rc =~ ^[0-9]+$ && $rc -ne 0 ]] || no "expected exit code != 0, got: $rc"
+  grep -E '^Abbruch' "$a/err1" | grep -qE -- "$2" || no "the abort message does not name the reason (/$2/):" "$(cat "$a/err1")"
+  [[ -d $(upper "$1" run)/sshd ]] || no "/run/sshd was not created in the checks"
+  d=$(diff <(grep -vE '^\./run/u(/sshd)?\|' "$a/snap0") <(grep -vE '^\./run/u(/sshd)?\|' "$a/snap1")) ||
+    no "files changed apart from /run/sshd:" "$d"
+  d=$(diff "$a/fw0" "$a/fw1") || no "firewall rules changed:" "$d"
+  calls=$(modifying_calls "$a/log1" strict)
+  [[ -z $calls ]] || no "modifying commands were run:" "$calls"
+  return $((1 - ok))
+}
+
+# Dry run without /run/sshd: exit 0, nothing changed (/run/sshd not created either),
+# and it shows that a real run creates /run/sshd.
+t_dry_run_sshd() { # SCENARIO
+  local ok=1
+  have_run "$1" 1 || return 1
+  t_run_sshd_fixture "$1"
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)"
+  assert_unchanged "$1" 1
+  [[ ! -d $(upper "$1" run)/sshd ]] || no "dry run created /run/sshd"
+  grep -qE '\[Testlauf\] install .*/run/sshd' "$(art "$1")/out1" || no "dry run does not show that /run/sshd would be created"
+  return $((1 - ok))
+}
+
 # --- tests: the test sandbox itself -------------------------------------------
 
 t_guard_refuses() { # GUARD_CASE
@@ -1745,6 +2254,12 @@ main() {
     echo "CANNOT RUN: user srvadmin exists on this host (the fixtures create it)"
     exit 2
   fi
+  for c in sshlogin sshdeny; do
+    if getent group "$c" >/dev/null; then
+      echo "CANNOT RUN: group $c exists on this host (the fixtures create it)"
+      exit 2
+    fi
+  done
   # Namespaces of this process; inner refuses to run in them (inner_guard).
   CALLER_NET=$(readlink /proc/self/ns/net) || CALLER_NET=""
   CALLER_MNT=$(readlink /proc/self/ns/mnt) || CALLER_MNT=""
@@ -1768,6 +2283,8 @@ main() {
     trap 'rm -rf "$WORK"' EXIT
   fi
   write_stubs "$WORK/stubs"
+  # The same stubs without ufw, for a server without ufw (SC_UFW=absent).
+  cp -a "$WORK/stubs" "$WORK/stubs-noufw" && rm -f "$WORK/stubs-noufw/ufw"
   if ! prepare_keys "$WORK/keys"; then
     echo "CANNOT RUN: test keys could not be prepared (gpg)"
     exit 2
@@ -1825,6 +2342,37 @@ PermitRootLogin yes"
   scenario rsyslog_hold "SC_DPKG=rsyslog=hold ok installed" SC_LOGROTATE_RSYSLOG=1 SC_RUNS=2
   scenario dry_rsyslog SC_DRY_RUN=1 "SC_DPKG=rsyslog=install ok installed" SC_LOGROTATE_RSYSLOG=1
   scenario journald_old SC_JOURNALD_OLD=1
+  scenario lr "SC_DPKG=logrotate=install ok installed" SC_LOGROTATE_PKG=1 SC_RUNS=2
+  scenario lr_rsyslog "SC_DPKG=$(printf '%s\n' 'rsyslog=install ok installed' 'logrotate=hold ok installed')" \
+    SC_LOGROTATE_PKG=1 SC_LOGROTATE_RSYSLOG=1
+  scenario lr_removed "SC_DPKG=logrotate=deinstall ok config-files" SC_LOGROTATE_PKG=1
+  scenario dry_lr SC_DRY_RUN=1 "SC_DPKG=logrotate=install ok installed" SC_LOGROTATE_PKG=1
+  # fail2ban values of the privacy policy
+  scenario f2b_defaults SC_F2B_DEFAULTS=1
+  scenario f2b_edit_local SC_RUNS=2 SC_F2B_EDIT=local
+  scenario f2b_edit_jail SC_RUNS=2 SC_F2B_EDIT=jail
+  # UFW
+  scenario ufw_active "SC_DPKG=ufw=install ok installed" SC_UFW=active
+  scenario ufw_unclear "SC_DPKG=ufw=install ok installed" SC_UFW=unclear
+  scenario ufw_absent SC_UFW=absent
+  scenario dry_ufw_active SC_DRY_RUN=1 "SC_DPKG=ufw=install ok installed" SC_UFW=active
+  # SSH settings that do not take effect, admin locked out
+  scenario ssh_early_pw "SC_SSHD_EARLY=PasswordAuthentication yes"
+  scenario ssh_early_kbd "SC_SSHD_EARLY=KbdInteractiveAuthentication yes"
+  scenario ssh_early_root "SC_SSHD_EARLY=PermitRootLogin prohibit-password"
+  scenario ssh_match_pw "SC_SSHD_MATCH=PasswordAuthentication yes"
+  scenario ssh_denyusers_star "SC_SSHD_LATE=DenyUsers ub*"
+  scenario ssh_denyusers_qmark "SC_SSHD_EARLY=DenyUsers ?buntu" SC_SSHD_OLD=1
+  scenario ssh_allowgroups_none SC_GROUPS=sshlogin "SC_SSHD_LATE=AllowGroups sshlogin"
+  scenario ssh_denygroups SC_GROUPS=sshdeny:ubuntu "SC_SSHD_LATE=DenyGroups sshdeny"
+  scenario ssh_groups_ok "SC_GROUPS=sshlogin:ubuntu sshdeny" "SC_SSHD_EARLY=PasswordAuthentication no" \
+    'SC_SSHD_LATE=AllowGroups sshlogin\nDenyGroups sshdeny\nDenyUsers ub? root'
+  # /run/sshd missing
+  scenario run_sshd_missing SC_RUN_SSHD=missing
+  scenario run_sshd_abort SC_RUN_SSHD=missing "SC_DPKG=ufw=install ok installed" SC_UFW=active
+  scenario run_sshd_ro SC_RUN_SSHD=missing SC_RO=/run
+  scenario run_sshd_broken SC_RUN_SSHD=missing "SC_SSHD_EARLY=ThisIsNotAnSshdOption yes"
+  scenario dry_run_sshd SC_DRY_RUN=1 SC_RUN_SSHD=missing
   # Docker key
   scenario key_wrong SC_DOCKER_KEY=wrong
   scenario key_two SC_DOCKER_KEY=two
@@ -1956,6 +2504,70 @@ PermitRootLogin yes"
   check "dry run with rsyslog: shows journald drop-in and 00-auth-log with their content, changes nothing" \
     t_dry_log_retention dry_rsyslog 1
   check "dry run without rsyslog: shows journald drop-in, no 00-auth-log" t_dry_log_retention dry 0
+
+  check "log retention: logrotate installed: 00-login-logs for btmp (create 0660 root utmp) and wtmp (create 0664 root utmp), each daily, rotate 6, ifempty, missingok, ignoreduplicates; logrotate.d/btmp and wtmp unchanged; run 2 unchanged" \
+    t_lr_file lr 2 /etc/logrotate.d/00-login-logs "/etc/logrotate.d/btmp /etc/logrotate.d/wtmp" \
+    "/var/log/btmp 0660 root utmp" "/var/log/wtmp 0664 root utmp"
+  check "log retention: logrotate installed: 00-fail2ban-log daily, rotate 6, ifempty, missingok, ignoreduplicates, create 640 root adm; logrotate.d/fail2ban unchanged; run 2 unchanged" \
+    t_lr_file lr 2 /etc/logrotate.d/00-fail2ban-log /etc/logrotate.d/fail2ban "/var/log/fail2ban.log 640 root adm"
+  check "log retention: logrotate installed: no warning about logrotate" t_no_warning lr logrotate
+  check "log retention: logrotate held, rsyslog installed: 00-login-logs as above, logrotate.d/btmp, wtmp, rsyslog unchanged" \
+    t_lr_file lr_rsyslog 1 /etc/logrotate.d/00-login-logs "/etc/logrotate.d/btmp /etc/logrotate.d/wtmp /etc/logrotate.d/rsyslog" \
+    "/var/log/btmp 0660 root utmp" "/var/log/wtmp 0664 root utmp"
+  check "log retention: logrotate held, rsyslog installed: 00-fail2ban-log as above, logrotate.d/fail2ban unchanged" \
+    t_lr_file lr_rsyslog 1 /etc/logrotate.d/00-fail2ban-log /etc/logrotate.d/fail2ban "/var/log/fail2ban.log 640 root adm"
+  check "log retention: logrotate not installed: no 00-login-logs, no 00-fail2ban-log, warning" t_no_lr fresh
+  check "log retention: logrotate removed, conffiles left: no 00-login-logs, no 00-fail2ban-log, warning, package files unchanged" \
+    t_no_lr lr_removed
+  check "dry run with logrotate: shows 00-login-logs and 00-fail2ban-log, changes nothing" t_dry_lr dry_lr
+
+  check "fail2ban: effective values (fail2ban-client -d): logtarget SYSLOG[facility=AUTHPRIV], dbpurgeage 1d, sshd maxretry 5, findtime 10m, bantime 10m, systemd, iptables-multiport; files 644" \
+    t_f2b_effective fresh 2
+  check "fail2ban: package defaults changed (other dbpurgeage, logtarget, maxretry, findtime, bantime): effective values as in the privacy policy" \
+    t_f2b_effective f2b_defaults 1
+  check "fail2ban: restarted once in run 1 (after fail2ban-client -t), not in run 2 (files unchanged)" t_f2b_restart fresh none
+  check "fail2ban: only fail2ban.local changed before run 2: written back, jail.local untouched, restarted once" \
+    t_f2b_restart f2b_edit_local local
+  check "fail2ban: only jail.local changed before run 2: written back, fail2ban.local untouched, restarted once" \
+    t_f2b_restart f2b_edit_jail jail
+  check "dry run shows step: fail2ban.local and the values of the privacy policy" t_dry_shows \
+    '/etc/fail2ban/fail2ban\.local' '\|[[:space:]]+\[Definition\]$' '\|[[:space:]]+logtarget = SYSLOG\[facility=AUTHPRIV\]$' \
+    '\|[[:space:]]+dbpurgeage = 1d$' '\|[[:space:]]+maxretry = 5$' '\|[[:space:]]+findtime = 10m$' '\|[[:space:]]+bantime = 10m$'
+
+  check "UFW installed and active: abort before any change" t_aborts_because ufw_active '^Abbruch.*(UFW|ufw)'
+  check "UFW status unclear (ufw status fails) as root: abort before any change" t_aborts_because ufw_unclear '^Abbruch.*(UFW|ufw)'
+  check "UFW installed and inactive: warning, the run goes on" t_ufw_inactive_warns fresh
+  check "UFW not installed: no ufw call, no warning, the run goes on" t_ufw_absent ufw_absent
+  check "dry run with active UFW: nothing changed, says a real run would abort" t_dry_would_abort dry_ufw_active 'UFW|ufw'
+
+  check "SSH: earlier drop-in 00-test.conf with PasswordAuthentication yes: drop-in reset, no reload, abort" \
+    t_sshd_rollback_because ssh_early_pw 'passwordauthentication'
+  check "SSH: earlier drop-in with KbdInteractiveAuthentication yes: drop-in reset, no reload, abort" \
+    t_sshd_rollback_because ssh_early_kbd 'kbdinteractiveauthentication'
+  check "SSH: earlier drop-in with PermitRootLogin prohibit-password: drop-in reset, no reload, abort" \
+    t_sshd_rollback_because ssh_early_root 'permitrootlogin'
+  check "SSH: Match User ubuntu with PasswordAuthentication yes (only sshd -T -C sees it): drop-in reset, no reload, abort" \
+    t_sshd_rollback_because ssh_match_pw 'passwordauthentication'
+  check "SSH: DenyUsers ub* in a later drop-in: drop-in reset, no reload, abort" \
+    t_sshd_rollback_because ssh_denyusers_star 'DenyUsers'
+  check "SSH: DenyUsers ?buntu: previous drop-in back (content, mode), no reload, abort" \
+    t_sshd_rollback_because ssh_denyusers_qmark 'DenyUsers'
+  check "SSH: AllowGroups sshlogin, ubuntu in no such group: drop-in reset, no reload, abort" \
+    t_sshd_rollback_because ssh_allowgroups_none 'AllowGroups'
+  check "SSH: DenyGroups sshdeny, ubuntu is a member: drop-in reset, no reload, abort" \
+    t_sshd_rollback_because ssh_denygroups 'DenyGroups'
+  check "SSH: AllowGroups with ubuntu's group, DenyGroups and DenyUsers ub? without ubuntu, earlier drop-in with PasswordAuthentication no: runs, reloads" \
+    t_sshd_accepts ssh_groups_ok "allowgroups sshlogin" "denygroups sshdeny" "denyusers ub?" "denyusers root"
+
+  check "/run/sshd missing: created in the checks (owner root, not group or world writable), the run goes through" \
+    t_run_sshd_created run_sshd_missing
+  check "/run/sshd missing, checks abort (UFW active): /run/sshd is the only change" \
+    t_aborts_only_run_sshd run_sshd_abort 'UFW|ufw'
+  check "/run/sshd missing and cannot be created: abort, nothing changed, no fallback to ~/.ssh/authorized_keys" \
+    t_aborts_because run_sshd_ro '/run/sshd'
+  check "/run/sshd missing, sshd -T fails afterwards (bad option): abort, only /run/sshd changed, no fallback to ~/.ssh/authorized_keys" \
+    t_aborts_only_run_sshd run_sshd_broken 'sshd -T'
+  check "dry run without /run/sshd: nothing changed, /run/sshd not created, shows that it would be" t_dry_run_sshd dry_run_sshd
 
   check "dry run shows: systemctl enable netfilter-persistent" t_dry_shows 'systemctl enable netfilter-persistent'
   check "packages: apt-get full-upgrade instead of upgrade (real and dry run)" t_full_upgrade
