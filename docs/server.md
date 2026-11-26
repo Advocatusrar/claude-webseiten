@@ -17,6 +17,11 @@ Was auf dem Server läuft, steht vollständig in [`deploy/`](../deploy):
 Traefik liest seine Routen aus einer Datei und braucht keinen Zugriff auf den
 Docker-Socket. Weder Traefik noch nginx schreiben Zugriffsprotokolle mit IP-Adressen.
 
+`setup-server.sh` kennt zwei Profile (Variable `PROFIL`): `oracle` ist der Standard und
+in den Abschnitten „Was ihr braucht“ bis „Skript testen“ beschrieben. Für einen
+Hostinger-VPS gilt `PROFIL=hostinger`, siehe
+[Hostinger-VPS (Profil `hostinger`)](#hostinger-vps-profil-hostinger).
+
 ## Was ihr braucht
 
 1. **Einen Server bei Oracle Cloud:** Instanz mit Shape `VM.Standard.A1.Flex` (Arm,
@@ -257,7 +262,236 @@ Exit-Code 0 heißt bestanden, 1 mindestens ein Fehler, 2 der Test kann hier nich
 
 **Hinweis Docker und Firewall:** Docker leitet veröffentlichte Container-Ports an der
 INPUT-Kette vorbei. Deshalb veröffentlicht nur Traefik Ports (80, 443). Eigene Regeln
-für Container gehören in die Kette `DOCKER-USER`.
+für Container gehören in die Kette `DOCKER-USER`. Auf Hostinger veröffentlichen auch
+andere Container Ports (z. B. 32768), siehe den Abschnitt zum Profil `hostinger`.
+
+## Hostinger-VPS (Profil `hostinger`)
+
+`setup-server.sh` hat zwei Profile, gewählt mit der Variablen `PROFIL`: `oracle`
+(Standard, alles oben) und `hostinger`. Ein anderer Wert bricht ab, bevor etwas
+geändert wird. Das Profil `hostinger` ist für einen Hostinger-VPS mit Ubuntu 24.04
+geschrieben, auf dem schon läuft, was Hostinger mitbringt: Docker (`docker-ce`,
+`containerd.io`, Compose-Plugin aus dem offiziellen Repository), Traefik von Hostinger
+im Host-Netz auf 80 und 443 und weitere Container (z. B. eine App mit dem
+veröffentlichten Port `0.0.0.0:32768`).
+
+### Ausgangslage und was das Profil anders macht
+
+| Thema           | Hostinger vorher                                                         | Nach dem Skript                                                                                                                                         |
+| --------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Anmeldung       | nur root (Web-Konsole im hPanel oder SSH), root mit Passwort             | `ADMIN_USER` mit Schlüssel (Gruppe `sudo`), `deploy` für die CI, root nur noch von der Web-Konsole (`169.254.0.1`) mit Passwort                         |
+| SSH             | `PermitRootLogin yes`, `PasswordAuthentication yes`                      | global `PermitRootLogin no`, `PasswordAuthentication no`, `KbdInteractiveAuthentication no`; Ausnahme `Match Address 169.254.0.1`                       |
+| Firewall        | `INPUT` offen (Policy `ACCEPT`, keine Regeln, IPv4 und IPv6), UFW inaktiv | `INPUT` endet mit `REJECT`; davor nur Loopback, Antworten, ICMP/ICMPv6, DHCP-Client, TCP 22, 80, 443; UFW entfernt                                      |
+| fail2ban        | nicht eingerichtet                                                       | wie bei Oracle, zusätzlich `ignoreip = 127.0.0.1/8 ::1 169.254.0.1`                                                                                     |
+| Docker          | installiert, läuft                                                       | bleibt installiert und läuft weiter; `daemon.json` ergänzt (`live-restore`, Log-Grenzen), **kein** Neustart von Docker                                  |
+
+Alles andere (Updates mit Neustart um 04:00, Aufbewahrung der Protokolle, Benutzer
+`deploy`, die Prüfungen gegen das Aussperren, `DRY_RUN=1`) ist wie im Profil `oracle`.
+
+**Eingaben, nur beim Aufruf, nie im Repository:**
+
+- `ADMIN_USER`: euer neuer Login-Benutzer. Pflicht, kein Standard. Nur Kleinbuchstaben,
+  Ziffern, `_` und `-`, höchstens 32 Zeichen, nicht `root` oder `deploy`. Gibt es den
+  Benutzer schon, muss er ein normaler Login-Benutzer sein (UID ab `UID_MIN`,
+  Login-Shell); ein Systembenutzer wie `www-data` bricht ab. Gibt es nur eine Gruppe
+  dieses Namens, bricht das Skript ebenfalls ab.
+- `ADMIN_PUBKEY`: genau eine Zeile `TYP BASE64 [Kommentar]`, also der Inhalt eurer
+  `.pub`-Datei. Erlaubt: `ssh-ed25519` (empfohlen), `ecdsa-sha2-nistp256`, `-nistp384`,
+  `-nistp521`, `ssh-rsa` ab 2048 Bit. Abgelehnt: private Schlüssel, mehrere Zeilen,
+  Steuerzeichen, Optionen vor dem Schlüssel (`command=`, `from=`, `restrict` …), andere
+  Typen, alles, was `ssh-keygen -l` nicht als öffentlichen Schlüssel genau dieses Typs
+  erkennt. Der Schlüssel erscheint in keiner Fehlermeldung, nur sein Fingerabdruck.
+
+**sudo mit Passwort.** Das Skript legt `ADMIN_USER` ohne Passwort an und trägt kein
+`NOPASSWD` ein. Ihr setzt das Passwort selbst als root mit `passwd ADMIN_USER`; das
+Skript zeigt den Schritt am Ende an, solange keines gesetzt ist. Die Anmeldung mit dem
+Schlüssel klappt auch ohne Passwort (das Skript prüft, dass sshd `UsePAM yes` verwendet),
+nur `sudo` nicht. Ein gestohlener Schlüssel allein gibt so noch keine Root-Rechte.
+
+### Ablauf (für den Betreiber)
+
+1. **Schlüssel auf eurem Rechner** (falls noch keiner da ist):
+   `ssh-keygen -t ed25519 -C "name@rechner"`. Den öffentlichen Teil anzeigen:
+   `cat ~/.ssh/id_ed25519.pub`. Nur diese eine Zeile kommt auf den Server, nie die
+   Datei ohne `.pub`.
+2. **Commit wählen und Prüfsumme auf eurem Rechner berechnen.** Im Repository auf
+   GitHub den Commit von `main` nehmen, der das Skript in der geprüften Fassung enthält
+   (40-stelliger Hash). In eurem Klon:
+   `git fetch origin && git show COMMIT:deploy/setup-server.sh | sha256sum`.
+   Die Prüfsumme notieren.
+3. **Web-Konsole öffnen:** im hPanel den VPS wählen und das Browser-Terminal öffnen
+   (Login als root). Dieses Fenster bleibt bis Schritt 9 offen.
+4. **Skript auf den Server holen** (in der Web-Konsole, als root):
+
+   ```sh
+   cd /root
+   COMMIT=0123456789abcdef0123456789abcdef01234567   # euer Commit aus Schritt 2
+   curl -fsSLo setup-server.sh "https://raw.githubusercontent.com/Advocatusrar/claude-webseiten/$COMMIT/deploy/setup-server.sh"
+   sha256sum setup-server.sh
+   ```
+
+   Die Prüfsumme muss genau der aus Schritt 2 entsprechen, sonst nicht ausführen. Statt
+   `curl` geht auch `git clone https://github.com/Advocatusrar/claude-webseiten.git`
+   und `git -C claude-webseiten checkout COMMIT`, oder vor dem ersten Lauf
+   `scp deploy/setup-server.sh root@SERVER:/root/` von eurem Rechner (root darf sich bis
+   zum Lauf noch mit Passwort anmelden). Immer einen festen Commit nehmen, nie `main`.
+5. **Testlauf** (ändert nichts):
+
+   ```sh
+   PROFIL=hostinger ADMIN_USER=name ADMIN_PUBKEY='ssh-ed25519 AAAA... name@rechner' DRY_RUN=1 bash setup-server.sh
+   ```
+
+   Den Schlüssel in einfachen Anführungszeichen einfügen, in einer Zeile. Die Ausgabe
+   lesen: Zeilen mit „Ein echter Lauf würde hier abbrechen“ zuerst beheben. Die Warnung
+   „Diese Dienste lauschen auf weiteren Ports …“ nennt Dienste des Servers, die nach dem
+   Lauf von außen nicht mehr erreichbar sind; von Docker veröffentlichte Ports (z. B.
+   32768) sind davon nicht betroffen (siehe unten).
+6. **Echter Lauf:** derselbe Befehl ohne `DRY_RUN=1`. Er endet mit „Änderungen in
+   diesem Lauf: …“ und der Abnahmeliste.
+7. **Passwort für sudo setzen** (Web-Konsole, als root): `passwd name`.
+8. **Zweite Anmeldung testen, bevor ihr irgendetwas schließt.** Auf eurem Rechner in
+   einem neuen Fenster: `ssh name@SERVER`, dann `sudo -v` (fragt nach dem Passwort aus
+   Schritt 7). Gegenproben: `ssh root@SERVER` und
+   `ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password name@SERVER`
+   werden mit „Permission denied“ abgewiesen.
+   Klappt der Login mit dem Schlüssel nicht: in der noch offenen Web-Konsole
+   `rm /etc/ssh/sshd_config.d/10-haertung.conf && systemctl reload ssh`. Damit gilt
+   wieder die SSH-Konfiguration von Hostinger; Ursache suchen und das Skript erneut
+   starten.
+9. **Web-Konsole neu öffnen** (im hPanel schließen und neu starten): Der Login als root
+   muss weiter klappen. Erst danach ist die alte Sitzung entbehrlich.
+10. **Dienste prüfen** (auf eurem Rechner): `curl -I http://SERVER` und
+    `curl -I http://SERVER:32768` antworten wie vor dem Lauf (Traefik bzw. die andere
+    App). Auf dem Server: `sudo iptables -S INPUT`, `sudo ip6tables -S INPUT`,
+    `sudo fail2ban-client status sshd`, `sudo docker info | grep -i 'live restore'`
+    (zeigt `Live Restore Enabled: true`).
+11. **Firewall im hPanel** zusätzlich einrichten: eingehend TCP 22, 80 und 443 erlauben
+    (und 32768, solange die andere App von außen erreichbar sein soll), den Rest
+    verwerfen. Sie filtert vor dem Server und ist die einzige Stelle, an der sich
+    Docker-Ports wie 32768 ohne Eingriff in Docker beschränken lassen. Danach Schritt 8
+    bis 10 wiederholen, auch die Web-Konsole.
+12. **Optional, in einer ruhigen Stunde:** einmal `sudo reboot` und danach Schritt 8 bis
+    10 wiederholen. Das prüft, dass die Firewall-Regeln beim Start geladen werden
+    (`netfilter-persistent`). Ein zweiter Lauf des Skripts meldet „Änderungen in diesem
+    Lauf: 0“.
+
+### Was das Profil im Einzelnen tut
+
+**Prüfungen vor jeder Änderung** (Abbruch ohne Änderung), zusätzlich zu denen des
+Profils `oracle`, soweit sie gelten: Aufruf als root (ohne `sudo` erlaubt; mit `sudo`
+gilt wie bei Oracle, dass der aufrufende und der angemeldete Benutzer `ADMIN_USER`
+sein müssen); `ADMIN_USER` und `ADMIN_PUBKEY` wie oben; sshd liest für `ADMIN_USER`
+die Datei `~/.ssh/authorized_keys` (`AuthorizedKeysFile` laut `sshd -T`), in die das
+Skript den Schlüssel legt; `iptables` und `ip6tables` lassen sich lesen. UFW aktiv
+bricht ab wie bei Oracle; ein installiertes, inaktives UFW (Normalfall bei Hostinger)
+entfernt apt mit `iptables-persistent`, das Skript sagt das deutlich. UFW danach nicht
+wieder installieren.
+
+**Docker** (vor den Paket-Updates, damit ein Update von `docker-ce` schon mit
+`live-restore` läuft): Das Skript startet Docker nie neu, denn das würde Traefik von
+Hostinger und alle anderen Container stoppen. Es führt seine Werte in
+`/etc/docker/daemon.json` zusammen, statt die Datei zu ersetzen: vorhandene Schlüssel
+bleiben, ergänzt werden nur fehlende (`"live-restore": true`; `"log-driver": "local"`
+mit `max-size` 10m und `max-file` 3, bzw. nur `max-size` und `max-file`, wenn schon
+`json-file` oder `local` gesetzt ist). Vorher legt es eine Kopie
+`daemon.json.bak-DATUM` an und prüft das Ergebnis mit `dockerd --validate`. Danach
+`systemctl reload docker` (SIGHUP): `live-restore` wirkt sofort, laufende Container
+bleiben unberührt. Log-Treiber und Log-Grenzen liest dockerd erst bei seinem nächsten
+Start (Neustart des Servers, Paket-Update), und sie gelten nur für danach neu erstellte
+Container. Ist `live-restore` ausdrücklich auf `false` gesetzt oder ein anderer
+Log-Treiber eingetragen, bleibt das so und das Skript warnt. Ein ungültiges
+`daemon.json` bricht ab, bevor etwas geändert wird. Docker selbst wird nicht neu
+installiert und kein Repository-Eintrag angelegt; das Skript meldet nur die Versionen.
+
+**Firewall:** Das Skript hängt an `INPUT` (IPv4 und IPv6) an, was fehlt, in dieser
+Reihenfolge: `-i lo`, `RELATED,ESTABLISHED` (ohne sie bräche die laufende SSH-Sitzung ab
+und keine Antwort auf apt, DNS oder NTP käme an), ICMP bzw. alles von ICMPv6 (Neighbor
+Discovery und Router Advertisements; ohne sie funktioniert IPv6 nicht), den DHCP-Client
+(wie in den Standardregeln von UFW: UDP 67 → 68, bei IPv6 UDP 547 → 546 zwischen
+link-lokalen Adressen), TCP 22, 80 und 443, und erst wenn alle diese Regeln da sind, als
+letzte Regel `REJECT`. Die Policy bleibt `ACCEPT`. Es fügt nur ein und hängt an, es
+löscht keine Regel; ein zweiter Lauf erzeugt keine Kopien. `FORWARD`, die Ketten
+`DOCKER*` und die Tabelle `nat` bleiben unberührt.
+
+- **Port 32768 und andere Docker-Ports** bleiben erreichbar: Docker leitet sie mit DNAT
+  in der Tabelle `nat` und über die Kette `FORWARD` weiter, sie laufen nie durch
+  `INPUT`. Beschränken lässt sich das nur in der Kette `DOCKER-USER` oder in der
+  Firewall im hPanel; das Skript lässt beides in Ruhe.
+- **Traefik von Hostinger** (Host-Netz, 80 und 443) läuft durch `INPUT` und ist durch
+  die Regeln für 80 und 443 abgedeckt. Seine Verbindungen zu Containern gehen über
+  `OUTPUT` hinaus; die Antworten kommen über `docker0` bzw. `br-*` zurück und sind
+  `RELATED,ESTABLISHED`.
+- **Verbindungen von Containern zum Server selbst** (nicht zu einem veröffentlichten
+  Port) laufen ebenfalls durch `INPUT`: zu 22, 80 und 443 erlaubt, zu jedem anderen
+  Port des Servers abgewiesen. Es gibt bewusst kein `-i docker0 -j ACCEPT` oder
+  `-i br-+ -j ACCEPT`; das würde jedem Container alle Dienste des Servers öffnen.
+  Health-Checks von Docker laufen im Container und sind nicht betroffen. Braucht ein
+  Container doch einen Dienst des Servers, eine eigene Regel vor dem `REJECT` setzen,
+  z. B. `sudo iptables -I INPUT <Nummer des REJECT> -i br-xxxx -p tcp --dport PORT -j ACCEPT`
+  (Nummer mit `sudo iptables -L INPUT --line-numbers -n`), und das Skript erneut
+  starten, damit es die Regeln speichert.
+- **Gespeichert** wird in `/etc/iptables/rules.v4` und `rules.v6` (Modus 0640) nur die
+  Tabelle `filter` mit den Policies und den Regeln von `INPUT`, deren Ziel eingebaut ist
+  (`ACCEPT`, `DROP`, `REJECT`, `RETURN`, `LOG`), vorher geprüft mit
+  `iptables-restore --test`. Nicht `netfilter-persistent save`: Das würde auch die Ketten
+  und NAT-Regeln von Docker mit den Container-Adressen von heute speichern, die beim
+  Start vor Docker geladen würden. Die Sprungregel von fail2ban fehlt ebenfalls, fail2ban
+  legt sie beim Start selbst an. Beim Start lädt `netfilter-persistent` die Dateien.
+
+**SSH:** `/etc/ssh/sshd_config.d/10-haertung.conf` mit `PasswordAuthentication no`,
+`KbdInteractiveAuthentication no`, `PermitRootLogin no`, `GSSAPIAuthentication no`,
+`HostbasedAuthentication no`, `AllowUsers ADMIN_USER deploy root@169.254.0.1` und am
+Ende `Match Address 169.254.0.1` mit `PermitRootLogin yes` und
+`PasswordAuthentication yes`, abgeschlossen mit `Match all`. sshd nimmt den ersten Wert,
+den es liest, und liest `sshd_config.d` am Anfang von `sshd_config` in Namensreihenfolge;
+`10-` kommt vor `50-cloud-init.conf` (dort `PasswordAuthentication yes`) und
+`60-cloudimg-settings.conf`. Ein `Match`-Block in einer per `Include` gelesenen Datei
+endet mit dieser Datei (OpenSSH 9.6, nachgeprüft mit `sshd -T`: Einstellungen aus
+`60-cloudimg-settings.conf` und dem Rest von `sshd_config` gelten weiter für alle
+Verbindungen); `Match all` schließt ihn trotzdem ausdrücklich. Bei jedem echten Lauf
+prüft das Skript mit `sshd -t` und `sshd -T -C`:
+
+| Verbindung                                  | Erwartung                                                                                   |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `ADMIN_USER` von `203.0.113.10` (Internet)  | wie bei Oracle: nur Schlüssel, in `AllowUsers`, kein Passwort; zusätzlich `UsePAM yes`      |
+| root von `203.0.113.10`                     | `PermitRootLogin no`, `PasswordAuthentication no`, kein `AllowUsers`-Eintrag für root von dort |
+| root von `169.254.0.1` (Web-Konsole)        | `PermitRootLogin yes`, `PasswordAuthentication yes`, `AllowUsers root@169.254.0.1`          |
+| `deploy` von `203.0.113.10`                 | `PasswordAuthentication no`, `KbdInteractiveAuthentication no`, `PubkeyAuthentication yes`  |
+
+Dazu muss der Schlüssel aus `ADMIN_PUBKEY` in `~ADMIN_USER/.ssh/authorized_keys` stehen
+(Besitzer `ADMIN_USER`, Verzeichnis 700, Datei 600), bevor sshd neu geladen wird.
+Scheitert eine Prüfung, setzt das Skript die Datei zurück, lädt SSH nicht neu und bricht
+ab. `203.0.113.10` ist eine Dokumentationsadresse (RFC 5737) und steht für jede Adresse
+aus dem Internet.
+
+**fail2ban** wie bei Oracle, zusätzlich `ignoreip = 127.0.0.1/8 ::1 169.254.0.1` im Jail
+`sshd` (geprüft mit `fail2ban-client -d`, genau diese Liste). Grund: Die Web-Konsole
+meldet sich von `169.254.0.1` mit dem root-Passwort an. Fünf Tippfehler in 10 Minuten
+würden sonst diese Adresse sperren und damit die Web-Konsole, den einzigen Zugang, der
+nicht vom SSH-Schlüssel abhängt (etwa nachdem man sich ausgesperrt hat). `169.254.0.0/16`
+ist link-lokal: Pakete mit dieser Absenderadresse kommen nur von Hostingers eigener
+Seite des Netzes, nicht aus dem Internet. Versuche von dort werden weiter protokolliert.
+
+### Risiken und Grenzen
+
+- **Die Ausnahme für `169.254.0.1` verlässt sich auf das interne Netz von Hostinger.**
+  Wer diese Adresse im Netz des VPS verwenden kann (Hostinger selbst, oder ein Fehler
+  in dessen Netztrennung), darf sich als root mit Passwort anmelden, ohne Sperre durch
+  fail2ban. Deshalb: ein langes, nur hier verwendetes root-Passwort und
+  Zwei-Faktor-Anmeldung für das hPanel, denn wer ins hPanel kommt, kommt über die
+  Web-Konsole als root auf den Server. Ändert Hostinger die Adresse der Web-Konsole,
+  funktioniert sie nicht mehr; der Zugang über `ADMIN_USER` bleibt.
+- Von `169.254.0.1` aus ist für `ADMIN_USER` ebenfalls ein Passwort erlaubt (die Ausnahme
+  gilt für die Adresse, nicht nur für root).
+- `apt-get full-upgrade` kann `docker-ce` aktualisieren; das Paket startet dockerd neu.
+  Dank `live-restore` (vor den Updates gesetzt) laufen die Container weiter; bei
+  veröffentlichten Ports kann es eine kurze Unterbrechung geben.
+- Dienste des Servers auf anderen Ports als 22, 80 und 443 sind von außen und aus
+  Containern nicht mehr erreichbar (die Prüfung listet sie vorher auf).
+- Die Datenschutzerklärung (`site/src/texte/datenschutz.md`) sagt „Wartungszugriffe nur
+  über SSH mit Schlüssel“ und nennt die Sperre durch fail2ban ohne Ausnahme. Mit der
+  Web-Konsole stimmt das für Hostinger nicht mehr ganz; Text und Angaben zum
+  Hosting-Anbieter vor dem Umzug anpassen.
 
 ## Website einrichten (folgt mit dem Aufbau von Live und Staging)
 
