@@ -11,7 +11,8 @@
 # - Commands that would reach the host or the network (apt-get, systemctl,
 #   timedatectl, curl, netfilter-persistent, ...) are stubs that log their
 #   arguments. iptables, sshd, fail2ban-client, useradd and usermod are the real
-#   tools (inside the sandbox), wrapped so that their calls are logged too.
+#   tools (inside the sandbox), wrapped so that their calls are logged too; so are
+#   ip(6)tables-save and ip(6)tables-restore, whose output and input are kept.
 # - logrotate: the package state comes from the dpkg-query stub (SC_DPKG), the program
 #   from the fixture (SC_LOGROTATE_BIN=1: a stub at /usr/sbin/logrotate inside the
 #   sandbox; otherwise there is no logrotate in the PATH of the script).
@@ -327,6 +328,13 @@ fixture() {
       ip6tables -A INPUT -p tcp -m state --state NEW -m tcp --dport 443 -j ACCEPT
       ;;
   esac
+  # NAT rules in both families (like Docker's masquerading): restoring the table filter
+  # must leave them as they are. $art/nat_fixture records that they were set.
+  if [[ ${SC_NAT:-0} == 1 ]]; then
+    iptables -t nat -A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE
+    ip6tables -t nat -A POSTROUTING -s 2001:db8:17::/64 ! -o docker0 -j MASQUERADE
+    touch "$art/nat_fixture"
+  fi
   # Rules saved earlier (netfilter-persistent), as on a server where they were saved
   # before: a run that aborts must leave these files as they are.
   if [[ ${SC_RULES_SAVED:-0} == 1 ]]; then
@@ -482,6 +490,12 @@ dump_fw() {
   { iptables-save; ip6tables-save; } | grep -v '^#' | sed -E 's/\[[0-9]+:[0-9]+\]/[0:0]/g'
 }
 
+# save_family TOOL: all tables of one family (TOOL-save), without comments and counters.
+# Empty if the family has no table (grep finds nothing then, which is no error here).
+save_family() {
+  "$1-save" | { grep -v '^#' || true; } | sed -E 's/\[[0-9]+:[0-9]+\]/[0:0]/g'
+}
+
 # set_loginuid UID: give the calling process the audit login UID UID (inherited by
 # everything it starts). Only writes if it differs: the kernel can refuse any change of
 # a login UID that is set (loginuid immutable, no CAP_AUDIT_CONTROL), even to the same
@@ -518,7 +532,7 @@ run_setup() {
   if [[ ${SC_UFW:-} == absent ]]; then stubs="$STUBS-noufw"; fi
   envs=(
     PATH="$stubs:$SANDBOX_PATH_TAIL" HOME=/root LANG=C.UTF-8 TMPDIR="$art/tmp"
-    STUB_LOG="$art/log$n" STUB_STATE="$art/state"
+    STUB_LOG="$art/log$n" STUB_STATE="$art/state" STUB_RUN="$n"
     SSHD_T_FAIL="${SC_SSHD_T_FAIL:-0}"
     STUB_DOCKER_KEY="$KEYS/${SC_DOCKER_KEY:-docker}.asc"
     STUB_IPT_RACE="${SC_IPT_RACE:-}"
@@ -663,6 +677,8 @@ inner() {
   fixture "$art"
   snapshot "$art" >"$art/snap0"
   dump_fw >"$art/fw0"
+  save_family iptables >"$art/save4_0"
+  save_family ip6tables >"$art/save6_0"
   iptables -S INPUT >"$art/v4_0"
   ip6tables -S INPUT >"$art/v6_0"
   sshd_state >"$art/sshd_state0"
@@ -670,6 +686,8 @@ inner() {
     run_setup "$art" "$i"
     snapshot "$art" >"$art/snap$i"
     dump_fw >"$art/fw$i"
+    save_family iptables >"$art/save4_$i"
+    save_family ip6tables >"$art/save6_$i"
     iptables -S INPUT >"$art/v4_$i"
     ip6tables -S INPUT >"$art/v6_$i"
     if ((i == 1)) && [[ ${SC_BETWEEN:-0} == 1 ]]; then
@@ -736,6 +754,8 @@ done
 #   flush_v4, flush_v6    all rules gone, policy ACCEPT
 #   policy_v4, policy_v6  only the policy set to ACCEPT
 #   del_final_v4          the final "-A INPUT -j DROP" deleted
+# STUB_STATE/after_apt.v4 and .v6 then hold all tables of each family as they are right
+# after this change (without comments and counters).
 # STUB_APT_SSHD_MATCH: the same apt run (a package update) adds a Match block for ubuntu
 # to sshd_config. STUB_STATE/apt_hooks records what was done.
 case " \$* " in
@@ -749,7 +769,11 @@ case " \$* " in
       del_final_v4) /usr/sbin/iptables -D INPUT -j DROP ;;
       *) echo "apt-get (test stub): unknown STUB_APT_FW '\$STUB_APT_FW'" >&2; exit 99 ;;
     esac
-    [[ -z \${STUB_APT_FW:-} ]] || echo "fw \$STUB_APT_FW" >>"\$STUB_STATE/apt_hooks"
+    if [[ -n \${STUB_APT_FW:-} ]]; then
+      echo "fw \$STUB_APT_FW" >>"\$STUB_STATE/apt_hooks"
+      /usr/sbin/iptables-save | grep -v '^#' | sed -E 's/\[[0-9]+:[0-9]+\]/[0:0]/g' >"\$STUB_STATE/after_apt.v4"
+      /usr/sbin/ip6tables-save | grep -v '^#' | sed -E 's/\[[0-9]+:[0-9]+\]/[0:0]/g' >"\$STUB_STATE/after_apt.v6"
+    fi
     if [[ -n \${STUB_APT_SSHD_MATCH:-} ]]; then
       printf '\n# test fixture (package update)\nMatch User ubuntu\n    %s\n' "\$STUB_APT_SSHD_MATCH" >>/etc/ssh/sshd_config
       echo "sshd \$STUB_APT_SSHD_MATCH" >>"\$STUB_STATE/apt_hooks"
@@ -912,12 +936,30 @@ $log
 exec /usr/sbin/$name "\$@"
 EOF
   done
-  # Logged so that the tests see a restored (replaced) rule set.
+  # Logged so that the tests see a restored (replaced) rule set. The input is appended to
+  # STUB_STATE/NAME.in.RUN (RUN: number of the run), so that the tests can compare it
+  # with what the script saved before.
   for name in iptables-restore ip6tables-restore; do
     cat >"$dir/$name" <<EOF
 #!/bin/bash
 $log
-exec /usr/sbin/$name "\$@"
+keep=/dev/null
+if [[ -n \${STUB_STATE:-} ]]; then keep="\$STUB_STATE/$name.in.\${STUB_RUN:-0}"; fi
+input=\$(cat; echo .)
+input=\${input%.}
+printf '%s' "\$input" >>"\$keep"
+printf '%s' "\$input" | /usr/sbin/$name "\$@"
+EOF
+  done
+  # Logged as well; the output is appended to STUB_STATE/NAME.out.RUN.
+  for name in iptables-save ip6tables-save; do
+    cat >"$dir/$name" <<EOF
+#!/bin/bash
+$log
+set -o pipefail
+keep=/dev/null
+if [[ -n \${STUB_STATE:-} ]]; then keep="\$STUB_STATE/$name.out.\${STUB_RUN:-0}"; fi
+/usr/sbin/$name "\$@" | tee -a "\$keep"
 EOF
   done
   # iptables, optionally with a simulated concurrent writer (like fail2ban's
@@ -1071,6 +1113,7 @@ modifying_calls() { # LOGFILE MODE
       if (c == "systemctl" && ($2 == "is-enabled" || $2 == "is-active" || $2 == "cat" || $2 == "show" || $2 == "status")) ro = 1
       else if (c == "timedatectl" && $2 == "show") ro = 1
       else if ((c == "iptables" || c == "ip6tables") && ($2 == "-L" || $2 == "-S" || $2 == "-C" || $2 == "-n")) ro = 1
+      else if (c == "iptables-save" || c == "ip6tables-save") ro = 1
       else if (c == "dpkg" && $2 == "--print-architecture") ro = 1
       else if (c == "dpkg-query" || c == "uname" || c == "ss") ro = 1
       else if (c == "ufw" && $2 == "status" && NF == 2) ro = 1
@@ -1636,19 +1679,69 @@ t_fw_copy_behind_reject() { # SCENARIO FAMILY(v4|v6) TOOL PORT...
   return $((1 - ok))
 }
 
-# No scenario, real or dry run, deletes, replaces or flushes firewall rules or chains,
-# or restores a whole rule set: no "ip(6)tables -D/-R/-F/-X" (short or long option), no
-# ip(6)tables-restore and no netfilter-persistent other than "save" in the call logs,
-# none of them in the dry-run output either.
+# Family of the INPUT a hook of the apt-get stub changes (STUB_APT_FW, e.g. flush_v4):
+# the tool whose rules it changed, empty if none.
+hook_tool() { # HOOK
+  case $1 in
+    *_v4*) echo iptables ;;
+    *_v6*) echo ip6tables ;;
+  esac
+}
+
+# No scenario, real or dry run, deletes, replaces or flushes firewall rules or chains:
+# no "ip(6)tables -D/-R/-F/-X" (short or long option) and no netfilter-persistent other
+# than "save" in the call logs, none of them in the dry-run output either. A whole rule
+# set is restored (TOOL-restore) only in runs in which the package installation changed
+# INPUT of TOOL (apt-get stub: "fw HOOK" in STUB_STATE/apt_hooks, HOOK names the family),
+# never in any other scenario or run and never in a dry run; then at most once per run,
+# after "apt-get ... install ... iptables-persistent", not with --noflush, and only from
+# the copy of the table filter taken in the same run before that apt-get
+# ("TOOL-save -t filter"): the input of the restore is exactly what that save printed,
+# and it holds only the table filter.
 t_fw_never_deletes() {
-  local ok=1 f logs=0 v4=0 v6=0 dry=0 hits
+  local ok=1 f a n logs=0 v4=0 v6=0 dry=0 restored=0 hits tool hook dev cnt inst rl sl input saved
   for f in "$WORK"/*/log[0-9]*; do
     [[ -f $f ]] || continue
     logs=$((logs + 1))
+    a=${f%/*}
+    n=${f##*/log}
     if grep -qE '^iptables -I INPUT [0-9]+ ' "$f"; then v4=$((v4 + 1)); fi
     if grep -qE '^ip6tables -I INPUT [0-9]+ ' "$f"; then v6=$((v6 + 1)); fi
-    hits=$(grep -E "^($FW_DELETE_RE|ip6?tables-restore( |\$)|netfilter-persistent( |\$))" "$f" | grep -vx 'netfilter-persistent save')
+    hits=$(grep -E "^($FW_DELETE_RE|netfilter-persistent( |\$))" "$f" | grep -vx 'netfilter-persistent save')
     [[ -z $hits ]] || no "${f#"$WORK"/}:" "$hits"
+    for tool in iptables ip6tables; do
+      cnt=$(grep -cE "^${tool}-restore( |\$)" "$f")
+      ((cnt > 0)) || continue
+      restored=$((restored + cnt))
+      dev=0
+      while read -r _ hook; do
+        [[ $(hook_tool "$hook") == "$tool" ]] && dev=1
+      done < <(grep -E '^fw ' "$a/state/apt_hooks" 2>/dev/null)
+      if ((dev == 0)); then
+        no "${f#"$WORK"/}: $tool-restore although the package installation did not change INPUT of $tool:" "$(grep -E "^${tool}-restore" "$f")"
+        continue
+      fi
+      ((cnt == 1)) || no "${f#"$WORK"/}: $cnt calls of $tool-restore in one run (expected at most 1)"
+      ! grep -qE "^${tool}-restore( .*)? (-n|--noflush)( |\$)" "$f" ||
+        no "${f#"$WORK"/}: $tool-restore with --noflush (adds to the table instead of putting back the copy)"
+      inst=$(grep -nE '^apt-get .* install .*iptables-persistent' "$f" | head -1 | cut -d: -f1)
+      rl=$(grep -nE "^${tool}-restore( |\$)" "$f" | head -1 | cut -d: -f1)
+      sl=$(grep -nE "^${tool}-save -t filter\$" "$f" | head -1 | cut -d: -f1)
+      if [[ -z $inst ]] || ((rl < inst)); then no "${f#"$WORK"/}: $tool-restore (log line $rl) not after installing iptables-persistent (line ${inst:-none})"; fi
+      if [[ -z $sl || -z $inst ]] || ((sl > inst)); then
+        no "${f#"$WORK"/}: no '$tool-save -t filter' before installing iptables-persistent (save in line ${sl:-none}, install in line ${inst:-none})"
+      fi
+      input=$(cat "$a/state/$tool-restore.in.$n" 2>/dev/null)
+      saved=$(cat "$a/state/$tool-save.out.$n" 2>/dev/null)
+      if [[ -z $input ]]; then
+        no "${f#"$WORK"/}: input of $tool-restore not recorded or empty"
+      elif [[ $input != "$saved" ]]; then
+        no "${f#"$WORK"/}: input of $tool-restore is not what '$tool-save -t filter' printed in this run (< saved, > restored):" \
+          "$(diff <(printf '%s\n' "$saved") <(printf '%s\n' "$input"))"
+      fi
+      [[ $(grep -E '^\*' <<<"$input" | tr '\n' ' ') == '*filter ' ]] ||
+        no "${f#"$WORK"/}: input of $tool-restore holds the tables '$(grep -E '^\*' <<<"$input" | tr '\n' ' ')', expected only *filter"
+    done
   done
   for f in "$WORK"/*/out[0-9]* "$WORK"/*/err[0-9]*; do
     [[ -f $f ]] || continue
@@ -1657,9 +1750,10 @@ t_fw_never_deletes() {
       grep -vE '\[Testlauf\] netfilter-persistent save$')
     [[ -z $hits ]] || no "${f#"$WORK"/}:" "$hits"
   done
-  # Otherwise this test would look at nothing.
-  ((logs >= 20 && v4 >= 3 && v6 >= 3 && dry >= 1)) ||
-    no "too little to check: $logs call logs, $v4 with iptables -I, $v6 with ip6tables -I, $dry dry runs with iptables -I"
+  # Otherwise this test would look at nothing (the restore part: one restore in each of
+  # the six fw_apt_* scenarios at least).
+  ((logs >= 20 && v4 >= 3 && v6 >= 3 && dry >= 1 && restored >= 6)) ||
+    no "too little to check: $logs call logs, $v4 with iptables -I, $v6 with ip6tables -I, $dry dry runs with iptables -I, $restored calls of ip(6)tables-restore"
   return $((1 - ok))
 }
 
@@ -2646,6 +2740,141 @@ t_fw_apt_abort() { # SCENARIO HOOK TOOL REGEX [saved]
   return $((1 - ok))
 }
 
+# Tables other than filter (nat, mangle, raw, security) of a TOOL-save dump, as they are.
+fw_other_tables() { # FILE
+  awk '/^\*/ { t = substr($0, 2) } t != "" && t != "filter" { print } /^COMMIT$/ { t = "" }' "$1"
+}
+
+# ACCEPT rules for tcp PORT before and behind the first rule that turns other traffic
+# away (a REJECT rule, also with a comment, or "-A INPUT -j DROP"), and the number of that
+# rule (0 if there is none).
+fw_final_split() { # FILE(iptables -S INPUT) PORT
+  awk -v port="$2" '
+    /^-A INPUT/ { n++
+      if (!fin && (/ -j REJECT/ || $0 == "-A INPUT -j DROP")) { fin = n; next }
+      if ($0 ~ ("-p tcp .*--dport " port "( |$)") && / -j ACCEPT/) { if (fin) behind++; else before++ } }
+    END { printf "%d %d %d\n", before, behind, fin }' "$1"
+}
+
+# INPUT of the table filter in a rules file (iptables-save format), in the form of
+# "iptables -S INPUT": "-P INPUT POLICY", then the rules.
+saved_input() { # FILE
+  awk '/^\*/ { t = substr($0, 2) }
+       t == "filter" && $1 == ":INPUT" { print "-P INPUT " $2 }
+       t == "filter" && $1 == "-A" && $2 == "INPUT" { print }' "$1"
+}
+
+# The package installation (apt-get stub, STUB_APT_FW=HOOK) changed INPUT of TOOL so that
+# it no longer turns other traffic away. Before the package installation the run saved
+# the table filter of both tools ("iptables-save -t filter", "ip6tables-save -t filter",
+# before the first apt-get that installs or upgrades). After it, it put back exactly that
+# copy for TOOL (TOOL-restore once, after installing iptables-persistent, before any
+# rule is inserted or saved; nothing restored for the other tool), warned that the
+# firewall was restored (one warning naming TOOL, "wiederhergestellt" and REGEX, what had
+# changed; none for the other tool) and went on: exit 0, no abort, the run reaches the
+# end. Afterwards INPUT of both tools is closed again: no rule of before lost (policy and
+# final REJECT/DROP included), only the missing ACCEPT rules added, 22/80/443 exactly
+# once before the final rule; and it is saved (netfilter-persistent save after the
+# restore and the inserts; the saved INPUT equals INPUT after the run). The other tables
+# (nat) are after the run as right after the package installation (and, with the nat
+# fixture, still have its rules).
+t_fw_apt_restored() { # SCENARIO HOOK TOOL REGEX
+  local ok=1 s=$1 tool=$3 a other w first inst rl r_other ins sv sl fam t f0 f1 port before behind fin exp added lost rules d
+  have_run "$s" 1 || return 1
+  a=$(art "$s")
+  if [[ $tool == iptables ]]; then other=ip6tables; else other=iptables; fi
+  grep -qx "fw $2" "$a/state/apt_hooks" 2>/dev/null || no "fixture: the apt-get stub did not change the firewall ($2)"
+  [[ $(rc_of "$s" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$s" 1)" "$(grep -E '^Abbruch' -A2 "$a/err1")"
+  ! grep -q '^Abbruch' "$a/err1" || no "abort message:" "$(grep '^Abbruch' "$a/err1")"
+  grep -qE 'Änderungen in diesem Lauf: [0-9]' "$a/out1" || no "the run did not reach the end"
+  w=$(grep -E 'WARNUNG:' "$a/err1" | grep -F 'wiederhergestellt')
+  [[ $(grep -cE "(^|[ (])${tool}[ :]" <<<"$w") == 1 ]] ||
+    no "expected exactly one warning that the firewall was restored naming $tool:" "$(grep 'WARNUNG' "$a/err1")"
+  grep -E "(^|[ (])${tool}[ :]" <<<"$w" | grep -qE -- "$4" || no "the warning does not say what changed (/$4/):" "${w:-no such warning}"
+  ! grep -qE "(^|[ (])${other}[ :]" <<<"$w" || no "a warning says the firewall of $other was restored, whose INPUT did not change:" "$w"
+  first=$(grep -nE '^apt-get .* (install|upgrade|full-upgrade|dist-upgrade)( |$)' "$a/log1" | head -1 | cut -d: -f1)
+  inst=$(grep -nE '^apt-get .* install .*iptables-persistent' "$a/log1" | head -1 | cut -d: -f1)
+  if [[ -z $first || -z $inst ]]; then
+    no "no apt-get that installs, or no installation of iptables-persistent"
+    return 1
+  fi
+  for t in iptables ip6tables; do
+    sl=$(grep -nxF "$t-save -t filter" "$a/log1" | head -1 | cut -d: -f1)
+    if [[ -z $sl ]] || ((sl > first)); then
+      no "the table filter of $t was not saved ($t-save -t filter) before the package installation (log line ${sl:-none}, first apt-get that installs: $first)"
+    fi
+  done
+  [[ $(grep -cE "^${tool}-restore( |\$)" "$a/log1") == 1 ]] ||
+    no "expected exactly one call of $tool-restore, got $(grep -cE "^${tool}-restore( |\$)" "$a/log1")"
+  r_other=$(grep -E "^${other}-restore( |\$)" "$a/log1")
+  [[ -z $r_other ]] || no "$other-restore was called, whose INPUT did not change:" "$r_other"
+  rl=$(grep -nE "^${tool}-restore( |\$)" "$a/log1" | head -1 | cut -d: -f1)
+  if [[ -n $rl ]]; then
+    ((rl > inst)) || no "$tool-restore (log line $rl) before installing iptables-persistent (line $inst)"
+    ins=$(grep -nE '^ip6?tables -[IA] INPUT' "$a/log1" | head -1 | cut -d: -f1)
+    if [[ -n $ins ]] && ((ins < rl)); then no "a rule was inserted (log line $ins) before the restore (line $rl)"; fi
+    sv=$(grep -nx 'netfilter-persistent save' "$a/log1" | head -1 | cut -d: -f1)
+    if [[ -n $sv ]] && ((sv < rl)); then no "the rules were saved (log line $sv) before the restore (line $rl)"; fi
+    [[ $(cat "$a/state/$tool-restore.in.1" 2>/dev/null) == "$(cat "$a/state/$tool-save.out.1" 2>/dev/null)" &&
+      -s $a/state/$tool-restore.in.1 ]] ||
+      no "the input of $tool-restore is not the copy '$tool-save -t filter' printed before the package installation"
+  fi
+  # Closed again and saved, in both families.
+  for fam in v4 v6; do
+    if [[ $fam == v4 ]]; then t=iptables; else t=ip6tables; fi
+    f0="$a/${fam}_0" f1="$a/${fam}_1"
+    lost=$(comm -23 <(LC_ALL=C sort "$f0") <(LC_ALL=C sort "$f1"))
+    [[ -z $lost ]] || no "$t: rules (or the policy) of INPUT from before the run are gone after it:" "$lost"
+    exp=""
+    for port in 22 80 443; do
+      grep -qxF -- "$(fw_rule "$port")" "$f0" || exp+="$(fw_rule "$port")"$'\n'
+      read -r before behind fin < <(fw_final_split "$f1" "$port")
+      ((before == 1)) || no "$t: $before ACCEPT rules for tcp $port before the final REJECT/DROP after the run (expected exactly 1)"
+    done
+    if ! grep -qxF -- '-P INPUT DROP' "$f1"; then
+      read -r _ _ fin < <(fw_final_split "$f1" 22)
+      ((fin > 0)) || no "$t: INPUT is open after the run (neither policy DROP nor a final REJECT/DROP)"
+    fi
+    added=$(comm -13 <(LC_ALL=C sort "$f0") <(LC_ALL=C sort "$f1"))
+    [[ $added == "$(printf '%s' "$exp" | LC_ALL=C sort)" ]] ||
+      no "$t: the run added other rules than the missing ACCEPT rules."$'\n'"added:"$'\n'"$added"$'\n'"expected:"$'\n'"$exp"
+    rules="$(upper "$s" etc)/iptables/rules.$fam"
+    if [[ ! -f $rules ]]; then
+      no "$t: /etc/iptables/rules.$fam was not saved"
+    else
+      d=$(diff <(saved_input "$rules") "$f1") || no "$t: INPUT in /etc/iptables/rules.$fam is not INPUT after the run (< saved, > live):" "$d"
+    fi
+  done
+  if ((ok == 0)); then
+    for fam in v4 v6; do
+      no "$fam INPUT before the run:"$'\n'"$(cat "$a/${fam}_0")" "$fam INPUT after the run:"$'\n'"$(cat "$a/${fam}_1")"
+    done
+  fi
+  sv=$(grep -nx 'netfilter-persistent save' "$a/log1" | tail -1 | cut -d: -f1)
+  ins=$(grep -nE '^ip6?tables -[IA] INPUT' "$a/log1" | tail -1 | cut -d: -f1)
+  if [[ -z $sv ]]; then
+    no "netfilter-persistent save was not run"
+  elif [[ -n $ins ]] && ((sv < ins)); then
+    no "saved (log line $sv) before the last insert (line $ins)"
+  fi
+  # Other tables: as right after the package installation (the restore leaves them alone).
+  for fam in 4 6; do
+    if [[ ! -f $a/state/after_apt.v$fam ]]; then
+      no "fixture: the apt-get stub did not record the tables after the package installation (after_apt.v$fam)"
+      continue
+    fi
+    d=$(diff <(fw_other_tables "$a/state/after_apt.v$fam") <(fw_other_tables "$a/save${fam}_1")) ||
+      no "IPv$fam: tables other than filter changed after the package installation (< right after apt, > after the run):" "$d"
+    if [[ -f $a/nat_fixture ]]; then
+      grep -qE -- '^-A POSTROUTING .*-j MASQUERADE' <(fw_other_tables "$a/save${fam}_0") ||
+        no "fixture: IPv$fam nat has no MASQUERADE rule before the run"
+      grep -qE -- '^-A POSTROUTING .*-j MASQUERADE' <(fw_other_tables "$a/save${fam}_1") ||
+        no "IPv$fam: the MASQUERADE rule of the nat fixture is gone after the run"
+    fi
+  done
+  return $((1 - ok))
+}
+
 # Warnings in run 1 of SCENARIO that INPUT of TOOL does not filter incoming connections.
 open_warnings() { # SCENARIO TOOL
   grep -E "WARNUNG: $2: " "$(art "$1")/err1" | grep -E 'INPUT' | grep -cE 'gefiltert'
@@ -2744,18 +2973,27 @@ f2b_jails() { # FILE
   grep -oE "^\['add', '[^']+'" "$1" | sed -E "s/^\['add', '//; s/'$//" | LC_ALL=C sort
 }
 
-# A jail other than sshd is enabled (fixture jail.d/zz.local): fail2ban-client -d shows
-# it next to sshd, the values of sshd still pass (exit 0, the run reaches the end), and a
-# warning names JAIL.
-t_f2b_other_jail_warns() { # SCENARIO JAIL
-  local ok=1 a w
+# A jail other than sshd is enabled (fixture: /etc/fail2ban/jail.d/zz.local with a section
+# [JAIL]): run 1 aborts before fail2ban is restarted or started, like a foreign value of
+# the privacy policy (t_f2b_foreign_abort: exit != 0, abort message naming zz.local,
+# fail2ban neither restarted nor started nor active, jail.d and fail2ban.d unchanged, no
+# summary). The abort message names JAIL, and the package's jail.conf as well if that has
+# a section [JAIL]. fail2ban-client -d after the run shows JAIL next to sshd.
+t_f2b_other_jail_aborts() { # SCENARIO JAIL
+  local ok=1 a ab add
   have_run "$1" 1 || return 1
   a=$(art "$1")
-  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)" "$(grep -E '^Abbruch' -A3 "$a/err1")"
-  [[ $(f2b_jails "$a/f2b_dump" | tr '\n' ' ') == *"$2 "* ]] || no "fixture not in effect: fail2ban-client -d shows the jails: $(f2b_jails "$a/f2b_dump" | tr '\n' ' ')"
-  w=$(grep -E 'WARNUNG:' "$a/err1" | grep -wF -- "$2")
-  [[ -n $w ]] || no "no warning that names the jail $2:" "$(grep 'WARNUNG' "$a/err1")"
-  grep -qE 'Änderungen in diesem Lauf: [0-9]' "$a/out1" || no "the run did not reach the end"
+  add=$(grep -E "^\['add', '$2', " "$a/f2b_dump" | head -1)
+  [[ -n $add && $(f2b_jails "$a/f2b_dump" | tr '\n' ' ') == *"sshd "* ]] ||
+    no "fixture not in effect: fail2ban-client -d shows the jails: $(f2b_jails "$a/f2b_dump" | tr '\n' ' ')"
+  if [[ -n $add ]]; then
+    t_f2b_foreign_abort "$1" 1 /etc/fail2ban/jail.d/zz.local "$add" || ok=0
+  fi
+  ab=$(sed -n '/^Abbruch/,$p' "$a/err1")
+  grep -qw -- "$2" <<<"$ab" || no "the abort message does not name the jail $2:" "${ab:-no abort message}"
+  if grep -qxE "[[:space:]]*\[$2\][[:space:]]*" /etc/fail2ban/jail.conf 2>/dev/null; then
+    grep -qF /etc/fail2ban/jail.conf <<<"$ab" || no "the abort message does not name /etc/fail2ban/jail.conf, which has a section [$2]:" "$ab"
+  fi
   return $((1 - ok))
 }
 
@@ -3121,12 +3359,12 @@ PermitRootLogin yes"
   scenario loginuid_alt_other SC_LOGINUID=ubuntu SC_ADMIN_USER=claude SC_KEY_USER=claude
   scenario dry_loginuid_other SC_DRY_RUN=1 SC_LOGINUID=claude
   # Firewall changed by the package installation; final DROP; nothing that filters
-  scenario fw_apt_flush_v4 SC_APT_FW=flush_v4 SC_RULES_SAVED=1
-  scenario fw_apt_flush_v6 SC_APT_FW=flush_v6 SC_RULES_SAVED=1
-  scenario fw_apt_policy_v4 SC_FW=drop_policy SC_V6=drop_policy SC_APT_FW=policy_v4
-  scenario fw_apt_policy_v6 SC_FW=drop_policy SC_V6=drop_policy SC_APT_FW=policy_v6
-  scenario fw_apt_del_drop SC_FW=drop_rule SC_V6=drop_rule SC_APT_FW=del_final_v4
-  scenario fw_apt_flush_comment SC_FW=oracle_comment SC_APT_FW=flush_v4
+  scenario fw_apt_flush_v4 SC_APT_FW=flush_v4 SC_RULES_SAVED=1 SC_NAT=1
+  scenario fw_apt_flush_v6 SC_APT_FW=flush_v6 SC_RULES_SAVED=1 SC_NAT=1
+  scenario fw_apt_policy_v4 SC_FW=drop_policy SC_V6=drop_policy SC_APT_FW=policy_v4 SC_NAT=1
+  scenario fw_apt_policy_v6 SC_FW=drop_policy SC_V6=drop_policy SC_APT_FW=policy_v6 SC_NAT=1
+  scenario fw_apt_del_drop SC_FW=drop_rule SC_V6=drop_rule SC_APT_FW=del_final_v4 SC_NAT=1
+  scenario fw_apt_flush_comment SC_FW=oracle_comment SC_APT_FW=flush_v4 SC_NAT=1
   scenario fw_comment SC_FW=oracle_comment
   scenario fw_open SC_FW=open SC_V6=open
   scenario fw_drop_rule SC_FW=drop_rule SC_V6=drop_rule SC_RUNS=2
@@ -3242,7 +3480,7 @@ PermitRootLogin yes"
   check "firewall IPv6 policy DROP without REJECT: 22/80/443 opened, policy stays DROP" t_fw_v6_drop_policy v6_drop
   check "firewall IPv6 policy DROP: second run changes nothing" t_rerun_fw_unchanged v6_drop
   check "firewall IPv6 policy ACCEPT without REJECT: no rule added" t_fw_family_unchanged fw_drop_policy v6
-  check "firewall: no rule deleted, replaced, flushed or restored in any scenario (call logs and dry-run output)" t_fw_never_deletes
+  check "firewall: no rule deleted, replaced or flushed in any scenario; ip(6)tables-restore only after the package installation changed INPUT of that family, once, from the copy saved with -t filter in the same run (call logs and dry-run output)" t_fw_never_deletes
 
   check "firewall IPv6: ACCEPT 443 only after REJECT, copy of 22 after REJECT too: one 443 inserted before REJECT, both copies stay, warning on every run, no -D/-R, second run 0 changes" \
     t_fw_copy_behind_reject fw_after_reject_v6 v6 ip6tables 22 443
@@ -3411,18 +3649,18 @@ PermitRootLogin yes"
 
   check "firewall: debconf autosave_v4/v6 false before installing iptables-persistent; INPUT read before the first apt-get" \
     t_fw_before_packages fresh
-  check "firewall: package installation flushes IPv4 INPUT (final REJECT gone): abort after step 1, nothing saved, no later step" \
-    t_fw_apt_abort fw_apt_flush_v4 flush_v4 iptables 'REJECT' saved
-  check "firewall: package installation flushes IPv6 INPUT: abort after step 1 naming ip6tables, nothing saved" \
-    t_fw_apt_abort fw_apt_flush_v6 flush_v6 ip6tables 'REJECT' saved
-  check "firewall: package installation sets IPv4 policy DROP to ACCEPT: abort after step 1, nothing saved" \
-    t_fw_apt_abort fw_apt_policy_v4 policy_v4 iptables 'Policy'
-  check "firewall: package installation sets IPv6 policy DROP to ACCEPT: abort after step 1 naming ip6tables, nothing saved" \
-    t_fw_apt_abort fw_apt_policy_v6 policy_v6 ip6tables 'Policy'
-  check "firewall: package installation deletes the final -A INPUT -j DROP: abort after step 1, nothing saved" \
-    t_fw_apt_abort fw_apt_del_drop del_final_v4 iptables 'DROP'
-  check "firewall (edge case): package installation flushes INPUT whose final REJECT has a comment: abort after step 1, nothing saved" \
-    t_fw_apt_abort fw_apt_flush_comment flush_v4 iptables 'REJECT'
+  check "firewall: package installation flushes IPv4 INPUT (final REJECT gone): saved filter table restored, warning, exit 0, INPUT closed with 22/80/443 before REJECT, saved, nat unchanged" \
+    t_fw_apt_restored fw_apt_flush_v4 flush_v4 iptables 'REJECT'
+  check "firewall: package installation flushes IPv6 INPUT: saved filter table restored with ip6tables-restore, warning naming ip6tables, exit 0, closed again, saved, nat unchanged" \
+    t_fw_apt_restored fw_apt_flush_v6 flush_v6 ip6tables 'REJECT'
+  check "firewall: package installation sets IPv4 policy DROP to ACCEPT: restored (policy DROP again), warning, exit 0, 22/80/443 open, saved, nat unchanged" \
+    t_fw_apt_restored fw_apt_policy_v4 policy_v4 iptables 'Policy'
+  check "firewall: package installation sets IPv6 policy DROP to ACCEPT: restored with ip6tables-restore, warning naming ip6tables, exit 0, saved, nat unchanged" \
+    t_fw_apt_restored fw_apt_policy_v6 policy_v6 ip6tables 'Policy'
+  check "firewall: package installation deletes the final -A INPUT -j DROP: restored, warning, exit 0, 22/80/443 before the DROP, saved, nat unchanged" \
+    t_fw_apt_restored fw_apt_del_drop del_final_v4 iptables 'DROP'
+  check "firewall (edge case): package installation flushes INPUT whose final REJECT has a comment: restored, warning, exit 0, closed again, saved, nat unchanged" \
+    t_fw_apt_restored fw_apt_flush_comment flush_v4 iptables 'REJECT'
   check "firewall (edge case): final REJECT with a comment: no warning that INPUT does not filter" t_fw_open_warns fw_comment ''
   check "firewall: neither final REJECT/DROP nor policy DROP (IPv4 and IPv6): a warning for each, the run goes on" \
     t_fw_open_warns fw_open 'iptables ip6tables'
@@ -3436,8 +3674,8 @@ PermitRootLogin yes"
   check "firewall: only conditional DROP rules, policy ACCEPT: warning that INPUT does not filter" \
     t_fw_open_warns fw_cond_drop 'iptables ip6tables'
 
-  check "fail2ban: jail recidive enabled as well: warning naming recidive, the run goes on" \
-    t_f2b_other_jail_warns f2b_recidive recidive
+  check "fail2ban: jail recidive enabled as well: abort naming recidive and the files with [recidive], fail2ban neither restarted nor started" \
+    t_f2b_other_jail_aborts f2b_recidive recidive
   check "fail2ban: jail recidive disabled: no warning about other jails" t_f2b_only_sshd f2b_recidive_off recidive
   check "fail2ban: fresh server, only jail sshd: no warning about other jails" t_f2b_only_sshd fresh
 
