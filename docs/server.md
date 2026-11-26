@@ -280,7 +280,7 @@ veröffentlichten Port `0.0.0.0:32768`).
 | Thema           | Hostinger vorher                                                         | Nach dem Skript                                                                                                                                         |
 | --------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Anmeldung       | nur root (Web-Konsole im hPanel oder SSH), root mit Passwort             | `ADMIN_USER` mit Schlüssel (Gruppe `sudo`), `deploy` für die CI, root nur noch von der Web-Konsole (`169.254.0.1`) mit Passwort                         |
-| SSH             | `PermitRootLogin yes`, `PasswordAuthentication yes`                      | global `PermitRootLogin no`, `PasswordAuthentication no`, `KbdInteractiveAuthentication no`; Ausnahme `Match Address 169.254.0.1`                       |
+| SSH             | `PermitRootLogin yes`, `PasswordAuthentication yes`                      | global `PermitRootLogin no`, `PasswordAuthentication no`, `KbdInteractiveAuthentication no`; Ausnahme `Match User root Address 169.254.0.1`             |
 | Firewall        | `INPUT` offen (Policy `ACCEPT`, keine Regeln, IPv4 und IPv6), UFW inaktiv | `INPUT` endet mit `REJECT`; davor nur Loopback, Antworten, ICMP/ICMPv6, DHCP-Client, TCP 22, 80, 443; UFW entfernt                                      |
 | fail2ban        | nicht eingerichtet                                                       | wie bei Oracle, zusätzlich `ignoreip = 127.0.0.1/8 ::1 169.254.0.1`                                                                                     |
 | Docker          | installiert, läuft                                                       | bleibt installiert und läuft weiter; `daemon.json` ergänzt (`live-restore`, Log-Grenzen), **kein** Neustart von Docker                                  |
@@ -433,7 +433,8 @@ löscht keine Regel; ein zweiter Lauf erzeugt keine Kopien. `FORWARD`, die Kette
 - **Gespeichert** wird in `/etc/iptables/rules.v4` und `rules.v6` (Modus 0640) nur die
   Tabelle `filter` mit den Policies und den Regeln von `INPUT`, deren Ziel eingebaut ist
   (`ACCEPT`, `DROP`, `REJECT`, `RETURN`, `LOG`), vorher geprüft mit
-  `iptables-restore --test`. Nicht `netfilter-persistent save`: Das würde auch die Ketten
+  `iptables-restore --test`. Eine vorhandene Datei mit anderem Inhalt sichert das Skript
+  vorher als `rules.v4.bak-DATUM` bzw. `rules.v6.bak-DATUM`. Nicht `netfilter-persistent save`: Das würde auch die Ketten
   und NAT-Regeln von Docker mit den Container-Adressen von heute speichern, die beim
   Start vor Docker geladen würden. Die Sprungregel von fail2ban fehlt ebenfalls, fail2ban
   legt sie beim Start selbst an. Beim Start lädt `netfilter-persistent` die Dateien.
@@ -441,8 +442,9 @@ löscht keine Regel; ein zweiter Lauf erzeugt keine Kopien. `FORWARD`, die Kette
 **SSH:** `/etc/ssh/sshd_config.d/10-haertung.conf` mit `PasswordAuthentication no`,
 `KbdInteractiveAuthentication no`, `PermitRootLogin no`, `GSSAPIAuthentication no`,
 `HostbasedAuthentication no`, `AllowUsers ADMIN_USER deploy root@169.254.0.1` und am
-Ende `Match Address 169.254.0.1` mit `PermitRootLogin yes` und
-`PasswordAuthentication yes`, abgeschlossen mit `Match all`. sshd nimmt den ersten Wert,
+Ende `Match User root Address 169.254.0.1` mit `PermitRootLogin yes` und
+`PasswordAuthentication yes`, abgeschlossen mit `Match all`. Die Ausnahme gilt nur für
+root; `ADMIN_USER` und `deploy` brauchen auch von `169.254.0.1` aus den Schlüssel. sshd nimmt den ersten Wert,
 den es liest, und liest `sshd_config.d` am Anfang von `sshd_config` in Namensreihenfolge;
 `10-` kommt vor `50-cloud-init.conf` (dort `PasswordAuthentication yes`) und
 `60-cloudimg-settings.conf`. Ein `Match`-Block in einer per `Include` gelesenen Datei
@@ -457,6 +459,7 @@ prüft das Skript mit `sshd -t` und `sshd -T -C`:
 | root von `203.0.113.10`                     | `PermitRootLogin no`, `PasswordAuthentication no`, kein `AllowUsers`-Eintrag für root von dort |
 | root von `169.254.0.1` (Web-Konsole)        | `PermitRootLogin yes`, `PasswordAuthentication yes`, `AllowUsers root@169.254.0.1`          |
 | `deploy` von `203.0.113.10`                 | `PasswordAuthentication no`, `KbdInteractiveAuthentication no`, `PubkeyAuthentication yes`  |
+| `ADMIN_USER` und `deploy` von `169.254.0.1` | ebenso nur Schlüssel: `PasswordAuthentication no`, `KbdInteractiveAuthentication no`        |
 
 Dazu muss der Schlüssel aus `ADMIN_PUBKEY` in `~ADMIN_USER/.ssh/authorized_keys` stehen
 (Besitzer `ADMIN_USER`, Verzeichnis 700, Datei 600), bevor sshd neu geladen wird.
@@ -481,8 +484,6 @@ Seite des Netzes, nicht aus dem Internet. Versuche von dort werden weiter protok
   Zwei-Faktor-Anmeldung für das hPanel, denn wer ins hPanel kommt, kommt über die
   Web-Konsole als root auf den Server. Ändert Hostinger die Adresse der Web-Konsole,
   funktioniert sie nicht mehr; der Zugang über `ADMIN_USER` bleibt.
-- Von `169.254.0.1` aus ist für `ADMIN_USER` ebenfalls ein Passwort erlaubt (die Ausnahme
-  gilt für die Adresse, nicht nur für root).
 - `apt-get full-upgrade` kann `docker-ce` aktualisieren; das Paket startet dockerd neu.
   Dank `live-restore` (vor den Updates gesetzt) laufen die Container weiter; bei
   veröffentlichten Ports kann es eine kurze Unterbrechung geben.

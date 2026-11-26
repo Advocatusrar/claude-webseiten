@@ -73,7 +73,7 @@ hostinger() { [[ $PROFIL == hostinger ]]; }
 
 # Connection that sshd -T -C evaluates Match blocks for (used once ADMIN_USER is checked).
 # Profile hostinger: a login from a public address, so that the Match block for the web
-# console (Match Address 169.254.0.1) does not apply.
+# console (Match User root Address 169.254.0.1) does not apply.
 if hostinger; then
   SSHD_TEST_SPEC="user=$ADMIN_USER,host=client.invalid,addr=$PUBLIC_TEST_ADDR"
   SSHD_DEPLOY_SPEC="user=$DEPLOY_USER,host=client.invalid,addr=$PUBLIC_TEST_ADDR"
@@ -86,6 +86,9 @@ fi
 # (password allowed), see check_sshd_hostinger.
 SSHD_ROOT_PUBLIC_SPEC="user=root,host=client.invalid,addr=$PUBLIC_TEST_ADDR"
 SSHD_ROOT_CONSOLE_SPEC="user=root,host=console.invalid,addr=$CONSOLE_ADDR"
+# ADMIN_USER and deploy from the address of the web console: still only the key.
+SSHD_ADMIN_CONSOLE_SPEC="user=$ADMIN_USER,host=console.invalid,addr=$CONSOLE_ADDR"
+SSHD_DEPLOY_CONSOLE_SPEC="user=$DEPLOY_USER,host=console.invalid,addr=$CONSOLE_ADDR"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1224,9 +1227,9 @@ fi
 if hostinger; then
   # Written on every run if the content differs (put), checked first with TOOL-restore
   # --test, which loads nothing. An earlier rules file (e.g. from netfilter-persistent
-  # save) is replaced by this one.
+  # save) is replaced by this one, after a copy FILE.bak-DATE.
   if dry || ! iptables -L INPUT -n >/dev/null 2>&1; then
-    info "[Testlauf] würde /etc/iptables/rules.v4 und rules.v6 schreiben (Modus 0640): Tabelle filter mit den Policies und den Regeln von INPUT (ohne Sprünge in andere Ketten), ohne Docker-Ketten und ohne Tabelle nat. Vorher Prüfung mit iptables-restore --test bzw. ip6tables-restore --test."
+    info "[Testlauf] würde /etc/iptables/rules.v4 und rules.v6 schreiben (Modus 0640): Tabelle filter mit den Policies und den Regeln von INPUT (ohne Sprünge in andere Ketten), ohne Docker-Ketten und ohne Tabelle nat. Vorher Prüfung mit iptables-restore --test bzw. ip6tables-restore --test; eine vorhandene Datei mit anderem Inhalt wird vorher als .bak-DATUM gesichert."
   else
     for fw_tool in iptables ip6tables; do
       if [[ $fw_tool == iptables ]]; then fw_file=/etc/iptables/rules.v4; else fw_file=/etc/iptables/rules.v6; fi
@@ -1236,10 +1239,17 @@ if hostinger; then
         echo "Abbruch: $fw_tool: Die zu speichernden Regeln enthalten keine abweisende Regel in INPUT, nichts gespeichert." >&2
         exit 1
       fi
-      # Checked only when the file is to be written (a second run only reads).
+      # Checked only when the file is to be written (a second run only reads). An
+      # existing file with other content is kept as FILE.bak-DATE first.
       if [[ ! -f $fw_file || "$(cat "$fw_file")" != "$fw_rules" ]]; then
         "${fw_tool}-restore" --test <<<"$fw_rules" ||
           { echo "Abbruch: ${fw_tool}-restore --test lehnt die zu speichernden Regeln ab, $fw_file bleibt unverändert." >&2; exit 1; }
+        if [[ -f $fw_file ]]; then
+          fw_backup="$fw_file.bak-$(date +%Y%m%d-%H%M%S)"
+          cp -p -- "$fw_file" "$fw_backup" ||
+            { echo "Abbruch: Sicherung $fw_backup ließ sich nicht anlegen, $fw_file bleibt unverändert." >&2; exit 1; }
+          info "Sicherung der bisherigen Datei: $fw_backup"
+        fi
       fi
       put "$fw_file" 0640 <<<"$fw_rules" || true
     done
@@ -1532,11 +1542,15 @@ sshd_expect() {
 #     PasswordAuthentication yes, AllowUsers root@$CONSOLE_ADDR;
 #   deploy from the internet ($SSHD_DEPLOY_SPEC): only the key (PasswordAuthentication and
 #     KbdInteractiveAuthentication no, PubkeyAuthentication yes);
+#   ADMIN_USER and deploy from the web console's address ($SSHD_ADMIN_CONSOLE_SPEC,
+#     $SSHD_DEPLOY_CONSOLE_SPEC): only the key (PasswordAuthentication and
+#     KbdInteractiveAuthentication no, PubkeyAuthentication yes); the exception is for
+#     root only;
 #   ADMIN_USER from the internet: UsePAM yes (the account has no password until the
 #     operator sets one; without PAM sshd refuses a locked account even with a key).
 # ADMIN_USER from the internet is checked like on Oracle (check_sshd_effective).
 check_sshd_hostinger() {
-  local eff pat
+  local eff pat spec
   eff=$(sshd -T -C "$SSHD_ROOT_PUBLIC_SPEC" 2>/dev/null) ||
     sshd_check_failed "sshd -T -C $SSHD_ROOT_PUBLIC_SPEC meldet einen Fehler." error
   sshd_expect "sshd -T -C $SSHD_ROOT_PUBLIC_SPEC" "$eff" "permitrootlogin no" \
@@ -1559,6 +1573,12 @@ check_sshd_hostinger() {
   eff=$(sshd -T -C "$SSHD_TEST_SPEC" 2>/dev/null) ||
     sshd_check_failed "sshd -T -C $SSHD_TEST_SPEC meldet einen Fehler." error
   sshd_expect "sshd -T -C $SSHD_TEST_SPEC" "$eff" "usepam yes"
+  for spec in "$SSHD_ADMIN_CONSOLE_SPEC" "$SSHD_DEPLOY_CONSOLE_SPEC"; do
+    eff=$(sshd -T -C "$spec" 2>/dev/null) ||
+      sshd_check_failed "sshd -T -C $spec meldet einen Fehler." error
+    sshd_expect "sshd -T -C $spec" "$eff" "passwordauthentication no" \
+      "kbdinteractiveauthentication no" "pubkeyauthentication yes"
+  done
 }
 # Profile hostinger: an exception for the web console (SSH from CONSOLE_ADDR as root
 # with password). sshd takes the first value it reads; this file comes first (10-), so
@@ -1577,7 +1597,8 @@ GSSAPIAuthentication no
 HostbasedAuthentication no
 AllowUsers ${ADMIN_USER} ${DEPLOY_USER} root@${CONSOLE_ADDR}
 # Web console of Hostinger (hPanel): SSH from ${CONSOLE_ADDR} as root with password.
-Match Address ${CONSOLE_ADDR}
+# Only root; ${ADMIN_USER} and ${DEPLOY_USER} keep the key only, also from there.
+Match User root Address ${CONSOLE_ADDR}
     PermitRootLogin yes
     PasswordAuthentication yes
 Match all"
@@ -1636,7 +1657,7 @@ else
   [[ -d /run/sshd ]] || run install -d -m 0755 /run/sshd
   info "[Testlauf] sshd -t, danach Prüfung mit sshd -T und sshd -T -C $SSHD_TEST_SPEC (bei jedem echten Lauf, auch wenn $SSHD_CONF unverändert bleibt): AllowUsers enthält $ADMIN_USER, PasswordAuthentication, KbdInteractiveAuthentication, PermitRootLogin, GSSAPIAuthentication und HostbasedAuthentication sind no, PubkeyAuthentication ist yes, AuthenticationMethods ist any oder hat eine Liste nur mit publickey, DenyUsers, AllowGroups und DenyGroups schließen $ADMIN_USER nicht aus (sonst Abbruch); für $DEPLOY_USER mit sshd -T und sshd -T -C $SSHD_DEPLOY_SPEC nur als Warnung: AllowUsers enthält $DEPLOY_USER, DenyUsers, AllowGroups und DenyGroups schließen $DEPLOY_USER nicht aus, PubkeyAuthentication ist yes, AuthenticationMethods ist any oder hat eine Liste nur mit publickey (die leere authorized_keys von $DEPLOY_USER wird nicht geprüft)"
   if hostinger; then
-    info "[Testlauf] Profil hostinger, zusätzlich (sonst Abbruch und $SSHD_CONF zurückgesetzt): sshd -T -C $SSHD_ROOT_PUBLIC_SPEC: PermitRootLogin, PasswordAuthentication und KbdInteractiveAuthentication no, AllowUsers lässt root von dort nicht herein; sshd -T -C $SSHD_ROOT_CONSOLE_SPEC: PermitRootLogin yes, PasswordAuthentication yes, AllowUsers root@$CONSOLE_ADDR; sshd -T -C $SSHD_DEPLOY_SPEC: PasswordAuthentication und KbdInteractiveAuthentication no, PubkeyAuthentication yes; sshd -T -C $SSHD_TEST_SPEC: UsePAM yes; der Schlüssel aus ADMIN_PUBKEY steht in $ADMIN_AUTH_KEYS (Besitzer $ADMIN_USER, ~/.ssh 700, Datei 600), bevor SSH neu geladen wird"
+    info "[Testlauf] Profil hostinger, zusätzlich (sonst Abbruch und $SSHD_CONF zurückgesetzt): sshd -T -C $SSHD_ROOT_PUBLIC_SPEC: PermitRootLogin, PasswordAuthentication und KbdInteractiveAuthentication no, AllowUsers lässt root von dort nicht herein; sshd -T -C $SSHD_ROOT_CONSOLE_SPEC: PermitRootLogin yes, PasswordAuthentication yes, AllowUsers root@$CONSOLE_ADDR; sshd -T -C $SSHD_DEPLOY_SPEC: PasswordAuthentication und KbdInteractiveAuthentication no, PubkeyAuthentication yes; sshd -T -C $SSHD_ADMIN_CONSOLE_SPEC und $SSHD_DEPLOY_CONSOLE_SPEC: ebenso nur Schlüssel (die Ausnahme gilt nur für root); sshd -T -C $SSHD_TEST_SPEC: UsePAM yes; der Schlüssel aus ADMIN_PUBKEY steht in $ADMIN_AUTH_KEYS (Besitzer $ADMIN_USER, ~/.ssh 700, Datei 600), bevor SSH neu geladen wird"
   fi
 fi
 if [[ $SSHD_CHANGED == 1 ]] && hostinger; then
