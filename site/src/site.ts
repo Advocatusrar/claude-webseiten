@@ -1,7 +1,7 @@
 // Central site settings. Values in [eckigen Klammern] are placeholders the operators must fill in.
 export const SITE = {
-  // Working title, not final.
-  name: 'Funkenschlag',
+  // Final name, decided by the operators (domain funkenundstahl.de).
+  name: 'Funken & Stahl',
   // Shown in <title> and og:title of the start page; with the name below 60 characters.
   // Only say "getestet" again once products with own test results are published.
   claim: 'Feuerstahl und Striker unabhängig erklärt',

@@ -92,7 +92,7 @@ Domain liegt. `robots.txt` und `llms.txt` werden mit dieser Adresse erzeugt.
 
 ## Offene Platzhalter
 
-- `src/site.ts`: Seitenname „Funkenschlag“ ist ein Arbeitstitel; Betreiber-Name,
+- `src/site.ts`: Seitenname „Funken & Stahl“ ist festgelegt; Betreiber-Name,
   Anschrift und E-Mail stehen noch in `[eckigen Klammern]`. Die Kontaktseite zeigt
   den E-Mail-Knopf erst, wenn dort eine echte Adresse steht.
 - Der Claim in `src/site.ts` sagt „unabhängig erklärt“. „getestet“ erst wieder
