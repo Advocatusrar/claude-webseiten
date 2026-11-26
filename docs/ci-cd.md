@@ -24,6 +24,9 @@ Datei: [`.github/workflows/ci-cd.yml`](../.github/workflows/ci-cd.yml).
 - **Nur `main` wird deployt**, und erst, wenn die Variable `DEPLOY_ENABLED` auf `true`
   steht. Dann gilt `CHECK_LIVE=1`: Platzhalter im Impressum oder `example.org` brechen
   den Build ab, ein unvollständiges Impressum geht nie online.
+- **`DEPLOY_ENABLED` bis zum Aufbau von Live und Staging nicht setzen.** Auf dem Server
+  liegen noch kein `deploy.sh` und keine Website (`setup-server.sh` legt sie nicht mehr
+  an). Der Deploy-Job würde nach jedem Merge nach `main` fehlschlagen.
 - **Rollback statt Hoffnung.** Wird das neue Image auf dem Server nicht gesund, startet
   `deploy.sh` automatisch das vorige.
 
@@ -90,7 +93,7 @@ Settings → Rules → Rulesets → New ruleset → New branch ruleset:
 | `SITE_URL`       | `https://www.meine-domain.de` | Adresse für Canonical, Sitemap, JSON-LD      |
 | `DEPLOY_HOST`    | `203.0.113.10`               | Server                                        |
 | `DEPLOY_USER`    | `deploy`                     | Benutzer auf dem Server                       |
-| `DEPLOY_ENABLED` | `true`                       | schaltet Veröffentlichen und Deploy ein       |
+| `DEPLOY_ENABLED` | `true`                       | schaltet Veröffentlichen und Deploy ein; **erst nach dem Aufbau von Live und Staging setzen**, sonst schlägt der Deploy-Job fehl |
 
 ### 3. Environment `production` (Settings → Environments → New environment)
 
@@ -113,6 +116,8 @@ Repository privat, bleibt das Image privat, und der Server braucht einmal
 
 - **Automatisch:** `deploy.sh` startet das vorige Image, wenn das neue nicht gesund wird.
 - **Von Hand:** auf dem Server `sudo -u deploy /opt/website/deploy.sh
-  ghcr.io/<owner>/<repo>/website:sha-<älterer-commit>`.
+  ghcr.io/<owner>/<repo>/website:sha-<älterer-commit>`. Achtung: `setup-server.sh`
+  richtet `/opt/website` nicht mehr ein. Pfad und Befehl werden mit dem Aufbau von Live
+  und Staging neu festgelegt; bis dahin gilt dieser Befehl nicht.
 - **Sauber über Git:** den fehlerhaften Commit mit `git revert` rückgängig machen und als
   Pull Request durch die Pipeline schicken.
