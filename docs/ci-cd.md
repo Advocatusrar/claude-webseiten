@@ -25,12 +25,17 @@ Datei: [`.github/workflows/ci-cd.yml`](../.github/workflows/ci-cd.yml).
   steht. Dann gilt `CHECK_LIVE=1`: Platzhalter im Impressum oder `example.org` brechen
   den Build ab, ein unvollständiges Impressum geht nie online.
 - **`DEPLOY_ENABLED` erst setzen, wenn der Server bereit ist.** `setup-server.sh` legt
-  `deploy.sh` und die Website nicht an. Auf dem Hostinger-VPS richtet ihr `/opt/website`
-  von Hand ein ([`server.md`](server.md), „Variante Hostinger-VPS“); für den Oracle-Server
-  folgt das mit dem Aufbau von Live und Staging. Ohne fertigen Server würde der
-  Deploy-Job nach jedem Merge nach `main` fehlschlagen. Offen ist noch, wie das erste
-  Image entsteht: „Publish image“ läuft nur mit `DEPLOY_ENABLED=true`, und dann startet
-  auch der Deploy (siehe `server.md`, „Offene Entscheidung (erstes Image)“).
+  `deploy.sh` und die Website nicht an. Auf dem Hostinger-VPS bereitet ihr
+  `/opt/website` von Hand vor, ohne etwas zu starten ([`server.md`](server.md),
+  „Variante Hostinger-VPS“); für den Oracle-Server folgt das mit dem Aufbau von Live und
+  Staging. Ohne vorbereiteten Server würde der Deploy-Job nach jedem Merge nach `main`
+  fehlschlagen.
+- **Nie von Hand auf dem Server deployen**, auch nicht beim ersten Start. Der Server wird
+  nur vorbereitet; jeder Start, auch der erste, kommt aus dem Job „Deploy to production“
+  nach Freigabe im Environment `production`. Getrennte Schalter: `PUBLISH_ENABLED`
+  veröffentlicht nur das Image (kommt mit dem Zweig `ci/publish-ohne-deploy`),
+  `DEPLOY_ENABLED` veröffentlicht und deployt (siehe `server.md`, „Erster Start nur über
+  die Pipeline“).
 - **Rollback statt Hoffnung.** Wird das neue Image auf dem Server nicht gesund, startet
   `deploy.sh` automatisch das vorige.
 
@@ -97,7 +102,7 @@ Settings → Rules → Rulesets → New ruleset → New branch ruleset:
 | `SITE_URL`       | `https://funkenundstahl.de`  | Adresse für Canonical, Sitemap, JSON-LD; muss zu `DOMAIN` in `/opt/website/.env` passen (ohne `www`, das leitet weiter) |
 | `DEPLOY_HOST`    | `203.0.113.10`               | Server                                        |
 | `DEPLOY_USER`    | `deploy`                     | Benutzer auf dem Server                       |
-| `DEPLOY_ENABLED` | `true`                       | schaltet Veröffentlichen und Deploy ein; **erst setzen, wenn der Server bereit ist** (Oracle: nach dem Aufbau von Live und Staging; Hostinger-VPS: nach der offenen Entscheidung zum ersten Image, siehe oben), sonst schlägt der Deploy-Job fehl |
+| `DEPLOY_ENABLED` | `true`                       | schaltet Veröffentlichen und Deploy ein; **erst setzen, wenn der Server vorbereitet ist** (Oracle: nach dem Aufbau von Live und Staging; Hostinger-VPS: nach den Schritten 1 bis 9 in `server.md`), sonst schlägt der Deploy-Job fehl. Der erste Start kommt damit aus der Pipeline, nie von Hand |
 
 ### 3. Environment `production` (Settings → Environments → New environment)
 
@@ -119,10 +124,7 @@ Repository privat, bleibt das Image privat, und der Server braucht einmal
 ## Rollback
 
 - **Automatisch:** `deploy.sh` startet das vorige Image, wenn das neue nicht gesund wird.
-- **Von Hand:** auf dem Server `sudo -u deploy /opt/website/deploy.sh
-  ghcr.io/<owner>/<repo>/website:sha-<älterer-commit>`. Das gilt für den Hostinger-VPS,
-  sobald `/opt/website` nach [`server.md`](server.md) („Variante Hostinger-VPS“)
-  eingerichtet ist. Für den Oracle-Server werden Pfad und Befehl mit dem Aufbau von Live
-  und Staging neu festgelegt.
+- **Nicht von Hand:** `deploy.sh` wird auf dem Server nie per Hand aufgerufen, auch nicht
+  für einen Rollback. Ein älterer Stand geht über Git und die Pipeline (nächster Punkt).
 - **Sauber über Git:** den fehlerhaften Commit mit `git revert` rückgängig machen und als
   Pull Request durch die Pipeline schicken.

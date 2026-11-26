@@ -274,7 +274,7 @@ Dieser Teil wird mit der neuen Struktur neu geschrieben.
 > Live und Staging aufgebaut sind. `setup-server.sh` legt weder `deploy.sh` noch die
 > Verzeichnisse der Website an. Mit `DEPLOY_ENABLED=true` würde jeder Merge nach `main`
 > den Deploy-Job starten, und der schlägt dann fehl (siehe [`ci-cd.md`](ci-cd.md)).
-> Für den Hostinger-VPS gilt stattdessen die „Offene Entscheidung (erstes Image)“ unter
+> Für den Hostinger-VPS gilt stattdessen „Erster Start nur über die Pipeline“ unter
 > „Variante Hostinger-VPS“.
 
 Erhalten bleibt:
@@ -285,8 +285,8 @@ Erhalten bleibt:
   (`command="…",restrict`). Den privaten Teil als Secret `DEPLOY_SSH_KEY` in GitHub
   eintragen, `ssh-keyscan SERVER` als Secret `DEPLOY_KNOWN_HOSTS`, danach die lokale
   Datei löschen. `DEPLOY_ENABLED=true` erst danach setzen, auf dem Oracle-Server erst
-  nach dem Aufbau von Live und Staging, auf dem Hostinger-VPS erst nach der „Offenen
-  Entscheidung (erstes Image)“ (siehe oben und [`ci-cd.md`](ci-cd.md)).
+  nach dem Aufbau von Live und Staging, auf dem Hostinger-VPS nach Schritt 10 unter
+  „Erster Start nur über die Pipeline“ (siehe oben und [`ci-cd.md`](ci-cd.md)).
 - **Tipp für den ersten Start:** In `.env` die Zeile `ACME_CA_SERVER=...staging...`
   aktivieren. Let's Encrypt begrenzt fehlgeschlagene Versuche; mit der Staging-CA lässt
   sich gefahrlos testen. Wenn alles läuft, die Zeile entfernen, das Zertifikats-Volume
@@ -364,20 +364,21 @@ Unterschiede zur eigenen Traefik-Instanz:
   Hostinger fest. Seine Konfiguration liegt nicht im Repository (Schritt 2 unten prüft
   sie, Schritt 3 klärt die Datenschutzerklärung).
 
-**Offene Entscheidung (erstes Image):** `deploy.sh` braucht ein Image in GHCR. Das
-veröffentlicht nur der CI-Job „Publish image“, und der läuft nur mit
-`DEPLOY_ENABLED=true`. Damit startet nach jedem Merge nach `main` aber auch der Job
-„Deploy to production“ (siehe [`ci-cd.md`](ci-cd.md)). Wie das erste Image entsteht
-(etwa: Deploy-Schlüssel und Server vorher fertig einrichten, dann `DEPLOY_ENABLED=true`
-setzen), ist noch nicht entschieden. Die CI bleibt dafür vorerst unverändert.
+**Erster Start nur über die Pipeline (entschieden):** Auf dem Server wird nie von Hand
+deployt, auch nicht beim ersten Start. Ihr bereitet `/opt/website` vor (Dateien, `.env`,
+Deploy-Schlüssel mit Forced Command, Zugang zu GHCR), ruft aber weder `deploy.sh` noch
+`docker compose up` selbst auf. Den ersten Start macht die Pipeline: Job „Deploy to
+production“ nach Freigabe im Environment `production`. Die Schalter sind getrennt:
+`PUBLISH_ENABLED` veröffentlicht nur das Image (kommt mit dem Zweig
+`ci/publish-ohne-deploy`), `DEPLOY_ENABLED` veröffentlicht und deployt (siehe
+[`ci-cd.md`](ci-cd.md)).
 
 ### Einrichten
 
-Voraussetzungen: Der VPS ist mit `setup-server.sh` im Profil `hostinger` eingerichtet
-(Benutzer `deploy` in der Gruppe `docker`), und es gibt ein veröffentlichtes Image in
-GHCR, gebaut mit `SITE_URL=https://funkenundstahl.de` (siehe „Offene Entscheidung“ oben).
-Die Befehle auf dem Server laufen mit eurem eigenen Admin-Benutzer, nicht mit dem
-Deploy-Schlüssel.
+Voraussetzung: Der VPS ist mit `setup-server.sh` im Profil `hostinger` eingerichtet
+(Benutzer `deploy` in der Gruppe `docker`). Die Befehle auf dem Server laufen mit eurem
+eigenen Admin-Benutzer, nicht mit dem Deploy-Schlüssel. Die Schritte 1 bis 9 bereiten nur
+vor und starten nichts; die Website startet erst mit Schritt 10 über die Pipeline.
 
 1. **DNS bei Strato** (Strato-Kundenlogin → Domains → Domainverwaltung →
    `funkenundstahl.de` → DNS-Einstellungen):
@@ -484,13 +485,14 @@ Deploy-Schlüssel.
    WEBSITE_IMAGE=ghcr.io/advocatusrar/claude-webseiten/website:latest
    ```
 
-   `ACME_EMAIL` und `ACME_CA_SERVER` entfallen. `WEBSITE_IMAGE` überschreibt `deploy.sh`
-   bei jedem Deploy mit dem Digest.
+   `ACME_EMAIL` und `ACME_CA_SERVER` entfallen. `WEBSITE_IMAGE` ist bis zum ersten
+   Deploy nur ein Platzhalter für die Prüfung in Schritt 7; `deploy.sh` setzt bei jedem
+   Deploy der Pipeline den Digest ein.
 
-7. **Konfiguration prüfen**, auf dem Server. Euer Admin-Benutzer kann `/opt/website`
-   nicht betreten (Rechte 750, Besitzer `deploy`), deshalb läuft alles als `deploy`.
-   `--project-directory` reicht nicht: Compose sucht die Datei aus `COMPOSE_FILE` im
-   aktuellen Verzeichnis.
+7. **Konfiguration prüfen** (nur lesen, startet nichts), auf dem Server. Euer
+   Admin-Benutzer kann `/opt/website` nicht betreten (Rechte 750, Besitzer `deploy`),
+   deshalb läuft alles als `deploy`. `--project-directory` reicht nicht: Compose sucht
+   die Datei aus `COMPOSE_FILE` im aktuellen Verzeichnis.
 
    ```sh
    sudo -u deploy sh -c 'cd /opt/website && docker compose config --services'
@@ -505,15 +507,40 @@ Deploy-Schlüssel.
 8. **Bei privatem Paket** einmal anmelden (Token mit Recht `read:packages`):
    `sudo -u deploy docker login ghcr.io`.
 
-9. **Erster Start** mit Gesundheitsprüfung und Rollback:
+9. **Deploy-Schlüssel für die CI eintragen**, wie unter „Website einrichten“ →
+   „Deploy-Schlüssel nur für die CI“ beschrieben (Schlüssel auf eurem Rechner erzeugen,
+   privaten Teil als Secret `DEPLOY_SSH_KEY`, `ssh-keyscan SERVER` als
+   `DEPLOY_KNOWN_HOSTS`). Auf dem Server eine Zeile in
+   `/home/deploy/.ssh/authorized_keys`, beschränkt auf `deploy.sh`:
 
-   ```sh
-   sudo -u deploy /opt/website/deploy.sh ghcr.io/advocatusrar/claude-webseiten/website:sha-<commit>
+   ```text
+   command="/opt/website/deploy.sh",restrict ssh-ed25519 AAAA… github-deploy
    ```
 
-10. **Prüfen**, auf eurem Rechner. Mit GET (`-o /dev/null -D -`), nicht mit `curl -I`:
-    Auf HEAD antwortet die Weiterleitung von Traefik mit `308` statt `301`. Beides ist
-    eine dauerhafte Weiterleitung.
+   Den Befehl nicht von Hand testen, auch nicht mit diesem Schlüssel: jeder Aufruf ist
+   ein Deploy.
+
+10. **Erster Start über die Pipeline**, in GitHub (Settings → Secrets and variables →
+    Actions → Variables, und Settings → Environments):
+    1. Variablen `SITE_URL=https://funkenundstahl.de`, `DEPLOY_HOST` (IP des VPS) und
+       `DEPLOY_USER=deploy` setzen; `SITE_URL` geht beim Bauen ins Image.
+    2. Environment `production`: Secrets aus Schritt 9 und **Required reviewers**
+       eintragen, damit der Deploy auf eure Freigabe wartet.
+    3. Optional zuerst `PUBLISH_ENABLED=true` (sobald der Zweig `ci/publish-ohne-deploy`
+       gemergt ist): Die Pipeline veröffentlicht dann nur das Image. Unter Packages →
+       `website` prüfen, dass es da ist, und die Sichtbarkeit klären (Schritt 8).
+    4. `DEPLOY_ENABLED=true` setzen. Ab jetzt gilt `CHECK_LIVE=1`: Impressum und
+       Datenschutzerklärung müssen vollständig sein, sonst bricht der Build ab.
+    5. Einen Lauf auf `main` auslösen: der nächste Merge nach `main` oder Actions →
+       „CI/CD“ → Run workflow (Branch `main`).
+    6. Der Job „Deploy to production“ wartet auf Freigabe: in Actions den Lauf öffnen,
+       „Review deployments“ → `production` → Approve. Danach ruft die CI `deploy.sh`
+       mit dem Image-Digest auf (Gesundheitsprüfung, bei Fehler Rollback) und prüft
+       `SITE_URL/healthz`.
+
+11. **Prüfen** nach dem ersten Deploy, auf eurem Rechner. Mit GET (`-o /dev/null -D -`),
+    nicht mit `curl -I`: Auf HEAD antwortet die Weiterleitung von Traefik mit `308` statt
+    `301`. Beides ist eine dauerhafte Weiterleitung.
 
     ```sh
     curl -s -o /dev/null -D - https://funkenundstahl.de/ \
@@ -534,20 +561,19 @@ Deploy-Schlüssel.
     eine Weiterleitung auf `https://funkenundstahl.de/`. Hermes danach wie gewohnt
     aufrufen und mit `sudo docker ps` prüfen, dass sein Container weiterläuft.
 
-11. **In GitHub** die Variable `SITE_URL` auf `https://funkenundstahl.de` setzen (siehe
-    [`ci-cd.md`](ci-cd.md)). `DEPLOY_ENABLED` erst setzen, wenn die offene Entscheidung
-    oben getroffen ist.
-
 **Konfiguration ändern:** Änderungen an `compose.hostinger.yml` oder `deploy.sh` laufen
 wie Code über einen Pull Request. Danach Schritt 5 wiederholen (`.env` bleibt dabei
-erhalten) und als `deploy` neu starten:
-`sudo -u deploy sh -c 'cd /opt/website && docker compose up -d --remove-orphans'`. Neue
-Variablen aus `.env.example` von Hand in `/opt/website/.env` nachtragen
-(`sudo -u deploy nano /opt/website/.env`).
+erhalten) und Schritt 7 zur Prüfung; neue Variablen aus `.env.example` von Hand in
+`/opt/website/.env` nachtragen (`sudo -u deploy nano /opt/website/.env`). Keine Container
+von Hand neu starten: Geänderte Dateien und `.env` wirken mit dem nächsten Deploy der
+Pipeline (`deploy.sh` ruft `docker compose up -d` auf, und Compose erstellt den Container
+bei geänderter Konfiguration neu). Braucht eine Änderung sofort einen Neustart, einen
+Lauf auf `main` auslösen und freigeben wie in Schritt 10.
 
-**Entfernen:** `sudo -u deploy sh -c 'cd /opt/website && docker compose down'` stoppt nur
-die Website und löscht das Netz `funkenundstahl-web`. Traefik nimmt die Routen von selbst
-heraus.
+**Entfernen** (endgültiger Abbau, kein Teil des Betriebs, nur nach ausdrücklicher
+Entscheidung; vorher `DEPLOY_ENABLED` ausschalten):
+`sudo -u deploy sh -c 'cd /opt/website && docker compose down'` stoppt nur die Website und
+löscht das Netz `funkenundstahl-web`. Traefik nimmt die Routen von selbst heraus.
 
 ## Laufender Betrieb
 
@@ -564,7 +590,7 @@ heraus.
 - **Hostinger-VPS:** Dort gilt Folgendes abweichend:
   - Den Traefik (`traefik:latest`) pflegt Hostinger. Dependabot aktualisiert ihn nicht,
     und er kann sich ohne Pull Request ändern. Nach einem Update von Hostinger die
-    Prüfungen aus Schritt 2 (nur lesen) und Schritt 10 der Einrichtung wiederholen.
+    Prüfungen aus Schritt 2 (nur lesen) und Schritt 11 der Einrichtung wiederholen.
     nginx-Versionen kommen weiter
     über Dependabot (Image der Website).
   - Monitoring auf `https://funkenundstahl.de/healthz` und das Ablaufdatum der
