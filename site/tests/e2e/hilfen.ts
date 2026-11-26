@@ -1,6 +1,13 @@
 import type { APIRequestContext } from '@playwright/test';
 
 /**
+ * Site name decided by the operators (domain funkenundstahl.de), the expected value for unit
+ * and browser tests. Written out here on purpose and not read from src/site.ts: a wrongly
+ * escaped value there (e.g. 'Funken &amp; Stahl') must fail the tests, not become the expectation.
+ */
+export const SEITENNAME = 'Funken & Stahl';
+
+/**
  * All page paths from the sitemap, relative to the base URL of the test run.
  * The sitemap contains absolute URLs with the configured SITE_URL; only the path counts.
  */
