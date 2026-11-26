@@ -277,6 +277,10 @@ fixture() {
   if [[ -n ${SC_SSHD_MATCH:-} ]]; then
     printf '\n# test fixture\nMatch User ubuntu\n    %b\n' "$SC_SSHD_MATCH" >>/etc/ssh/sshd_config
   fi
+  # The same for deploy (the CI) only.
+  if [[ -n ${SC_SSHD_MATCH_DEPLOY:-} ]]; then
+    printf '\n# test fixture\nMatch User deploy\n    %b\n' "$SC_SSHD_MATCH_DEPLOY" >>/etc/ssh/sshd_config
+  fi
   # No sshd privilege separation directory (socket activation, ssh.service not started).
   if [[ ${SC_RUN_SSHD:-} == missing ]]; then
     rm -rf /run/sshd
@@ -530,10 +534,18 @@ run_setup() {
   install -d -m 1777 "$art/tmp"
   # SC_UFW=absent: no ufw command at all (stubs without ufw).
   if [[ ${SC_UFW:-} == absent ]]; then stubs="$STUBS-noufw"; fi
+  # Only in run N: SC_SSHD_T_FAIL_RUN=N makes sshd -t fail, SC_APT_RUNDIR_RUN=N lets the
+  # apt-get stub replace /run/sshd by a file (STUB_APT_RUNDIR).
+  local t_fail=${SC_SSHD_T_FAIL:-0} rundir=""
+  if [[ ${SC_SSHD_T_FAIL_RUN:-} == "$n" ]]; then t_fail=1; fi
+  if [[ ${SC_APT_RUNDIR_RUN:-} == "$n" ]]; then rundir="file"; fi
   envs=(
     PATH="$stubs:$SANDBOX_PATH_TAIL" HOME=/root LANG=C.UTF-8 TMPDIR="$art/tmp"
     STUB_LOG="$art/log$n" STUB_STATE="$art/state" STUB_RUN="$n"
-    SSHD_T_FAIL="${SC_SSHD_T_FAIL:-0}"
+    SSHD_T_FAIL="$t_fail"
+    STUB_IPT_SAVE="${SC_IPT_SAVE:-}"
+    STUB_RESTORE="${SC_RESTORE:-}"
+    STUB_APT_RUNDIR="$rundir"
     STUB_DOCKER_KEY="$KEYS/${SC_DOCKER_KEY:-docker}.asc"
     STUB_IPT_RACE="${SC_IPT_RACE:-}"
     STUB_DPKG="${SC_DPKG:-}"
@@ -572,6 +584,7 @@ post_checks() {
   local art=$1 dh
   /usr/sbin/sshd -T >"$art/sshd_T" 2>&1 || true
   /usr/sbin/sshd -T -C user=ubuntu,host=localhost,addr=127.0.0.1 >"$art/sshd_T_admin" 2>&1 || true
+  /usr/sbin/sshd -T -C user=deploy,host=localhost,addr=127.0.0.1 >"$art/sshd_T_deploy" 2>&1 || true
   apt-config dump >"$art/aptconf" 2>&1 || true
   fail2ban-client -d >"$art/f2b_dump" 2>/dev/null || true
   getent passwd deploy >"$art/deploy_passwd" || true
@@ -754,10 +767,17 @@ done
 #   flush_v4, flush_v6    all rules gone, policy ACCEPT
 #   policy_v4, policy_v6  only the policy set to ACCEPT
 #   del_final_v4          the final "-A INPUT -j DROP" deleted
+#   flush_v4_nat          as flush_v4, and a new nat chain DOCKER with a MASQUERADE rule
+#                         for 172.18.0.0/16 in POSTROUTING (as if Docker set it up
+#                         meanwhile)
+#   unreadable_v4         from now on the iptables stub fails to read rules (-S, -L,
+#                         -C), as if iptables were broken after the package update
 # STUB_STATE/after_apt.v4 and .v6 then hold all tables of each family as they are right
 # after this change (without comments and counters).
 # STUB_APT_SSHD_MATCH: the same apt run (a package update) adds a Match block for ubuntu
-# to sshd_config. STUB_STATE/apt_hooks records what was done.
+# to sshd_config. STUB_APT_RUNDIR=file: it replaces /run/sshd by an empty file, so that
+# the directory cannot be created again (as if a package update stopped ssh and /run
+# could not be written). STUB_STATE/apt_hooks records what was done.
 case " \$* " in
   *" install "*" iptables-persistent "*)
     case \${STUB_APT_FW:-} in
@@ -767,8 +787,17 @@ case " \$* " in
       policy_v4) /usr/sbin/iptables -P INPUT ACCEPT ;;
       policy_v6) /usr/sbin/ip6tables -P INPUT ACCEPT ;;
       del_final_v4) /usr/sbin/iptables -D INPUT -j DROP ;;
+      flush_v4_nat)
+        /usr/sbin/iptables -F INPUT && /usr/sbin/iptables -P INPUT ACCEPT &&
+          /usr/sbin/iptables -t nat -N DOCKER &&
+          /usr/sbin/iptables -t nat -A POSTROUTING -s 172.18.0.0/16 ! -o br-test -j MASQUERADE
+        ;;
+      unreadable_v4) : >"\$STUB_STATE/ipt_unreadable" ;;
       *) echo "apt-get (test stub): unknown STUB_APT_FW '\$STUB_APT_FW'" >&2; exit 99 ;;
     esac
+    if [[ \${STUB_APT_RUNDIR:-} == file ]]; then
+      rm -rf /run/sshd && : >/run/sshd && echo "rundir file" >>"\$STUB_STATE/apt_hooks"
+    fi
     if [[ -n \${STUB_APT_FW:-} ]]; then
       echo "fw \$STUB_APT_FW" >>"\$STUB_STATE/apt_hooks"
       /usr/sbin/iptables-save | grep -v '^#' | sed -E 's/\[[0-9]+:[0-9]+\]/[0:0]/g' >"\$STUB_STATE/after_apt.v4"
@@ -938,7 +967,9 @@ EOF
   done
   # Logged so that the tests see a restored (replaced) rule set. The input is appended to
   # STUB_STATE/NAME.in.RUN (RUN: number of the run), so that the tests can compare it
-  # with what the script saved before.
+  # with what the script saved before. STUB_RESTORE (both families):
+  #   fail  the restore fails (exit 1) and changes nothing
+  #   noop  it reports success (exit 0) but changes nothing, so INPUT stays as it is
   for name in iptables-restore ip6tables-restore; do
     cat >"$dir/$name" <<EOF
 #!/bin/bash
@@ -948,14 +979,27 @@ if [[ -n \${STUB_STATE:-} ]]; then keep="\$STUB_STATE/$name.in.\${STUB_RUN:-0}";
 input=\$(cat; echo .)
 input=\${input%.}
 printf '%s' "\$input" >>"\$keep"
+case \${STUB_RESTORE:-} in
+  "") ;;
+  fail) echo "$name (test stub): forced failure, nothing restored" >&2; exit 1 ;;
+  noop) exit 0 ;;
+  *) echo "$name (test stub): unknown STUB_RESTORE '\$STUB_RESTORE'" >&2; exit 99 ;;
+esac
 printf '%s' "\$input" | /usr/sbin/$name "\$@"
 EOF
   done
-  # Logged as well; the output is appended to STUB_STATE/NAME.out.RUN.
+  # Logged as well; the output is appended to STUB_STATE/NAME.out.RUN. STUB_IPT_SAVE
+  # (both families): "fail" fails (exit 1, no output), "empty" prints nothing (exit 0).
   for name in iptables-save ip6tables-save; do
     cat >"$dir/$name" <<EOF
 #!/bin/bash
 $log
+case \${STUB_IPT_SAVE:-} in
+  "") ;;
+  fail) echo "$name (test stub): forced failure" >&2; exit 1 ;;
+  empty) exit 0 ;;
+  *) echo "$name (test stub): unknown STUB_IPT_SAVE '\$STUB_IPT_SAVE'" >&2; exit 99 ;;
+esac
 set -o pipefail
 keep=/dev/null
 if [[ -n \${STUB_STATE:-} ]]; then keep="\$STUB_STATE/$name.out.\${STUB_RUN:-0}"; fi
@@ -967,10 +1011,16 @@ EOF
   #   STUB_IPT_RACE=insert  right before "iptables -I INPUT <n> ..." is carried out
   #                         (the script read the REJECT position before).
   # Once per run. STUB_STATE/race_count counts the inserted rules.
+  # STUB_STATE/ipt_unreadable (set by the apt-get stub, unreadable_v4): reading rules
+  # (-S, -L, -C) fails.
   {
     printf '#!/bin/bash\n%s\n' "$log"
     cat <<'EOF'
 real=/usr/sbin/iptables
+if [[ -f ${STUB_STATE:-/nonexistent}/ipt_unreadable && ${1:-} =~ ^-(S|L|C)$ ]]; then
+  echo "iptables (test stub): forced read error" >&2
+  exit 4
+fi
 mode=${STUB_IPT_RACE:-}
 count_file=${STUB_STATE:-/nonexistent}/race_count
 inject() {
@@ -2524,6 +2574,55 @@ t_sshd_deploy_warns() { # SCENARIO REGEX LINE...
   return $((1 - ok))
 }
 
+# A Match block only for deploy (SC_SSHD_MATCH_DEPLOY) needs more than a key there: the
+# login of ubuntu is not affected, so only a warning (t_sshd_deploy_warns: exit 0, ssh
+# reloaded, hardening in effect, warning naming deploy and REGEX, no abort, the run goes
+# on and creates deploy). The fixture is in effect: after the run sshd -T -C for deploy
+# has LINE, sshd -T -C for ubuntu does not.
+t_sshd_deploy_auth_warns() { # SCENARIO REGEX LINE
+  local ok=1 a
+  t_sshd_deploy_warns "$1" "$2" || ok=0
+  a=$(art "$1")
+  grep -qxF -- "$3" "$a/sshd_T_deploy" || no "fixture not in effect: sshd -T -C for deploy lacks '$3'"
+  ! grep -qxF -- "$3" "$a/sshd_T_admin" || no "fixture: sshd -T -C for ubuntu has '$3' as well"
+  return $((1 - ok))
+}
+
+# The drop-in /etc/ssh/sshd_config.d/10-haertung.conf has every LINE (a line of its own;
+# blanks around and between the words do not matter), and sshd -T after the run has each
+# of them (in lower case, as sshd -T prints it).
+t_sshd_dropin_lines() { # SCENARIO LINE...
+  local ok=1 s=$1 f line
+  shift
+  have_run "$s" 1 || return 1
+  f="$(upper "$s" etc)${SSHD_DROPIN#/etc}"
+  if [[ ! -f $f ]]; then
+    no "$SSHD_DROPIN was not written"
+    return 1
+  fi
+  for line in "$@"; do
+    grep -qxE "[[:space:]]*${line// /[[:space:]]+}[[:space:]]*" "$f" || no "$SSHD_DROPIN lacks the line: $line" "$(cat "$f")"
+    grep -qxF -- "${line,,}" "$(art "$s")/sshd_T" || no "sshd -T after the run lacks: ${line,,}"
+  done
+  return $((1 - ok))
+}
+
+# As t_sshd_rollback_because (drop-in as before, no reload, abort naming REGEX), and the
+# fixture is in effect after the run: sshd -T (VIEW global) or sshd -T -C for ubuntu (VIEW
+# admin; then not the global view, only the Match block sets it) has LINE.
+t_sshd_rollback_fixture() { # SCENARIO REGEX VIEW LINE
+  local ok=1 a
+  t_sshd_rollback_because "$1" "$2" || ok=0
+  a=$(art "$1")
+  if [[ $3 == global ]]; then
+    grep -qxF -- "$4" "$a/sshd_T" || no "fixture not in effect: sshd -T lacks '$4'"
+  else
+    grep -qxF -- "$4" "$a/sshd_T_admin" || no "fixture not in effect: sshd -T -C for ubuntu lacks '$4'"
+    ! grep -qxF -- "$4" "$a/sshd_T" || no "fixture: global sshd -T has '$4' as well (only the Match block should set it)"
+  fi
+  return $((1 - ok))
+}
+
 # --- tests: /run/sshd -------------------------------------------------------------
 
 t_run_sshd_fixture() { # SCENARIO: /run/sshd was missing before the run
@@ -2673,6 +2772,65 @@ t_sshd_rerun_abort() { # SCENARIO REGEX FILE LINE
   return $((1 - ok))
 }
 
+# What the abort message of step 4 says about the cause when the drop-in is unchanged:
+#   rundir  /run/sshd could not be created, so sshd was not checked at all
+#   error   sshd itself reports an error (sshd -t or sshd -T fails)
+#   config  the configuration fails a check: another file changed (or the check is new)
+declare -A SSHD_CAUSE_RE=(
+  [rundir]='nicht geprüft|ungeprüft'
+  [error]='meldet einen Fehler|Syntaxfehler'
+  [config]='andere(n)? Datei|an anderer Stelle'
+)
+
+# Run 2 leaves the drop-in unchanged (as written by run 1), and a check of step 4 fails
+# for CAUSE: rundir (the package installation replaced /run/sshd by a file, so it cannot
+# be created again), error (sshd -t fails in run 2) or config (a later drop-in with
+# DenyUsers ubuntu before run 2). Run 1 exit 0; run 2 exit != 0 with an abort message,
+# the drop-in exactly as after run 1 (inode, mode, times, content), no other file changed
+# (apart from /run/sshd for rundir), ssh not reloaded, fail2ban not touched, no summary.
+# The abort message matches SSHD_CAUSE_RE of CAUSE and none of the other two causes (so
+# rundir and error do not say that another file changed, config does not say that sshd
+# was not checked or reported an error); for rundir it names /run/sshd.
+t_sshd_unchanged_cause() { # SCENARIO rundir|error|config
+  local ok=1 s=$1 cause=$2 a rc s1 d ab c ex
+  have_run "$s" 2 || return 1
+  a=$(art "$s")
+  case $cause in
+    rundir) grep -qx 'rundir file' "$a/state/apt_hooks" 2>/dev/null || no "fixture: the apt-get stub did not replace /run/sshd in run 2" ;;
+    error)
+      grep -qF 'test stub: forced sshd -t failure' "$a/err2" || no "fixture: sshd -t did not fail in run 2"
+      ! grep -qF 'test stub: forced sshd -t failure' "$a/err1" || no "fixture: sshd -t failed in run 1 already"
+      ;;
+    config) grep -qx 'denyusers ubuntu' "$a/sshd_T" || no "fixture not in effect: sshd -T after run 2 lacks 'denyusers ubuntu'" ;;
+  esac
+  [[ $(rc_of "$s" 1) == 0 ]] || no "run 1: expected exit code 0, got: $(rc_of "$s" 1)" "$(tail -3 "$a/err1")"
+  rc=$(rc_of "$s" 2)
+  [[ $rc =~ ^[0-9]+$ && $rc -ne 0 ]] || no "run 2: expected exit code != 0, got: $rc"
+  ab=$(sed -n '/^Abbruch/,$p' "$a/err2")
+  [[ -n $ab ]] || no "run 2: no abort message:" "$(cat "$a/err2")"
+  s1=$(snap_of "$s" 1 "$SSHD_DROPIN")
+  [[ -n $s1 ]] || no "$SSHD_DROPIN is not there after run 1"
+  d=$(diff <(printf '%s\n' "$s1") <(snap_of "$s" 2 "$SSHD_DROPIN")) || no "run 2 changed, reset or removed $SSHD_DROPIN:" "$d"
+  # For rundir the fixture itself changes /run/sshd and so /run (their snapshot lines left out).
+  if [[ $cause == rundir ]]; then ex='(^|  )\./run/u(/sshd)?(\||$)'; else ex='^$'; fi
+  d=$(diff <(grep -vE -- "$ex" "$a/snap1") <(grep -vE -- "$ex" "$a/snap2")) || no "run 2 changed files:" "$d"
+  ! grep -qE '^systemctl [a-z-]*(reload|restart)[a-z-]* ssh' "$a/log2" ||
+    no "run 2 reloaded ssh:" "$(grep -E '^systemctl .* ssh' "$a/log2")"
+  ! grep -qE '^fail2ban-client ' "$a/log2" || no "run 2 went on after the failed check (fail2ban-client ran)"
+  ! grep -q 'Änderungen in diesem Lauf' "$a/out2" || no "run 2 went on to the end"
+  grep -qE -- "${SSHD_CAUSE_RE[$cause]}" <<<"$ab" ||
+    no "the abort message does not give the cause $cause (/${SSHD_CAUSE_RE[$cause]}/):" "$ab"
+  for c in rundir error config; do
+    [[ $c == "$cause" ]] && continue
+    ! grep -qE -- "${SSHD_CAUSE_RE[$c]}" <<<"$ab" ||
+      no "the abort message for cause $cause gives the cause $c as well (/${SSHD_CAUSE_RE[$c]}/):" "$ab"
+  done
+  if [[ $cause == rundir ]]; then
+    grep -qF '/run/sshd' <<<"$ab" || no "the abort message does not name /run/sshd:" "$ab"
+  fi
+  return $((1 - ok))
+}
+
 # --- tests: audit login UID (sudo su -, sudo -i) -----------------------------------
 
 # Fixture: run 1 of SCENARIO had the audit login UID of USER ("-": a UID without user).
@@ -2708,13 +2866,16 @@ t_loginuid_runs() { # SCENARIO USER: login UID of USER; the run goes through (ex
 FW_WRITE_RE='^(ip6?tables( [^ ]+)* -[IAPDRFX] |ip6?tables-restore( |$)|netfilter-persistent( |$))'
 
 # The package installation (apt-get stub, STUB_APT_FW=HOOK) changed INPUT of TOOL so that
-# it no longer turns other traffic away. The run aborts right after step 1: the abort
-# message names TOOL and REGEX (what changed), not the other tool; iptables-persistent
-# was installed, but no later step ran (no modifying command apart from apt-get and the
-# debconf answers), no rule was inserted and nothing saved (no netfilter-persistent, all
-# files as before, also /etc/iptables/rules.v* if SAVED is "saved").
-t_fw_apt_abort() { # SCENARIO HOOK TOOL REGEX [saved]
-  local ok=1 s=$1 a rc other ab calls d f
+# it no longer turns other traffic away, and putting back the copy from before does not
+# help (STUB_IPT_SAVE: no copy; STUB_RESTORE: the restore fails or changes nothing). The
+# run aborts right after step 1: the abort message names TOOL and REGEX (what changed),
+# not the other tool, and WHY (why it was not restored); TOOL-restore was called RESTORES
+# times ("-": 0 or 1), the other tool's never; iptables-persistent was installed, but no
+# later step ran (no modifying command apart from apt-get, the debconf answers and that
+# restore), no rule was inserted and nothing saved (no netfilter-persistent, all files as
+# before, also /etc/iptables/rules.v* if SAVED is "saved").
+t_fw_apt_abort() { # SCENARIO HOOK TOOL REGEX RESTORES WHY [saved]
+  local ok=1 s=$1 a rc other ab calls d f n
   have_run "$s" 1 || return 1
   a=$(art "$s")
   if [[ $3 == iptables ]]; then other=ip6tables; else other=iptables; fi
@@ -2725,13 +2886,20 @@ t_fw_apt_abort() { # SCENARIO HOOK TOOL REGEX [saved]
   grep -qE "(^|[ (])${3}[ :]" <<<"$ab" || no "the abort message does not name $3:" "$(cat "$a/err1")"
   ! grep -qE "(^|[ (])${other}[ :]" <<<"$ab" || no "the abort message names $other, whose INPUT did not change:" "$ab"
   grep -qE -- "$4" <<<"$ab" || no "the abort message does not say what changed (/$4/):" "${ab:-no abort message}"
+  grep -qE -- "$6" <<<"$ab" || no "the abort message does not say why the firewall was not restored (/$6/):" "${ab:-no abort message}"
   grep -qE '^apt-get .* install .*iptables-persistent' "$a/log1" || no "step 1 did not install iptables-persistent"
-  calls=$(grep -E "$FW_WRITE_RE" "$a/log1")
+  n=$(grep -cE "^${3}-restore( |\$)" "$a/log1")
+  if [[ $5 == - ]]; then
+    ((n <= 1)) || no "$n calls of $3-restore (expected at most 1)"
+  else
+    ((n == $5)) || no "$n calls of $3-restore (expected $5)"
+  fi
+  calls=$(grep -E "$FW_WRITE_RE" "$a/log1" | grep -vE "^${3}-restore( |\$)")
   [[ -z $calls ]] || no "the script changed or saved firewall rules:" "$calls"
-  calls=$(modifying_calls "$a/log1" rerun)
+  calls=$(modifying_calls "$a/log1" rerun | grep -vE "^${3}-restore( |\$)")
   [[ -z $calls ]] || no "the run went on after step 1 (modifying commands):" "$calls"
   d=$(diff "$a/snap0" "$a/snap1") || no "files changed (nothing may be saved or written):" "$d"
-  if [[ ${5:-} == saved ]]; then
+  if [[ ${7:-} == saved ]]; then
     for f in /etc/iptables/rules.v4 /etc/iptables/rules.v6; do
       [[ -n $(snap_of "$s" 0 "$f") ]] || no "fixture: no saved $f before the run"
     done
@@ -2875,6 +3043,49 @@ t_fw_apt_restored() { # SCENARIO HOOK TOOL REGEX
   return $((1 - ok))
 }
 
+# The package installation flushed INPUT of iptables and in the same apt run added a nat
+# chain DOCKER with a MASQUERADE rule for 172.18.0.0/16 (apt-get stub, flush_v4_nat).
+# Restoring the table filter leaves nat alone: after the run nat still has that chain and
+# rule, and the rule of the nat fixture. (t_fw_apt_restored checks the rest.)
+t_fw_apt_nat_kept() { # SCENARIO
+  local ok=1 a nat0 nat1
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  nat0=$(fw_other_tables "$a/save4_0")
+  nat1=$(fw_other_tables "$a/save4_1")
+  ! grep -qF -- '172.18.0.0/16' <<<"$nat0" || no "fixture: the nat rule for 172.18.0.0/16 was there before the run"
+  grep -qE -- '^-A POSTROUTING -s 172\.18\.0\.0/16 .*-j MASQUERADE' "$a/state/after_apt.v4" 2>/dev/null ||
+    no "fixture: the apt-get stub did not add the nat rule for 172.18.0.0/16"
+  grep -qE '^iptables-restore( |$)' "$a/log1" || no "fixture: iptables-restore was not called, nothing was restored"
+  grep -qE -- '^-A POSTROUTING -s 172\.18\.0\.0/16 .*-j MASQUERADE' <<<"$nat1" ||
+    no "the nat rule added during the package installation is gone after the run:" "$nat1"
+  grep -qxF ':DOCKER - [0:0]' <<<"$nat1" || no "the nat chain DOCKER added during the package installation is gone after the run:" "$nat1"
+  grep -qE -- '^-A POSTROUTING -s 172\.17\.0\.0/16 .*-j MASQUERADE' <<<"$nat1" || no "the nat rule of the fixture is gone after the run:" "$nat1"
+  return $((1 - ok))
+}
+
+# The copy of the table filter cannot be taken (STUB_IPT_SAVE=fail: iptables-save and
+# ip6tables-save fail), but the package installation leaves INPUT as it was. Nothing to
+# restore, so the run goes through as usual: exit 0, no abort, no ip(6)tables-restore,
+# 22/80/443 before the REJECT in both families, netfilter-persistent save, the run reaches
+# the end.
+t_fw_nosave_ok() { # SCENARIO
+  local ok=1 a r
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  grep -qxF 'iptables-save -t filter' "$a/log1" || no "fixture: the run did not try iptables-save -t filter"
+  [[ ! -s $a/state/iptables-save.out.1 ]] || no "fixture: iptables-save printed rules although the stub should fail"
+  ! grep -qE '^fw ' "$a/state/apt_hooks" 2>/dev/null || no "fixture: the apt-get stub changed the firewall: $(cat "$a/state/apt_hooks")"
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)" "$(grep -E '^Abbruch' -A2 "$a/err1")"
+  r=$(grep -E '^ip6?tables-restore( |$)' "$a/log1")
+  [[ -z $r ]] || no "restored although INPUT did not change:" "$r"
+  grep -qE 'Änderungen in diesem Lauf: [0-9]' "$a/out1" || no "the run did not reach the end"
+  t_fw_ports_before_reject "$1" v4 || ok=0
+  t_fw_ports_before_reject "$1" v6 || ok=0
+  grep -qx 'netfilter-persistent save' "$a/log1" || no "netfilter-persistent save was not run"
+  return $((1 - ok))
+}
+
 # Warnings in run 1 of SCENARIO that INPUT of TOOL does not filter incoming connections.
 open_warnings() { # SCENARIO TOOL
   grep -E "WARNUNG: $2: " "$(art "$1")/err1" | grep -E 'INPUT' | grep -cE 'gefiltert'
@@ -2994,6 +3205,19 @@ t_f2b_other_jail_aborts() { # SCENARIO JAIL
   if grep -qxE "[[:space:]]*\[$2\][[:space:]]*" /etc/fail2ban/jail.conf 2>/dev/null; then
     grep -qF /etc/fail2ban/jail.conf <<<"$ab" || no "the abort message does not name /etc/fail2ban/jail.conf, which has a section [$2]:" "$ab"
   fi
+  return $((1 - ok))
+}
+
+# Dry run with another jail enabled (fixture jail.d/zz.local): exit 0, nothing changed
+# (t_dry_would_abort), the dry run asked fail2ban-client -d, and the line saying that a
+# real run would abort names JAIL and FILE.
+t_dry_f2b_other_jail() { # SCENARIO JAIL FILE
+  local ok=1 a l
+  t_dry_would_abort "$1" "$2" || ok=0
+  a=$(art "$1")
+  grep -qE '^fail2ban-client -d( |$)' "$a/log1" || no "the dry run did not ask fail2ban-client -d"
+  l=$(grep -E '\[Testlauf\].*abbrechen' "$a/err1" | grep -wF -- "$2")
+  grep -qF -- "$3" <<<"$l" || no "the dry run does not name $3 with the jail $2:" "${l:-$(cat "$a/err1")}"
   return $((1 - ok))
 }
 
@@ -3365,6 +3589,15 @@ PermitRootLogin yes"
   scenario fw_apt_policy_v6 SC_FW=drop_policy SC_V6=drop_policy SC_APT_FW=policy_v6 SC_NAT=1
   scenario fw_apt_del_drop SC_FW=drop_rule SC_V6=drop_rule SC_APT_FW=del_final_v4 SC_NAT=1
   scenario fw_apt_flush_comment SC_FW=oracle_comment SC_APT_FW=flush_v4 SC_NAT=1
+  # ... and putting back the copy does not help, or there is none
+  scenario fw_apt_restore_fail SC_APT_FW=flush_v4 SC_RULES_SAVED=1 SC_RESTORE=fail
+  scenario fw_apt_restore_noop SC_APT_FW=flush_v6 SC_RULES_SAVED=1 SC_RESTORE=noop
+  scenario fw_apt_nosave SC_APT_FW=flush_v4 SC_RULES_SAVED=1 SC_IPT_SAVE=fail
+  scenario fw_apt_save_empty SC_FW=drop_policy SC_V6=drop_policy SC_APT_FW=policy_v4 SC_IPT_SAVE=empty
+  scenario fw_nosave_ok SC_IPT_SAVE=fail
+  scenario fw_apt_unreadable SC_APT_FW=unreadable_v4 SC_RULES_SAVED=1
+  # ... and a nat rule added in the same apt run
+  scenario fw_apt_nat SC_APT_FW=flush_v4_nat SC_NAT=1
   scenario fw_comment SC_FW=oracle_comment
   scenario fw_open SC_FW=open SC_V6=open
   scenario fw_drop_rule SC_FW=drop_rule SC_V6=drop_rule SC_RUNS=2
@@ -3372,6 +3605,18 @@ PermitRootLogin yes"
   # Other fail2ban jails
   scenario f2b_recidive 'SC_F2B_JAIL_D=[recidive]\nenabled = true'
   scenario f2b_recidive_off 'SC_F2B_JAIL_D=[recidive]\nenabled = false'
+  scenario dry_f2b_recidive SC_DRY_RUN=1 'SC_F2B_JAIL_D=[recidive]\nenabled = true'
+  # GSSAPIAuthentication and HostbasedAuthentication that do not take effect
+  scenario ssh_early_gssapi "SC_SSHD_EARLY=GSSAPIAuthentication yes"
+  scenario ssh_early_hostbased "SC_SSHD_EARLY=HostbasedAuthentication yes"
+  scenario ssh_match_gssapi "SC_SSHD_MATCH=GSSAPIAuthentication yes"
+  scenario ssh_match_hostbased "SC_SSHD_MATCH=HostbasedAuthentication yes"
+  # deploy cannot log in with a key alone (Match User deploy)
+  scenario ssh_deploy_match_pubkey "SC_SSHD_MATCH_DEPLOY=PubkeyAuthentication no"
+  scenario ssh_deploy_match_methods "SC_SSHD_MATCH_DEPLOY=AuthenticationMethods publickey,password"
+  # Run 2 with the drop-in unchanged: /run/sshd cannot be created, sshd -t fails
+  scenario rerun_rundir SC_RUNS=2 SC_APT_RUNDIR_RUN=2
+  scenario rerun_sshd_t_fail SC_RUNS=2 SC_SSHD_T_FAIL_RUN=2
   # deploy with a home directory other than /home/deploy
   scenario deploy_home SC_DEPLOY_HOME=/srv/deployhome SC_RUNS=2
   scenario dry_deploy_home SC_DRY_RUN=1 SC_DEPLOY_HOME=/srv/deployhome
@@ -3661,6 +3906,24 @@ PermitRootLogin yes"
     t_fw_apt_restored fw_apt_del_drop del_final_v4 iptables 'DROP'
   check "firewall (edge case): package installation flushes INPUT whose final REJECT has a comment: restored, warning, exit 0, closed again, saved, nat unchanged" \
     t_fw_apt_restored fw_apt_flush_comment flush_v4 iptables 'REJECT'
+  check "firewall: temporary copy of the filter table removed after a restore" t_tmp_cleaned fw_apt_flush_v4
+  check "firewall: package installation flushes IPv4 INPUT, iptables-restore fails: abort after step 1 naming the failed restore, nothing saved" \
+    t_fw_apt_abort fw_apt_restore_fail flush_v4 iptables 'REJECT' 1 'gescheitert|fehlgeschlagen' saved
+  check "firewall: temporary copy of the filter table removed after the abort" t_tmp_cleaned fw_apt_restore_fail
+  check "firewall: package installation flushes IPv6 INPUT, ip6tables-restore changes nothing (INPUT still open): abort after the re-check, nothing saved" \
+    t_fw_apt_abort fw_apt_restore_noop flush_v6 ip6tables 'REJECT' 1 'weiter|immer noch|noch immer' saved
+  check "firewall: no copy of the filter table (iptables-save fails), package installation flushes IPv4 INPUT: abort without restore, nothing saved" \
+    t_fw_apt_abort fw_apt_nosave flush_v4 iptables 'REJECT' 0 'Sicherung' saved
+  check "firewall (edge case): copy of the filter table empty (iptables-save prints nothing), package installation sets policy ACCEPT: abort without restore, nothing saved" \
+    t_fw_apt_abort fw_apt_save_empty policy_v4 iptables 'Policy' 0 'Sicherung|gesichert'
+  check "firewall (edge case): no copy of the filter table, INPUT unchanged by the package installation: no restore, exit 0, 22/80/443 opened and saved" \
+    t_fw_nosave_ok fw_nosave_ok
+  check "firewall: IPv4 INPUT unreadable after the package installation: restore tried, still unreadable: abort, nothing saved" \
+    t_fw_apt_abort fw_apt_unreadable unreadable_v4 iptables 'lesen|lesbar' 1 'weiter|immer noch|noch immer' saved
+  check "firewall: package installation flushes IPv4 INPUT and adds a nat rule: filter table restored, warning, exit 0, closed again, saved" \
+    t_fw_apt_restored fw_apt_nat flush_v4_nat iptables 'REJECT'
+  check "firewall: restoring the filter table keeps the nat rule and chain added during the package installation and the nat rule from before" \
+    t_fw_apt_nat_kept fw_apt_nat
   check "firewall (edge case): final REJECT with a comment: no warning that INPUT does not filter" t_fw_open_warns fw_comment ''
   check "firewall: neither final REJECT/DROP nor policy DROP (IPv4 and IPv6): a warning for each, the run goes on" \
     t_fw_open_warns fw_open 'iptables ip6tables'
@@ -3677,6 +3940,29 @@ PermitRootLogin yes"
   check "fail2ban: jail recidive enabled as well: abort naming recidive and the files with [recidive], fail2ban neither restarted nor started" \
     t_f2b_other_jail_aborts f2b_recidive recidive
   check "fail2ban: jail recidive disabled: no warning about other jails" t_f2b_only_sshd f2b_recidive_off recidive
+  check "fail2ban: dry run with jail recidive enabled: nothing changed, says a real run would abort, naming recidive and jail.d/zz.local" \
+    t_dry_f2b_other_jail dry_f2b_recidive recidive /etc/fail2ban/jail.d/zz.local
+
+  check "SSH: drop-in also has GSSAPIAuthentication no and HostbasedAuthentication no, both effective (sshd -T)" \
+    t_sshd_dropin_lines fresh 'GSSAPIAuthentication no' 'HostbasedAuthentication no'
+  check "SSH: earlier drop-in with GSSAPIAuthentication yes: drop-in reset, no reload, abort" \
+    t_sshd_rollback_fixture ssh_early_gssapi '[Gg][Ss][Ss][Aa][Pp][Ii][Aa]uthentication' global 'gssapiauthentication yes'
+  check "SSH: earlier drop-in with HostbasedAuthentication yes: drop-in reset, no reload, abort" \
+    t_sshd_rollback_fixture ssh_early_hostbased '[Hh]ostbased[Aa]uthentication' global 'hostbasedauthentication yes'
+  check "SSH: Match User ubuntu with GSSAPIAuthentication yes (only sshd -T -C sees it): drop-in reset, no reload, abort" \
+    t_sshd_rollback_fixture ssh_match_gssapi '[Gg][Ss][Ss][Aa][Pp][Ii][Aa]uthentication' admin 'gssapiauthentication yes'
+  check "SSH: Match User ubuntu with HostbasedAuthentication yes (only sshd -T -C sees it): drop-in reset, no reload, abort" \
+    t_sshd_rollback_fixture ssh_match_hostbased '[Hh]ostbased[Aa]uthentication' admin 'hostbasedauthentication yes'
+  check "SSH: Match User deploy with PubkeyAuthentication no (ubuntu not affected): warning naming deploy and PubkeyAuthentication, no abort, ssh reloaded" \
+    t_sshd_deploy_auth_warns ssh_deploy_match_pubkey 'PubkeyAuthentication' 'pubkeyauthentication no'
+  check "SSH: Match User deploy with AuthenticationMethods publickey,password: warning naming deploy and AuthenticationMethods, no abort, ssh reloaded" \
+    t_sshd_deploy_auth_warns ssh_deploy_match_methods 'AuthenticationMethods' 'authenticationmethods publickey,password'
+  check "SSH, drop-in unchanged in run 2, /run/sshd cannot be created: abort says sshd was not checked (cause rundir), drop-in kept, no reload" \
+    t_sshd_unchanged_cause rerun_rundir rundir
+  check "SSH, drop-in unchanged in run 2, sshd -t fails: abort says sshd reports an error (cause error), not that another file changed" \
+    t_sshd_unchanged_cause rerun_sshd_t_fail error
+  check "SSH, drop-in unchanged in run 2, DenyUsers ubuntu in a later drop-in: abort says another file changed (cause config)" \
+    t_sshd_unchanged_cause rerun_denyusers config
   check "fail2ban: fresh server, only jail sshd: no warning about other jails" t_f2b_only_sshd fresh
 
   check "user deploy with home /srv/deployhome (getent passwd): authorized_keys there, nothing under /home/deploy, run 2 unchanged" \
