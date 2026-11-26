@@ -18,7 +18,7 @@
 #     `docker compose pull` and `docker image prune` into no-ops (no registry, the host's
 #     images stay); every other call goes to the real docker.
 #   Requests go to 127.0.0.1 (curl --resolve, no proxy). Needs ports 80, 443 and
-#   LIVE_API_PORT free, no network funkenundstahl-web and no compose project "website".
+#   LIVE_API_PORT free, no network funkenundstahl-web and no compose project "funkenundstahl".
 #   Everything started is removed at the end.
 #
 # Usage: bash site/tests/server/compose-hostinger.test.sh
@@ -61,6 +61,8 @@ HERMES=hermes-agent-fjbe
 HSTS_SECONDS=31536000
 # Network with a fixed name in compose.hostinger.yml (docs/server.md).
 WEB_NET=funkenundstahl-web
+# Compose project of compose.hostinger.yml (name: in the file).
+PROJECT=funkenundstahl
 # Local tag for the live deploy: deploy.sh only accepts ghcr.io references.
 LIVE_TAG=ghcr.io/compose-hostinger-test/website:live
 LIVE_PREFIX=cht-
@@ -598,8 +600,8 @@ live_prereqs() { # sets LIVE_REASON if the live part cannot run
     port_busy "$p" && { LIVE_REASON="port $p on 127.0.0.1 is in use"; return 1; }
   done
   docker network inspect "$WEB_NET" >/dev/null 2>&1 && { LIVE_REASON="network $WEB_NET exists already"; return 1; }
-  [[ -z $(docker ps -aq --filter label=com.docker.compose.project=website) ]] ||
-    { LIVE_REASON="containers of a compose project 'website' exist already"; return 1; }
+  [[ -z $(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT") ]] ||
+    { LIVE_REASON="containers of a compose project '$PROJECT' exist already"; return 1; }
   [[ -z $(docker ps -aq --filter "name=^${LIVE_PREFIX}") ]] ||
     { LIVE_REASON="containers named ${LIVE_PREFIX}* exist already"; return 1; }
   return 0
@@ -695,7 +697,7 @@ live_down() {
   if docker network inspect "$WEB_NET" >/dev/null 2>&1; then
     echo "WARNING: network $WEB_NET still exists after the live tests"
   fi
-  if [[ -n $(docker ps -aq --filter label=com.docker.compose.project=website) ||
+  if [[ -n $(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT") ||
     -n $(docker ps -aq --filter "name=^${LIVE_PREFIX}") ]]; then
     echo "WARNING: containers of the live tests are left over"
   fi
@@ -717,8 +719,8 @@ t_live_deploy() {
   [[ $status == healthy ]] || no "website container health: '$status'"
   # Only the website was started, no Traefik of our own.
   local svcs
-  svcs=$(docker ps --filter label=com.docker.compose.project=website --format '{{.Label "com.docker.compose.service"}}' | sort | tr '\n' ' ')
-  [[ $svcs == "website " ]] || no "running services of project website: '$svcs', expected 'website'"
+  svcs=$(docker ps --filter "label=com.docker.compose.project=$PROJECT" --format '{{.Label "com.docker.compose.service"}}' | sort | tr '\n' ' ')
+  [[ $svcs == "website " ]] || no "running services of project $PROJECT: '$svcs', expected 'website'"
   return $((1 - ok))
 }
 
