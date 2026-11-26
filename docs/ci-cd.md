@@ -97,7 +97,7 @@ Settings → Rules → Rulesets → New ruleset → New branch ruleset:
 | `SITE_URL`       | `https://funkenundstahl.de`  | Adresse für Canonical, Sitemap, JSON-LD; muss zu `DOMAIN` in `/opt/website/.env` passen (ohne `www`, das leitet weiter) |
 | `DEPLOY_HOST`    | `203.0.113.10`               | Server                                        |
 | `DEPLOY_USER`    | `deploy`                     | Benutzer auf dem Server                       |
-| `DEPLOY_ENABLED` | `true`                       | schaltet Veröffentlichen und Deploy ein; **erst nach dem Aufbau von Live und Staging setzen**, sonst schlägt der Deploy-Job fehl |
+| `DEPLOY_ENABLED` | `true`                       | schaltet Veröffentlichen und Deploy ein; **erst setzen, wenn der Server bereit ist** (Oracle: nach dem Aufbau von Live und Staging; Hostinger-VPS: nach der offenen Entscheidung zum ersten Image, siehe oben), sonst schlägt der Deploy-Job fehl |
 
 ### 3. Environment `production` (Settings → Environments → New environment)
 

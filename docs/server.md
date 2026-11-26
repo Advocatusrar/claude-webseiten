@@ -261,7 +261,10 @@ Exit-Code 0 heißt bestanden, 1 mindestens ein Fehler, 2 der Test kann hier nich
 
 **Hinweis Docker und Firewall:** Docker leitet veröffentlichte Container-Ports an der
 INPUT-Kette vorbei. Deshalb veröffentlicht nur Traefik Ports (80, 443). Eigene Regeln
-für Container gehören in die Kette `DOCKER-USER`.
+für Container gehören in die Kette `DOCKER-USER`. Das gilt für den Oracle-Server mit
+`compose.yml`. Auf dem Hostinger-VPS läuft Traefik im Host-Netz (80 und 443 also über
+INPUT), und Hermes veröffentlicht Port 32768 an INPUT vorbei; die Website selbst
+veröffentlicht dort keine Ports.
 
 ## Website einrichten (folgt mit dem Aufbau von Live und Staging)
 
@@ -281,8 +284,9 @@ Erhalten bleibt:
   Teil in `/home/deploy/.ssh/authorized_keys` eintragen, beschränkt auf einen Befehl
   (`command="…",restrict`). Den privaten Teil als Secret `DEPLOY_SSH_KEY` in GitHub
   eintragen, `ssh-keyscan SERVER` als Secret `DEPLOY_KNOWN_HOSTS`, danach die lokale
-  Datei löschen. `DEPLOY_ENABLED=true` erst danach und erst nach dem Aufbau von Live
-  und Staging setzen (siehe oben und [`ci-cd.md`](ci-cd.md)).
+  Datei löschen. `DEPLOY_ENABLED=true` erst danach setzen, auf dem Oracle-Server erst
+  nach dem Aufbau von Live und Staging, auf dem Hostinger-VPS erst nach der „Offenen
+  Entscheidung (erstes Image)“ (siehe oben und [`ci-cd.md`](ci-cd.md)).
 - **Tipp für den ersten Start:** In `.env` die Zeile `ACME_CA_SERVER=...staging...`
   aktivieren. Let's Encrypt begrenzt fehlgeschlagene Versuche; mit der Staging-CA lässt
   sich gefahrlos testen. Wenn alles läuft, die Zeile entfernen, das Zertifikats-Volume
@@ -309,7 +313,8 @@ betrifft nur Container desselben Projekts. Ein allgemeiner Name wie `website` k�
 einem geteilten Server mit einem fremden Projekt zusammenfallen.
 
 Vor diesem Stack wird der VPS mit `deploy/setup-server.sh` im Profil `hostinger`
-abgesichert (siehe Abschnitt „Hostinger-VPS (Profil hostinger)“). Das legt unter anderem
+abgesichert (siehe Abschnitt „Hostinger-VPS (Profil hostinger)“, vorhanden nach dem
+Merge des Zweigs `setup/hostinger-haertung`). Das legt unter anderem
 den Benutzer `deploy` an, der `deploy.sh` ausführt.
 
 Was der Traefik von Hostinger laut `docker inspect` bietet und `compose.hostinger.yml`
@@ -388,20 +393,27 @@ Deploy-Schlüssel.
    leer. Erst dann weiter, sonst scheitert die HTTP-Challenge von Let's Encrypt.
 
 2. **Server prüfen** (nur lesen), auf dem Server. `<traefik>` und `<hermes>` sind die
-   Containernamen aus der ersten Ausgabe.
+   Containernamen aus der ersten Ausgabe. Euer Admin-Benutzer ist nicht in der Gruppe
+   `docker` und wird auch nicht aufgenommen (das wäre gleichbedeutend mit root), deshalb
+   `sudo docker`.
 
    ```sh
-   docker ps --format '{{.Names}}  {{.Image}}  {{.Ports}}'
-   docker version --format '{{.Server.Version}}'
-   docker ps -a --format '{{.Names}} {{.Label "com.docker.compose.project"}}'
-   docker inspect <traefik> --format '{{json .Args}}'
-   docker inspect <traefik> --format '{{range .Config.Env}}{{println .}}{{end}}' \
+   sudo docker ps --format '{{.Names}}  {{.Image}}  {{.Ports}}'
+   sudo docker version --format '{{.Server.Version}}'
+   sudo docker ps -a --format '{{.Names}} {{.Label "com.docker.compose.project"}}'
+   sudo docker inspect <traefik> --format '{{json .Args}}'
+   sudo docker inspect <traefik> --format '{{range .Config.Env}}{{println .}}{{end}}' \
      | grep -E '^TRAEFIK_(ACCESSLOG|ENTRYPOINTS_[A-Z0-9_]+_MIDDLEWARES)'
-   docker inspect <traefik> --format '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}'
-   docker inspect $(docker ps -q) \
+   sudo docker inspect <traefik> --format '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}'
+   sudo docker inspect <traefik> --format '{{json .HostConfig.LogConfig}}'
+   sudo docker inspect $(sudo docker ps -q) \
      --format '{{.Name}}{{range $k, $v := .Config.Labels}}{{"\n  "}}{{$k}}={{$v}}{{end}}' \
      | grep -E '^/|\.rule='
    ```
+
+   **Achtung:** Die Ausgabe von `.Args` kann die E-Mail-Adresse enthalten, die Hostinger
+   für Let's Encrypt hinterlegt hat. Sie nicht ungefiltert in Pull Requests, Issues oder
+   Chats kopieren; nur die geprüften Punkte festhalten.
 
    Erwartet:
    - Docker Engine **25 oder neuer**. Ältere Versionen kennen `start_interval` nicht,
@@ -413,8 +425,13 @@ Deploy-Schlüssel.
      auf alle Seiten wirken würden.
    - Zugriffsprotokoll: weder `--accesslog` in den Argumenten noch `TRAEFIK_ACCESSLOG*`
      in der Umgebung. Ist eine statische Konfigurationsdatei eingebunden (`traefik.yml`
-     oder `traefik.toml` unter den Mounts), darin nach `accessLog` suchen. Ist ein
+     oder `traefik.toml` unter den Mounts), darin suchen:
+     `sudo grep -in accesslog <Source>` (`<Source>` ist der Pfad links von `->`; bei
+     einem eingebundenen Verzeichnis `sudo grep -rin accesslog <Source>`). Ist ein
      Zugriffsprotokoll aktiv, vor dem Start Schritt 3 klären.
+   - Log-Konfiguration des Traefik-Containers (`.HostConfig.LogConfig`): Treiber und
+     Grenzen (`max-size`, `max-file`) notieren. Fehlen Grenzen, wachsen Fehlermeldungen
+     von Traefik ohne Obergrenze; das gehört in Schritt 3.
    - Keine Router-Regel eines anderen Containers (vor allem `<hermes>`) erfasst
      `funkenundstahl.de` oder `www.funkenundstahl.de`, auch nicht als Sammelregel
      (`HostRegexp`, `PathPrefix` ohne `Host`) mit eigener `priority`.
@@ -424,8 +441,10 @@ Deploy-Schlüssel.
      hPanel-Kundenkonto abschließen und Hostinger als Hosting-Anbieter eintragen.
    - Land des Rechenzentrums: im hPanel beim VPS ablesen und eintragen.
    - Die Datenschutzerklärung sagt, der vorgeschaltete Proxy speichere keine
-     IP-Adressen. Hier ist das der Traefik von Hostinger, dessen Konfiguration nicht im
-     Repository liegt. Das Ergebnis aus Schritt 2 festhalten und den Text danach richten.
+     IP-Adressen, und Fehlermeldungen würden bei höchstens 30 MB je Dienst überschrieben.
+     Hier ist der Proxy der Traefik von Hostinger, dessen Konfiguration nicht im
+     Repository liegt. Die Ergebnisse aus Schritt 2 (Zugriffsprotokoll und
+     Log-Konfiguration des Traefik-Containers) festhalten und den Text danach richten.
 
 4. **Verzeichnis anlegen**, auf dem Server:
 
@@ -433,19 +452,21 @@ Deploy-Schlüssel.
    sudo install -d -m 750 -o deploy -g deploy /opt/website
    ```
 
-5. **Dateien übertragen**, auf eurem Rechner im Repository:
+5. **Dateien übertragen**, auf eurem Rechner im Repository. Die Dateien landen zuerst im
+   Home-Verzeichnis eures Admin-Benutzers (nicht in `/tmp`, das alle Benutzer sehen):
 
    ```sh
-   scp deploy/compose.hostinger.yml deploy/deploy.sh deploy/.env.example <admin>@SERVER:/tmp/
+   scp deploy/compose.hostinger.yml deploy/deploy.sh deploy/.env.example <admin>@SERVER:
    ```
 
-   Dann auf dem Server:
+   Dann auf dem Server. Die letzte Zeile legt `.env` nur an, wenn es noch keine gibt;
+   eine vorhandene `.env` (mit dem aktuellen `WEBSITE_IMAGE`) bleibt unverändert:
 
    ```sh
-   sudo install -m 644 -o deploy -g deploy /tmp/compose.hostinger.yml /opt/website/
-   sudo install -m 755 -o deploy -g deploy /tmp/deploy.sh /opt/website/
-   sudo install -m 600 -o deploy -g deploy /tmp/.env.example /opt/website/.env
-   rm /tmp/compose.hostinger.yml /tmp/deploy.sh /tmp/.env.example
+   sudo install -m 644 -o deploy -g deploy ~/compose.hostinger.yml /opt/website/
+   sudo install -m 755 -o deploy -g deploy ~/deploy.sh /opt/website/
+   sudo test -e /opt/website/.env || sudo install -m 600 -o deploy -g deploy ~/.env.example /opt/website/.env
+   rm ~/compose.hostinger.yml ~/deploy.sh ~/.env.example
    ```
 
 6. **`.env` ausfüllen:** `sudo -u deploy nano /opt/website/.env`, Inhalt:
@@ -505,11 +526,18 @@ Deploy-Schlüssel.
 
     Danach `301` mit `location: https://funkenundstahl.de/vergleichstest/?a=1`, dann
     eine Weiterleitung auf `https://funkenundstahl.de/`. Hermes danach wie gewohnt
-    aufrufen und mit `docker ps` prüfen, dass sein Container weiterläuft.
+    aufrufen und mit `sudo docker ps` prüfen, dass sein Container weiterläuft.
 
 11. **In GitHub** die Variable `SITE_URL` auf `https://funkenundstahl.de` setzen (siehe
     [`ci-cd.md`](ci-cd.md)). `DEPLOY_ENABLED` erst setzen, wenn die offene Entscheidung
     oben getroffen ist.
+
+**Konfiguration ändern:** Änderungen an `compose.hostinger.yml` oder `deploy.sh` laufen
+wie Code über einen Pull Request. Danach Schritt 5 wiederholen (`.env` bleibt dabei
+erhalten) und als `deploy` neu starten:
+`sudo -u deploy sh -c 'cd /opt/website && docker compose up -d --remove-orphans'`. Neue
+Variablen aus `.env.example` von Hand in `/opt/website/.env` nachtragen
+(`sudo -u deploy nano /opt/website/.env`).
 
 **Entfernen:** `sudo -u deploy sh -c 'cd /opt/website && docker compose down'` stoppt nur
 die Website und löscht das Netz `funkenundstahl-web`. Traefik nimmt die Routen von selbst
@@ -530,7 +558,8 @@ heraus.
 - **Hostinger-VPS:** Dort gilt Folgendes abweichend:
   - Den Traefik (`traefik:latest`) pflegt Hostinger. Dependabot aktualisiert ihn nicht,
     und er kann sich ohne Pull Request ändern. Nach einem Update von Hostinger die
-    Prüfungen aus Schritt 10 der Einrichtung wiederholen. nginx-Versionen kommen weiter
+    Prüfungen aus Schritt 2 (nur lesen) und Schritt 10 der Einrichtung wiederholen.
+    nginx-Versionen kommen weiter
     über Dependabot (Image der Website).
   - Monitoring auf `https://funkenundstahl.de/healthz` und das Ablaufdatum der
     Zertifikate für `funkenundstahl.de` und `www.funkenundstahl.de`.
