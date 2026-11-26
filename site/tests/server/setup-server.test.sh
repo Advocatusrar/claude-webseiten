@@ -1747,7 +1747,8 @@ hook_tool() { # HOOK
 # after "apt-get ... install ... iptables-persistent", not with --noflush, and only from
 # the copy of the table filter taken in the same run before that apt-get
 # ("TOOL-save -t filter"): the input of the restore is exactly what that save printed,
-# and it holds only the table filter.
+# and it holds only the table filter. A restore with --test loads nothing and does not
+# count here.
 t_fw_never_deletes() {
   local ok=1 f a n logs=0 v4=0 v6=0 dry=0 restored=0 hits tool hook dev cnt inst rl sl input saved
   for f in "$WORK"/*/log[0-9]*; do
@@ -1760,7 +1761,9 @@ t_fw_never_deletes() {
     hits=$(grep -E "^($FW_DELETE_RE|netfilter-persistent( |\$))" "$f" | grep -vx 'netfilter-persistent save')
     [[ -z $hits ]] || no "${f#"$WORK"/}:" "$hits"
     for tool in iptables ip6tables; do
-      cnt=$(grep -cE "^${tool}-restore( |\$)" "$f")
+      # A restore with --test (-t) only checks its input and loads nothing (profile
+      # hostinger, before writing /etc/iptables/rules.v*); t_h_rules_files checks those.
+      cnt=$(grep -E "^${tool}-restore( |\$)" "$f" | grep -cvE "^${tool}-restore( [^ ]+)* (--test|-t)( |\$)")
       ((cnt > 0)) || continue
       restored=$((restored + cnt))
       dev=0
