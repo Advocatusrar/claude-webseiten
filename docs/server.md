@@ -14,6 +14,7 @@ Was auf dem Server läuft, steht vollständig in [`deploy/`](../deploy):
 `setup-server.sh` richtet die Website nicht mehr ein. Wie `compose.yml`, `traefik/`,
 `.env` und `deploy.sh` auf den Server kommen, folgt mit dem Aufbau von Live und Staging
 (neue Struktur: `/opt/traefik`, `/opt/site-live`, `/opt/site-staging`, `/opt/deploy`).
+Für den Hostinger-VPS steht das schon unter „Variante Hostinger-VPS“ (`/opt/website`).
 
 Traefik liest seine Routen aus einer Datei und braucht keinen Zugriff auf den
 Docker-Socket. Weder Traefik noch nginx schreiben Zugriffsprotokolle mit IP-Adressen.
@@ -270,6 +271,8 @@ Dieser Teil wird mit der neuen Struktur neu geschrieben.
 > Live und Staging aufgebaut sind. `setup-server.sh` legt weder `deploy.sh` noch die
 > Verzeichnisse der Website an. Mit `DEPLOY_ENABLED=true` würde jeder Merge nach `main`
 > den Deploy-Job starten, und der schlägt dann fehl (siehe [`ci-cd.md`](ci-cd.md)).
+> Für den Hostinger-VPS gilt stattdessen die „Offene Entscheidung (erstes Image)“ unter
+> „Variante Hostinger-VPS“.
 
 Erhalten bleibt:
 
@@ -300,8 +303,14 @@ Variante mit eigenem Traefik.
 **Was unberührt bleibt:** der Traefik von Hostinger (Container, Image, Einstellungen), die
 App „Hermes“ (Router `hermes-agent-fjbe`, Netz `hermes-agent-fjbe_default`) und Port 32768.
 Die Website veröffentlicht keine Ports und nutzt ein eigenes Netz `funkenundstahl-web`.
-Alle Namen beim Traefik beginnen mit `funkenundstahl-`. `deploy/setup-server.sh` ist für
-Oracle geschrieben (Firewall, SSH, Docker) und läuft auf diesem VPS **nicht**.
+Alle Namen beim Traefik beginnen mit `funkenundstahl-`. Das Compose-Projekt heißt
+`funkenundstahl`: `deploy.sh` ruft `docker compose up --remove-orphans` auf, und das
+betrifft nur Container desselben Projekts. Ein allgemeiner Name wie `website` könnte auf
+einem geteilten Server mit einem fremden Projekt zusammenfallen.
+
+Vor diesem Stack wird der VPS mit `deploy/setup-server.sh` im Profil `hostinger`
+abgesichert (siehe Abschnitt „Hostinger-VPS (Profil hostinger)“). Das legt unter anderem
+den Benutzer `deploy` an, der `deploy.sh` ausführt.
 
 Was der Traefik von Hostinger laut `docker inspect` bietet und `compose.hostinger.yml`
 voraussetzt:
@@ -334,47 +343,97 @@ Unterschiede zur eigenen Traefik-Instanz:
   TLS 1.1 wird abgelehnt).
 - **Neustart:** Der Docker-Provider von Traefik übernimmt einen Container erst, wenn er
   gesund ist. Damit ein Deploy nicht etwa 30 Sekunden lang 404 liefert (Prüfintervall im
-  Image), prüft Docker in den ersten 30 Sekunden alle 2 Sekunden (`start_interval`, ab
-  Docker Engine 25). Lokal gemessen: etwa 3 Sekunden 404 je Deploy.
+  Image), prüft Docker in den ersten 30 Sekunden alle 2 Sekunden (`start_interval`).
+  Lokal gemessen: etwa 3 Sekunden 404 je Deploy. `start_interval` setzt **Docker Engine
+  25 oder neuer** voraus; Schritt 2 prüft das.
+- **www-Weiterleitung hängt am Container:** Die Labels beider Router sitzen am
+  Website-Container. Startet er, ist er ungesund oder gestoppt, entfernt Traefik alle
+  seine Router, auch die Weiterleitung von `www`. `noop@internal` heißt nur, dass die
+  Weiterleitung kein Backend fragt.
+- **Container-Logs:** Treiber `local`, höchstens 3 × 10 MB (Datenschutzerklärung:
+  höchstens 30 MB je Dienst).
 - **www über HTTP:** `http://www.…` geht in zwei Schritten: erst auf `https://www.…`
   (Entrypoint `web`), dann auf `https://funkenundstahl.de/…`.
 - **Keine `ACME_EMAIL`:** Zertifikate holt der Traefik von Hostinger.
 - **Zugriffsprotokolle:** Ob der Traefik von Hostinger IP-Adressen protokolliert, legt
-  Hostinger fest (Schritt 2 unten prüft das).
+  Hostinger fest. Seine Konfiguration liegt nicht im Repository (Schritt 2 unten prüft
+  sie, Schritt 3 klärt die Datenschutzerklärung).
+
+**Offene Entscheidung (erstes Image):** `deploy.sh` braucht ein Image in GHCR. Das
+veröffentlicht nur der CI-Job „Publish image“, und der läuft nur mit
+`DEPLOY_ENABLED=true`. Damit startet nach jedem Merge nach `main` aber auch der Job
+„Deploy to production“ (siehe [`ci-cd.md`](ci-cd.md)). Wie das erste Image entsteht
+(etwa: Deploy-Schlüssel und Server vorher fertig einrichten, dann `DEPLOY_ENABLED=true`
+setzen), ist noch nicht entschieden. Die CI bleibt dafür vorerst unverändert.
 
 ### Einrichten
 
-Voraussetzung: Es gibt ein veröffentlichtes Image in GHCR, gebaut mit
-`SITE_URL=https://funkenundstahl.de` (siehe [`ci-cd.md`](ci-cd.md)). Die Befehle auf dem
-Server laufen mit eurem eigenen Admin-Benutzer, nicht mit dem Deploy-Schlüssel.
+Voraussetzungen: Der VPS ist mit `setup-server.sh` im Profil `hostinger` eingerichtet
+(Benutzer `deploy` in der Gruppe `docker`), und es gibt ein veröffentlichtes Image in
+GHCR, gebaut mit `SITE_URL=https://funkenundstahl.de` (siehe „Offene Entscheidung“ oben).
+Die Befehle auf dem Server laufen mit eurem eigenen Admin-Benutzer, nicht mit dem
+Deploy-Schlüssel.
 
-1. **DNS** (DNS-Zone der Domain, z. B. in hPanel unter Domains → `funkenundstahl.de` →
-   DNS / Nameserver): `A`-Eintrag für `funkenundstahl.de` und für `www.funkenundstahl.de`
-   auf die IPv4-Adresse des VPS. Einen `AAAA`-Eintrag nur, wenn er auf die IPv6-Adresse
-   desselben VPS zeigt. Prüfen auf eurem Rechner: `dig +short funkenundstahl.de` und
-   `dig +short www.funkenundstahl.de` zeigen beide die Server-IP. Erst dann weiter, sonst
-   scheitert die HTTP-Challenge von Let's Encrypt.
-2. **Traefik von Hostinger prüfen** (nur lesen), auf dem Server:
+1. **DNS bei Strato** (Strato-Kundenlogin → Domains → Domainverwaltung →
+   `funkenundstahl.de` → DNS-Einstellungen):
+   - `A`-Eintrag für `funkenundstahl.de` und für `www.funkenundstahl.de` auf die
+     IPv4-Adresse des VPS.
+   - Vorhandene `AAAA`-Einträge für beide Namen **löschen**. Sie zeigen sonst weiter auf
+     Strato, und IPv6-Besucher sowie Let's Encrypt landen dort.
+   - `MX`- und `TXT`-Einträge (E-Mail, Verifizierungen) unverändert lassen.
+
+   Prüfen auf eurem Rechner: `dig +short A funkenundstahl.de` und
+   `dig +short A www.funkenundstahl.de` zeigen beide die Server-IP,
+   `dig +short AAAA funkenundstahl.de` und `dig +short AAAA www.funkenundstahl.de` sind
+   leer. Erst dann weiter, sonst scheitert die HTTP-Challenge von Let's Encrypt.
+
+2. **Server prüfen** (nur lesen), auf dem Server. `<traefik>` und `<hermes>` sind die
+   Containernamen aus der ersten Ausgabe.
 
    ```sh
    docker ps --format '{{.Names}}  {{.Image}}  {{.Ports}}'
-   docker inspect <name-des-traefik-containers> --format '{{json .Args}}'
+   docker version --format '{{.Server.Version}}'
+   docker ps -a --format '{{.Names}} {{.Label "com.docker.compose.project"}}'
+   docker inspect <traefik> --format '{{json .Args}}'
+   docker inspect <traefik> --format '{{range .Config.Env}}{{println .}}{{end}}' \
+     | grep -E '^TRAEFIK_(ACCESSLOG|ENTRYPOINTS_[A-Z0-9_]+_MIDDLEWARES)'
+   docker inspect <traefik> --format '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}'
+   docker inspect $(docker ps -q) \
+     --format '{{.Name}}{{range $k, $v := .Config.Labels}}{{"\n  "}}{{$k}}={{$v}}{{end}}' \
+     | grep -E '^/|\.rule='
    ```
 
-   Die Ausgabe muss zur Tabelle oben passen (`exposedbydefault=false`, Entrypoints `web`
-   und `websecure`, Resolver `letsencrypt`). Steht dort `--accesslog`, protokolliert
-   Hostingers Traefik Zugriffe: dann vor dem Start die Datenschutzerklärung klären.
-   Außerdem `docker version --format '{{.Server.Version}}'`: ab 25 gilt `start_interval`,
-   darunter dauert die Lücke beim Deploy etwa 30 Sekunden.
+   Erwartet:
+   - Docker Engine **25 oder neuer**. Ältere Versionen kennen `start_interval` nicht,
+     Compose kann die Datei dann ablehnen. In diesem Fall nicht weitermachen.
+   - Kein Compose-Projekt `funkenundstahl` vorhanden.
+   - Die Argumente passen zur Tabelle oben (`exposedbydefault=false`, Entrypoints `web`
+     und `websecure`, Resolver `letsencrypt`). Keine Middlewares auf Entrypoint-Ebene
+     (`--entrypoints.*.http.middlewares` oder `TRAEFIK_ENTRYPOINTS_*_MIDDLEWARES`), die
+     auf alle Seiten wirken würden.
+   - Zugriffsprotokoll: weder `--accesslog` in den Argumenten noch `TRAEFIK_ACCESSLOG*`
+     in der Umgebung. Ist eine statische Konfigurationsdatei eingebunden (`traefik.yml`
+     oder `traefik.toml` unter den Mounts), darin nach `accessLog` suchen. Ist ein
+     Zugriffsprotokoll aktiv, vor dem Start Schritt 3 klären.
+   - Keine Router-Regel eines anderen Containers (vor allem `<hermes>`) erfasst
+     `funkenundstahl.de` oder `www.funkenundstahl.de`, auch nicht als Sammelregel
+     (`HostRegexp`, `PathPrefix` ohne `Host`) mit eigener `priority`.
 
-3. **Verzeichnis anlegen**, auf dem Server. `<benutzer>` ist der Benutzer, der
-   `deploy.sh` ausführt (später `deploy`), er muss in der Gruppe `docker` sein:
+3. **Datenschutzerklärung klären** (der Text selbst kommt in einem eigenen Pull Request):
+   - Hostinger als Auftragsverarbeiter: Vertrag zur Auftragsverarbeitung (AVV) im
+     hPanel-Kundenkonto abschließen und Hostinger als Hosting-Anbieter eintragen.
+   - Land des Rechenzentrums: im hPanel beim VPS ablesen und eintragen.
+   - Die Datenschutzerklärung sagt, der vorgeschaltete Proxy speichere keine
+     IP-Adressen. Hier ist das der Traefik von Hostinger, dessen Konfiguration nicht im
+     Repository liegt. Das Ergebnis aus Schritt 2 festhalten und den Text danach richten.
+
+4. **Verzeichnis anlegen**, auf dem Server:
 
    ```sh
-   sudo install -d -m 750 -o <benutzer> -g <benutzer> /opt/website
+   sudo install -d -m 750 -o deploy -g deploy /opt/website
    ```
 
-4. **Dateien übertragen**, auf eurem Rechner im Repository:
+5. **Dateien übertragen**, auf eurem Rechner im Repository:
 
    ```sh
    scp deploy/compose.hostinger.yml deploy/deploy.sh deploy/.env.example <admin>@SERVER:/tmp/
@@ -383,13 +442,13 @@ Server laufen mit eurem eigenen Admin-Benutzer, nicht mit dem Deploy-Schlüssel.
    Dann auf dem Server:
 
    ```sh
-   sudo install -m 644 -o <benutzer> -g <benutzer> /tmp/compose.hostinger.yml /opt/website/
-   sudo install -m 755 -o <benutzer> -g <benutzer> /tmp/deploy.sh /opt/website/
-   sudo install -m 600 -o <benutzer> -g <benutzer> /tmp/.env.example /opt/website/.env
+   sudo install -m 644 -o deploy -g deploy /tmp/compose.hostinger.yml /opt/website/
+   sudo install -m 755 -o deploy -g deploy /tmp/deploy.sh /opt/website/
+   sudo install -m 600 -o deploy -g deploy /tmp/.env.example /opt/website/.env
    rm /tmp/compose.hostinger.yml /tmp/deploy.sh /tmp/.env.example
    ```
 
-5. **`.env` ausfüllen:** `sudo -u <benutzer> nano /opt/website/.env`, Inhalt:
+6. **`.env` ausfüllen:** `sudo -u deploy nano /opt/website/.env`, Inhalt:
 
    ```sh
    COMPOSE_FILE=compose.hostinger.yml
@@ -401,45 +460,59 @@ Server laufen mit eurem eigenen Admin-Benutzer, nicht mit dem Deploy-Schlüssel.
    `ACME_EMAIL` und `ACME_CA_SERVER` entfallen. `WEBSITE_IMAGE` überschreibt `deploy.sh`
    bei jedem Deploy mit dem Digest.
 
-6. **Konfiguration prüfen**, auf dem Server:
+7. **Konfiguration prüfen**, auf dem Server. Euer Admin-Benutzer kann `/opt/website`
+   nicht betreten (Rechte 750, Besitzer `deploy`), deshalb läuft alles als `deploy`.
+   `--project-directory` reicht nicht: Compose sucht die Datei aus `COMPOSE_FILE` im
+   aktuellen Verzeichnis.
 
    ```sh
-   cd /opt/website
-   sudo -u <benutzer> docker compose config --services
-   sudo -u <benutzer> docker compose config | grep traefik.http.routers
+   sudo -u deploy sh -c 'cd /opt/website && docker compose config --services'
+   sudo -u deploy sh -c 'cd /opt/website && docker compose config' | grep -E '^name:|traefik.http.routers'
    ```
 
-   Die erste Ausgabe ist genau `website` (kein `traefik`), die zweite zeigt die Router
-   `funkenundstahl-website` und `funkenundstahl-www` mit euren Domains. Fehlt `DOMAIN`,
-   `REDIRECT_DOMAIN` oder `WEBSITE_IMAGE`, bricht Compose mit „… fehlt in .env“ ab.
+   Die erste Ausgabe ist genau `website` (kein `traefik`). Die zweite zeigt
+   `name: funkenundstahl` und die Router `funkenundstahl-website` und
+   `funkenundstahl-www` mit euren Domains. Fehlt `DOMAIN`, `REDIRECT_DOMAIN` oder
+   `WEBSITE_IMAGE`, bricht Compose mit „… fehlt in .env“ ab.
 
-7. **Bei privatem Paket** einmal anmelden (Token mit Recht `read:packages`):
-   `sudo -u <benutzer> docker login ghcr.io`.
-8. **Erster Start** mit Gesundheitsprüfung und Rollback:
+8. **Bei privatem Paket** einmal anmelden (Token mit Recht `read:packages`):
+   `sudo -u deploy docker login ghcr.io`.
+
+9. **Erster Start** mit Gesundheitsprüfung und Rollback:
 
    ```sh
-   sudo -u <benutzer> /opt/website/deploy.sh ghcr.io/advocatusrar/claude-webseiten/website:sha-<commit>
+   sudo -u deploy /opt/website/deploy.sh ghcr.io/advocatusrar/claude-webseiten/website:sha-<commit>
    ```
 
-9. **Prüfen**, auf eurem Rechner:
+10. **Prüfen**, auf eurem Rechner. Mit GET (`-o /dev/null -D -`), nicht mit `curl -I`:
+    Auf HEAD antwortet die Weiterleitung von Traefik mit `308` statt `301`. Beides ist
+    eine dauerhafte Weiterleitung.
 
-   ```sh
-   curl -sI https://funkenundstahl.de/ | grep -iE '^HTTP|strict-transport'
-   curl -sI 'https://www.funkenundstahl.de/vergleichstest/?a=1' | grep -iE '^HTTP|^location'
-   curl -sI http://funkenundstahl.de/ | grep -iE '^HTTP|^location'
-   ```
+    ```sh
+    curl -s -o /dev/null -D - https://funkenundstahl.de/ \
+      | grep -iE '^HTTP|^(content-security-policy|x-content-type-options|referrer-policy|permissions-policy|cross-origin-opener-policy|strict-transport-security):'
+    curl -s -o /dev/null -D - 'https://www.funkenundstahl.de/vergleichstest/?a=1' | grep -iE '^HTTP|^location'
+    curl -s -o /dev/null -D - http://funkenundstahl.de/ | grep -iE '^HTTP|^location'
+    ```
 
-   Erwartet: `200` mit `strict-transport-security: max-age=31536000`, dann `301` mit
-   `location: https://funkenundstahl.de/vergleichstest/?a=1`, dann eine Weiterleitung auf
-   `https://funkenundstahl.de/`. Hermes danach wie gewohnt aufrufen und mit `docker ps`
-   prüfen, dass sein Container weiterläuft.
+    Erwartet beim ersten Aufruf `200` und alle sechs Header:
+    - `content-security-policy: default-src 'self'; …; frame-ancestors 'none'`
+    - `x-content-type-options: nosniff`
+    - `referrer-policy: strict-origin-when-cross-origin`
+    - `permissions-policy: camera=(), microphone=(), geolocation=(), interest-cohort=()`
+    - `cross-origin-opener-policy: same-origin`
+    - `strict-transport-security: max-age=31536000`
 
-10. **In GitHub** die Variable `SITE_URL` auf `https://funkenundstahl.de` setzen (siehe
-    [`ci-cd.md`](ci-cd.md)). `DEPLOY_ENABLED` bleibt aus, bis entschieden ist, ob die CI
-    auf diesen VPS deployen soll.
+    Danach `301` mit `location: https://funkenundstahl.de/vergleichstest/?a=1`, dann
+    eine Weiterleitung auf `https://funkenundstahl.de/`. Hermes danach wie gewohnt
+    aufrufen und mit `docker ps` prüfen, dass sein Container weiterläuft.
 
-**Entfernen:** `cd /opt/website && sudo -u <benutzer> docker compose down` stoppt nur die
-Website und löscht das Netz `funkenundstahl-web`. Traefik nimmt die Routen von selbst
+11. **In GitHub** die Variable `SITE_URL` auf `https://funkenundstahl.de` setzen (siehe
+    [`ci-cd.md`](ci-cd.md)). `DEPLOY_ENABLED` erst setzen, wenn die offene Entscheidung
+    oben getroffen ist.
+
+**Entfernen:** `sudo -u deploy sh -c 'cd /opt/website && docker compose down'` stoppt nur
+die Website und löscht das Netz `funkenundstahl-web`. Traefik nimmt die Routen von selbst
 heraus.
 
 ## Laufender Betrieb
@@ -454,3 +527,13 @@ heraus.
   Zertifikatsablaufdatum prüfen lassen.
 - **Backup:** Inhalt und Konfiguration liegen im Repository. Auf dem Server sind nur
   `.env` und das Zertifikats-Volume; beide lassen sich neu erzeugen.
+- **Hostinger-VPS:** Dort gilt Folgendes abweichend:
+  - Den Traefik (`traefik:latest`) pflegt Hostinger. Dependabot aktualisiert ihn nicht,
+    und er kann sich ohne Pull Request ändern. Nach einem Update von Hostinger die
+    Prüfungen aus Schritt 10 der Einrichtung wiederholen. nginx-Versionen kommen weiter
+    über Dependabot (Image der Website).
+  - Monitoring auf `https://funkenundstahl.de/healthz` und das Ablaufdatum der
+    Zertifikate für `funkenundstahl.de` und `www.funkenundstahl.de`.
+  - Kein Zertifikats-Volume in `/opt/website`: Die Zertifikate liegen beim Traefik von
+    Hostinger. Auf dem Server gehört nur `.env` zum Stack, sie lässt sich nach
+    Schritt 6 neu anlegen.

@@ -11,7 +11,12 @@
 # and websecure (:443), certresolver letsencrypt, host network.
 # All router, service and middleware names start with "funkenundstahl-" so they never
 # collide with other apps on the same Traefik.
-name: website
+#
+# Project name: on a shared host, deploy.sh's `docker compose up --remove-orphans` only
+# touches containers of this project, so the name must be unique on the VPS (a generic
+# name like "website" could match another app's project). Requires Docker Engine >= 25
+# (healthcheck start_interval).
+name: funkenundstahl
 
 services:
   website:
@@ -28,9 +33,16 @@ services:
     # docker provider ignores a container until it is healthy, so without a faster first
     # check every deploy would answer 404 for about 30 s (image interval). start_interval
     # only applies during start_period; afterwards the image's 30 s interval holds.
+    # start_interval needs Docker Engine >= 25.
     healthcheck:
       start_period: 30s
       start_interval: 2s
+    # Container logs capped at 3 x 10 MB (Datenschutzerklärung: at most 30 MB per service).
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "3"
     # No published ports: Traefik runs in the host network and reaches the container
     # by its address on the network below.
     networks:
@@ -51,8 +63,10 @@ services:
       - traefik.http.routers.funkenundstahl-website.middlewares=funkenundstahl-hsts@docker
 
       # Second name (www) redirects permanently to DOMAIN, path and query included.
-      # noop@internal: the redirect answers before any backend is asked, so the
-      # redirect keeps working even while the website container is unhealthy.
+      # noop@internal: the redirect answers without asking a backend. It does not keep
+      # the redirect alive on its own: these labels sit on the website container, and
+      # Traefik's docker provider drops all of its routers (this one included) while the
+      # container is starting, unhealthy or stopped.
       - traefik.http.routers.funkenundstahl-www.rule=Host(`${REDIRECT_DOMAIN:?REDIRECT_DOMAIN fehlt in .env}`)
       - traefik.http.routers.funkenundstahl-www.entrypoints=websecure
       - traefik.http.routers.funkenundstahl-www.tls=true

@@ -24,9 +24,13 @@ Datei: [`.github/workflows/ci-cd.yml`](../.github/workflows/ci-cd.yml).
 - **Nur `main` wird deployt**, und erst, wenn die Variable `DEPLOY_ENABLED` auf `true`
   steht. Dann gilt `CHECK_LIVE=1`: Platzhalter im Impressum oder `example.org` brechen
   den Build ab, ein unvollständiges Impressum geht nie online.
-- **`DEPLOY_ENABLED` bis zum Aufbau von Live und Staging nicht setzen.** Auf dem Server
-  liegen noch kein `deploy.sh` und keine Website (`setup-server.sh` legt sie nicht mehr
-  an). Der Deploy-Job würde nach jedem Merge nach `main` fehlschlagen.
+- **`DEPLOY_ENABLED` erst setzen, wenn der Server bereit ist.** `setup-server.sh` legt
+  `deploy.sh` und die Website nicht an. Auf dem Hostinger-VPS richtet ihr `/opt/website`
+  von Hand ein ([`server.md`](server.md), „Variante Hostinger-VPS“); für den Oracle-Server
+  folgt das mit dem Aufbau von Live und Staging. Ohne fertigen Server würde der
+  Deploy-Job nach jedem Merge nach `main` fehlschlagen. Offen ist noch, wie das erste
+  Image entsteht: „Publish image“ läuft nur mit `DEPLOY_ENABLED=true`, und dann startet
+  auch der Deploy (siehe `server.md`, „Offene Entscheidung (erstes Image)“).
 - **Rollback statt Hoffnung.** Wird das neue Image auf dem Server nicht gesund, startet
   `deploy.sh` automatisch das vorige.
 
@@ -116,8 +120,9 @@ Repository privat, bleibt das Image privat, und der Server braucht einmal
 
 - **Automatisch:** `deploy.sh` startet das vorige Image, wenn das neue nicht gesund wird.
 - **Von Hand:** auf dem Server `sudo -u deploy /opt/website/deploy.sh
-  ghcr.io/<owner>/<repo>/website:sha-<älterer-commit>`. Achtung: `setup-server.sh`
-  richtet `/opt/website` nicht mehr ein. Pfad und Befehl werden mit dem Aufbau von Live
-  und Staging neu festgelegt; bis dahin gilt dieser Befehl nicht.
+  ghcr.io/<owner>/<repo>/website:sha-<älterer-commit>`. Das gilt für den Hostinger-VPS,
+  sobald `/opt/website` nach [`server.md`](server.md) („Variante Hostinger-VPS“)
+  eingerichtet ist. Für den Oracle-Server werden Pfad und Befehl mit dem Aufbau von Live
+  und Staging neu festgelegt.
 - **Sauber über Git:** den fehlerhaften Commit mit `git revert` rückgängig machen und als
   Pull Request durch die Pipeline schicken.
