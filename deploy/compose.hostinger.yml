@@ -1,0 +1,82 @@
+# Variant for a Hostinger VPS whose Traefik is managed by Hostinger (docs/server.md,
+# "Variante Hostinger-VPS"). That Traefik already owns ports 80 and 443 and reads its
+# routes from Docker labels, so this file only brings the website and its labels.
+# The own-Traefik variant (compose.yml + traefik/dynamic.yml) stays unchanged.
+#
+# Selected on the server with COMPOSE_FILE=compose.hostinger.yml in /opt/website/.env,
+# so deploy.sh keeps calling plain `docker compose`.
+#
+# Assumptions about the Hostinger Traefik (checked with docker inspect, see docs/server.md):
+# docker provider with exposedbydefault=false, entrypoints web (:80, redirects to https)
+# and websecure (:443), certresolver letsencrypt, host network.
+# All router, service and middleware names start with "funkenundstahl-" so they never
+# collide with other apps on the same Traefik.
+name: website
+
+services:
+  website:
+    image: ${WEBSITE_IMAGE:?WEBSITE_IMAGE fehlt in .env}
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # The test itself comes from the image (HEALTHCHECK in site/Dockerfile). Traefik's
+    # docker provider ignores a container until it is healthy, so without a faster first
+    # check every deploy would answer 404 for about 30 s (image interval). start_interval
+    # only applies during start_period; afterwards the image's 30 s interval holds.
+    healthcheck:
+      start_period: 30s
+      start_interval: 2s
+    # No published ports: Traefik runs in the host network and reaches the container
+    # by its address on the network below.
+    networks:
+      - web
+    labels:
+      - traefik.enable=true
+      # Traefik runs in the host network, so it must use the container's address on
+      # exactly this bridge network. Pinning it avoids guessing if a second network is
+      # ever attached.
+      - traefik.docker.network=funkenundstahl-web
+
+      # Main router: DOMAIN over HTTPS. HTTP -> HTTPS is done by the entrypoint "web".
+      - traefik.http.routers.funkenundstahl-website.rule=Host(`${DOMAIN:?DOMAIN fehlt in .env}`)
+      - traefik.http.routers.funkenundstahl-website.entrypoints=websecure
+      - traefik.http.routers.funkenundstahl-website.tls=true
+      - traefik.http.routers.funkenundstahl-website.tls.certresolver=letsencrypt
+      - traefik.http.routers.funkenundstahl-website.service=funkenundstahl-website
+      - traefik.http.routers.funkenundstahl-website.middlewares=funkenundstahl-hsts@docker
+
+      # Second name (www) redirects permanently to DOMAIN, path and query included.
+      # noop@internal: the redirect answers before any backend is asked, so the
+      # redirect keeps working even while the website container is unhealthy.
+      - traefik.http.routers.funkenundstahl-www.rule=Host(`${REDIRECT_DOMAIN:?REDIRECT_DOMAIN fehlt in .env}`)
+      - traefik.http.routers.funkenundstahl-www.entrypoints=websecure
+      - traefik.http.routers.funkenundstahl-www.tls=true
+      - traefik.http.routers.funkenundstahl-www.tls.certresolver=letsencrypt
+      - traefik.http.routers.funkenundstahl-www.service=noop@internal
+      - traefik.http.routers.funkenundstahl-www.middlewares=funkenundstahl-to-apex@docker
+
+      # Same values as traefik/dynamic.yml. All other security headers come from nginx
+      # in the image (tested in CI).
+      - traefik.http.middlewares.funkenundstahl-hsts.headers.stsSeconds=31536000
+      - traefik.http.middlewares.funkenundstahl-hsts.headers.stsIncludeSubdomains=false
+      - traefik.http.middlewares.funkenundstahl-hsts.headers.stsPreload=false
+      # $$ is a literal $ for Traefik (Compose would otherwise interpolate it).
+      - traefik.http.middlewares.funkenundstahl-to-apex.redirectregex.regex=^https?://[^/]+(.*)
+      - traefik.http.middlewares.funkenundstahl-to-apex.redirectregex.replacement=https://${DOMAIN:?DOMAIN fehlt in .env}$${1}
+      - traefik.http.middlewares.funkenundstahl-to-apex.redirectregex.permanent=true
+
+      # nginx in the image listens on 8080; health check as in traefik/dynamic.yml.
+      - traefik.http.services.funkenundstahl-website.loadbalancer.server.port=8080
+      - traefik.http.services.funkenundstahl-website.loadbalancer.healthcheck.path=/healthz
+      - traefik.http.services.funkenundstahl-website.loadbalancer.healthcheck.interval=10s
+      - traefik.http.services.funkenundstahl-website.loadbalancer.healthcheck.timeout=3s
+
+networks:
+  web:
+    # Fixed name so traefik.docker.network above does not depend on the project name.
+    name: funkenundstahl-web

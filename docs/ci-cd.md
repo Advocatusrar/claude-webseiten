@@ -90,7 +90,7 @@ Settings → Rules → Rulesets → New ruleset → New branch ruleset:
 
 | Variable         | Beispiel                     | Zweck                                         |
 | ---------------- | ---------------------------- | --------------------------------------------- |
-| `SITE_URL`       | `https://www.meine-domain.de` | Adresse für Canonical, Sitemap, JSON-LD      |
+| `SITE_URL`       | `https://funkenundstahl.de`  | Adresse für Canonical, Sitemap, JSON-LD; muss zu `DOMAIN` in `/opt/website/.env` passen (ohne `www`, das leitet weiter) |
 | `DEPLOY_HOST`    | `203.0.113.10`               | Server                                        |
 | `DEPLOY_USER`    | `deploy`                     | Benutzer auf dem Server                       |
 | `DEPLOY_ENABLED` | `true`                       | schaltet Veröffentlichen und Deploy ein; **erst nach dem Aufbau von Live und Staging setzen**, sonst schlägt der Deploy-Job fehl |
