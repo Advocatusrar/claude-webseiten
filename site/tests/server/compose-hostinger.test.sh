@@ -13,12 +13,15 @@
 #     (:443), certresolver letsencrypt (HTTP challenge, CA address unreachable, so nothing
 #     leaves the machine and Traefik serves its default certificate),
 #   - a stand-in for the app Hermes with router and service hermes-agent-fjbe,
+#   - a stand-in for another app in a compose project called "website" (a generic name
+#     another app on the VPS could use); deploy.sh's --remove-orphans must not touch it,
 #   - the website deployed with an unchanged copy of deploy/deploy.sh, selected by
 #     COMPOSE_FILE=compose.hostinger.yml in .env. A docker wrapper turns
 #     `docker compose pull` and `docker image prune` into no-ops (no registry, the host's
 #     images stay); every other call goes to the real docker.
 #   Requests go to 127.0.0.1 (curl --resolve, no proxy). Needs ports 80, 443 and
-#   LIVE_API_PORT free, no network funkenundstahl-web and no compose project "funkenundstahl".
+#   LIVE_API_PORT free, no network funkenundstahl-web and no compose projects
+#   "funkenundstahl" or "website".
 #   Everything started is removed at the end.
 #
 # Usage: bash site/tests/server/compose-hostinger.test.sh
@@ -63,6 +66,12 @@ HSTS_SECONDS=31536000
 WEB_NET=funkenundstahl-web
 # Compose project of compose.hostinger.yml (name: in the file).
 PROJECT=funkenundstahl
+# Project name of the stand-in for another app on the shared VPS (live part).
+FOREIGN_PROJECT=website
+# Container logs as promised in the Datenschutzerklärung: driver local, 3 x 10 MB.
+LOG_DRIVER=local
+LOG_MAX_SIZE=10m
+LOG_MAX_FILE=3
 # Local tag for the live deploy: deploy.sh only accepts ghcr.io references.
 LIVE_TAG=ghcr.io/compose-hostinger-test/website:live
 LIVE_PREFIX=cht-
@@ -300,6 +309,37 @@ t_hardening_equal() {
   b=$(jq -S "$HARDENING_FIELDS" "$WORK/B.json")
   [[ $a == "$b" ]] || no "website in compose.hostinger.yml differs from website in compose.yml:" \
     "$(diff <(echo "$a") <(echo "$b") | sed 's/^/  /')"
+  return $((1 - ok))
+}
+
+# --- project name and logs (review of 001da7a) ---
+
+# The project name decides what deploy.sh's --remove-orphans may remove. It must come
+# from the file, not from the directory: on the server the directory is /opt/website.
+t_project_name() {
+  local ok=1 s d
+  need_cfg B || return 1
+  s=$(jqc B '.name // ""')
+  [[ $s == "$PROJECT" ]] || no "project name '$s', expected '$PROJECT'"
+  mkdir -p "$WORK/opt"
+  d=$(mkdeploy opt/website) || return 1
+  envfile "$d" "${B_ENV[@]}"
+  resolve opt_website "$d"
+  need_cfg opt_website || return 1
+  s=$(jqc opt_website '.name // ""')
+  [[ $s == "$PROJECT" ]] || no "in a directory named website (like /opt/website): project name '$s', expected '$PROJECT'"
+  return $((1 - ok))
+}
+
+t_logging() {
+  local ok=1 s
+  need_cfg B || return 1
+  s=$(jqc B '.services.website.logging.driver // ""')
+  [[ $s == "$LOG_DRIVER" ]] || no "logging driver '$s', expected '$LOG_DRIVER'"
+  s=$(jqc B '.services.website.logging.options["max-size"] // "" | tostring')
+  [[ $s == "$LOG_MAX_SIZE" ]] || no "logging max-size '$s', expected '$LOG_MAX_SIZE'"
+  s=$(jqc B '.services.website.logging.options["max-file"] // "" | tostring')
+  [[ $s == "$LOG_MAX_FILE" ]] || no "logging max-file '$s', expected '$LOG_MAX_FILE'"
   return $((1 - ok))
 }
 
@@ -602,6 +642,8 @@ live_prereqs() { # sets LIVE_REASON if the live part cannot run
   docker network inspect "$WEB_NET" >/dev/null 2>&1 && { LIVE_REASON="network $WEB_NET exists already"; return 1; }
   [[ -z $(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT") ]] ||
     { LIVE_REASON="containers of a compose project '$PROJECT' exist already"; return 1; }
+  [[ -z $(docker ps -aq --filter "label=com.docker.compose.project=$FOREIGN_PROJECT") ]] ||
+    { LIVE_REASON="containers of a compose project '$FOREIGN_PROJECT' exist already"; return 1; }
   [[ -z $(docker ps -aq --filter "name=^${LIVE_PREFIX}") ]] ||
     { LIVE_REASON="containers named ${LIVE_PREFIX}* exist already"; return 1; }
   return 0
@@ -660,6 +702,19 @@ live_up() {
     --global.checknewversion=false --global.sendanonymoususage=false >/dev/null || return 1
   wait_for 30 api_has_router "$HERMES@docker" || { echo "Traefik did not pick up the Hermes stand-in"; return 1; }
 
+  # Another app on the VPS whose compose project has a generic name.
+  mkdir -p "$WORK/foreign"
+  cat >"$WORK/foreign/compose.yml" <<FOREIGN || return 1
+name: $FOREIGN_PROJECT
+services:
+  app:
+    image: $LIVE_STANDIN_IMAGE
+    pull_policy: never
+FOREIGN
+  dc "$WORK/foreign" up -d >/dev/null 2>&1 || { echo "could not start the stand-in project $FOREIGN_PROJECT"; return 1; }
+  dc "$WORK/foreign" ps -q app >"$WORK/foreign.id"
+  [[ -s $WORK/foreign.id ]] || { echo "stand-in project $FOREIGN_PROJECT has no container"; return 1; }
+
   # The server directory: an unchanged copy of deploy/, .env as in docs/server.md step 5.
   d=$(mkdeploy live) || return 1
   envfile "$d" "COMPOSE_FILE=compose.hostinger.yml" "DOMAIN=$T_DOMAIN" "REDIRECT_DOMAIN=$T_REDIRECT" \
@@ -691,6 +746,7 @@ WRAP
 live_down() {
   ((LIVE_STARTED)) || return 0
   [[ -d $WORK/live ]] && dc "$WORK/live" down --remove-orphans >/dev/null 2>&1
+  [[ -f $WORK/foreign/compose.yml ]] && dc "$WORK/foreign" down >/dev/null 2>&1
   docker rm -f "${LIVE_PREFIX}traefik" "${LIVE_PREFIX}hermes" >/dev/null 2>&1
   docker network rm "${LIVE_PREFIX}hermes-net" >/dev/null 2>&1
   docker image rm "$LIVE_TAG" >/dev/null 2>&1 # only the extra tag
@@ -698,6 +754,7 @@ live_down() {
     echo "WARNING: network $WEB_NET still exists after the live tests"
   fi
   if [[ -n $(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT") ||
+    -n $(docker ps -aq --filter "label=com.docker.compose.project=$FOREIGN_PROJECT") ||
     -n $(docker ps -aq --filter "name=^${LIVE_PREFIX}") ]]; then
     echo "WARNING: containers of the live tests are left over"
   fi
@@ -760,6 +817,33 @@ t_live_container() {
   [[ $s == unless-stopped ]] || no "RestartPolicy: $s"
   s=$(jq -r '.[0].HostConfig.Privileged' <<<"$j")
   [[ $s == false ]] || no "Privileged: $s"
+  return $((1 - ok))
+}
+
+t_live_foreign_project() {
+  local ok=1 id before now s
+  id=$(website_id)
+  [[ -n $id ]] || { no "no website container"; return 1; }
+  s=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' "$id")
+  [[ $s == "$PROJECT" ]] || no "website container belongs to project '$s', expected '$PROJECT'"
+  before=$(cat "$WORK/foreign.id" 2>/dev/null)
+  [[ -n $before ]] || { no "test setup: no container of the stand-in project recorded"; return 1; }
+  now=$(docker ps -q --no-trunc --filter "label=com.docker.compose.project=$FOREIGN_PROJECT" | tr '\n' ' ')
+  [[ $now == "$before " ]] ||
+    no "container of project $FOREIGN_PROJECT before the deploy: $before; running afterwards: '${now% }'" \
+      "(removed by deploy.sh's docker compose up --remove-orphans?)"
+  return $((1 - ok))
+}
+
+t_live_logging() {
+  local ok=1 id s
+  id=$(website_id)
+  [[ -n $id ]] || { no "no website container"; return 1; }
+  s=$(docker inspect --format '{{.HostConfig.LogConfig.Type}}' "$id")
+  [[ $s == "$LOG_DRIVER" ]] || no "log driver '$s', expected '$LOG_DRIVER'"
+  s=$(docker inspect --format '{{json .HostConfig.LogConfig.Config}}' "$id" | jq -c -S .)
+  [[ $s == "{\"max-file\":\"$LOG_MAX_FILE\",\"max-size\":\"$LOG_MAX_SIZE\"}" ]] ||
+    no "log options $s, expected max-file $LOG_MAX_FILE and max-size $LOG_MAX_SIZE only"
   return $((1 - ok))
 }
 
@@ -869,6 +953,8 @@ main() {
   check "variant B: read_only, tmpfs /tmp, no-new-privileges, cap_drop ALL, no cap_add, not privileged, restart unless-stopped" \
     t_hardening_values
   check "variant B: hardening of website identical to website in compose.yml" t_hardening_equal
+  check "variant B: compose project is '$PROJECT', also in a directory named website" t_project_name
+  check "variant B: logs with driver $LOG_DRIVER, max-size $LOG_MAX_SIZE, max-file $LOG_MAX_FILE" t_logging
 
   check "image is WEBSITE_IMAGE from .env (digest reference as written by deploy.sh)" t_image_from_env
   local v
@@ -905,13 +991,15 @@ main() {
     "live: unchanged deploy.sh deploys variant B selected by COMPOSE_FILE in .env, website healthy, no own Traefik"
     "live: .env after the deploy still has COMPOSE_FILE=compose.hostinger.yml and the new WEBSITE_IMAGE"
     "live: container without published ports, read-only, CapDrop ALL, no-new-privileges, tmpfs /tmp, restart unless-stopped"
+    "live: website runs in project $PROJECT, the container of another app's project '$FOREIGN_PROJECT' survives the deploy (--remove-orphans)"
+    "live: container logs with driver $LOG_DRIVER, max-size $LOG_MAX_SIZE, max-file $LOG_MAX_FILE"
     "live: container label redirectregex.replacement is exactly https://DOMAIN\${1}"
     "live: Traefik routers for DOMAIN and REDIRECT_DOMAIN enabled without errors (websecure, letsencrypt, prefixed), $HERMES unaffected, service -> container:8080 on $WEB_NET"
     "live: https://DOMAIN/ answers 200 with the website and Strict-Transport-Security: max-age=$HSTS_SECONDS"
     "live: https://REDIRECT_DOMAIN/<path>?<query> redirects permanently to https://DOMAIN/<path>?<query>, // stays on the site"
     "live: other host names get 404, the Hermes stand-in still answers 200"
   )
-  local live_fns=(t_live_deploy t_live_env_kept t_live_container t_live_replacement_label
+  local live_fns=(t_live_deploy t_live_env_kept t_live_container t_live_foreign_project t_live_logging t_live_replacement_label
     t_live_traefik_routers t_live_main t_live_redirect t_live_other_hosts)
   local i run_live=0
   if [[ $LIVE == 0 ]]; then
