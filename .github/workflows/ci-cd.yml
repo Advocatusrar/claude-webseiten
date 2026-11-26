@@ -5,7 +5,8 @@
 #
 # Only main is published or deployed, and main only accepts pull requests with green
 # checks (branch ruleset, see docs/ci-cd.md). Both stay off by default:
-#   PUBLISH_ENABLED = "true"  publish the tested image, do not deploy (first start by hand)
+#   PUBLISH_ENABLED = "true"  publish the tested image, do not deploy (optional pre-stage:
+#                             inspect a green publish run before deploy is switched on)
 #   DEPLOY_ENABLED  = "true"  publish and deploy (implies publishing)
 # With either one, the image is a release image: CHECK_LIVE=1 turns placeholders
 # (Impressum, example.org) into build errors, and SITE_URL must be set.
@@ -30,7 +31,7 @@ concurrency:
 env:
   LEFTHOOK: '0'
   # Keep in sync with the "if" of the publish job (the env context is not available there).
-  RELEASE: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && (vars.PUBLISH_ENABLED == 'true' || vars.DEPLOY_ENABLED == 'true') }}
+  RELEASE: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && github.actor != 'dependabot[bot]' && (vars.PUBLISH_ENABLED == 'true' || vars.DEPLOY_ENABLED == 'true') }}
   SITE_URL: ${{ vars.SITE_URL || 'https://www.example.org' }}
   IMAGE_TAR: /tmp/website-image.tar
   IMAGE_LOCAL: website:ci
@@ -150,8 +151,8 @@ jobs:
   publish:
     name: Publish image
     needs: [quality, e2e, scan]
-    # Same condition as RELEASE above. Never on pull requests (so never for Dependabot).
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && (vars.PUBLISH_ENABLED == 'true' || vars.DEPLOY_ENABLED == 'true')
+    # Same condition as RELEASE above (keep both in sync). Never on pull requests, never for Dependabot.
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && github.actor != 'dependabot[bot]' && (vars.PUBLISH_ENABLED == 'true' || vars.DEPLOY_ENABLED == 'true')
     runs-on: ubuntu-latest
     permissions:
       contents: read

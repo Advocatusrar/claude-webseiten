@@ -71,8 +71,8 @@ deutschsprachige Informationsquelle und ein Vergleichstest zu Feuerstahl
    `dist/` auftaucht, und Platzhalter). Erst pushen, wenn der Test grün ist.
 3. **Pull Request** gegen `main` öffnen. Die Pipeline prüft erneut, zusätzlich mit
    Browsertests und Sicherheitsscan (`docs/ci-cd.md`); nach dem Merge wird das getestete
-   Image auf den Server deployt. Beim Deploy gilt
-   `CHECK_LIVE=1`: Platzhalter wie `[Vorname Nachname]` oder `example.org` sind dann
+   Image veröffentlicht und deployt. Für jedes Release-Image (Veröffentlichen und Deploy)
+   gilt `CHECK_LIVE=1`: Platzhalter wie `[Vorname Nachname]` oder `example.org` sind dann
    Fehler und verhindern die Veröffentlichung.
 
 ## Artikel anlegen
