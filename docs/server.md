@@ -285,8 +285,9 @@ Erhalten bleibt:
   (`command="…",restrict`). Den privaten Teil als Secret `DEPLOY_SSH_KEY` in GitHub
   eintragen, `ssh-keyscan SERVER` als Secret `DEPLOY_KNOWN_HOSTS`, danach die lokale
   Datei löschen. `DEPLOY_ENABLED=true` erst danach setzen, auf dem Oracle-Server erst
-  nach dem Aufbau von Live und Staging, auf dem Hostinger-VPS nach Schritt 10 unter
-  „Erster Start nur über die Pipeline“ (siehe oben und [`ci-cd.md`](ci-cd.md)).
+  nach dem Aufbau von Live und Staging, auf dem Hostinger-VPS in Schritt 10.4
+  („Variante Hostinger-VPS“ → „Einrichten“ → „Erster Start über die Pipeline“) (siehe
+  oben und [`ci-cd.md`](ci-cd.md)).
 - **Tipp für den ersten Start:** In `.env` die Zeile `ACME_CA_SERVER=...staging...`
   aktivieren. Let's Encrypt begrenzt fehlgeschlagene Versuche; mit der Staging-CA lässt
   sich gefahrlos testen. Wenn alles läuft, die Zeile entfernen, das Zertifikats-Volume
@@ -482,12 +483,15 @@ vor und starten nichts; die Website startet erst mit Schritt 10 über die Pipeli
    COMPOSE_FILE=compose.hostinger.yml
    DOMAIN=funkenundstahl.de
    REDIRECT_DOMAIN=www.funkenundstahl.de
-   WEBSITE_IMAGE=ghcr.io/advocatusrar/claude-webseiten/website:latest
+   WEBSITE_IMAGE=ghcr.io/advocatusrar/claude-webseiten/website:noch-kein-deploy
    ```
 
    `ACME_EMAIL` und `ACME_CA_SERVER` entfallen. `WEBSITE_IMAGE` ist bis zum ersten
-   Deploy nur ein Platzhalter für die Prüfung in Schritt 7; `deploy.sh` setzt bei jedem
-   Deploy der Pipeline den Digest ein.
+   Deploy nur ein Platzhalter für die Prüfung in Schritt 7 (bewusst ein Tag, das es
+   nicht gibt, nicht `latest`); `deploy.sh` setzt bei jedem Deploy der Pipeline den
+   Digest ein. Scheitert der erste Deploy, gibt es kein früheres Image: Das Rollback von
+   `deploy.sh` kann nur auf diesen Platzhalter zurück, und die Website bleibt einfach
+   aus, bis ein späterer Deploy gelingt.
 
 7. **Konfiguration prüfen** (nur lesen, startet nichts), auf dem Server. Euer
    Admin-Benutzer kann `/opt/website` nicht betreten (Rechte 750, Besitzer `deploy`),
@@ -504,28 +508,68 @@ vor und starten nichts; die Website startet erst mit Schritt 10 über die Pipeli
    `funkenundstahl-www` mit euren Domains. Fehlt `DOMAIN`, `REDIRECT_DOMAIN` oder
    `WEBSITE_IMAGE`, bricht Compose mit „… fehlt in .env“ ab.
 
-8. **Bei privatem Paket** einmal anmelden (Token mit Recht `read:packages`):
-   `sudo -u deploy docker login ghcr.io`.
+8. **Als `deploy` bei GHCR anmelden** (Token „classic“ mit nur dem Recht
+   `read:packages`, in GitHub unter Settings → Developer settings → Personal access
+   tokens):
 
-9. **Deploy-Schlüssel für die CI eintragen**, wie unter „Website einrichten“ →
-   „Deploy-Schlüssel nur für die CI“ beschrieben (Schlüssel auf eurem Rechner erzeugen,
-   privaten Teil als Secret `DEPLOY_SSH_KEY`, `ssh-keyscan SERVER` als
-   `DEPLOY_KNOWN_HOSTS`). Auf dem Server eine Zeile in
-   `/home/deploy/.ssh/authorized_keys`, beschränkt auf `deploy.sh`:
-
-   ```text
-   command="/opt/website/deploy.sh",restrict ssh-ed25519 AAAA… github-deploy
+   ```sh
+   sudo -u deploy docker login ghcr.io -u <github-benutzer>
    ```
 
-   Den Befehl nicht von Hand testen, auch nicht mit diesem Schlüssel: jeder Aufruf ist
-   ein Deploy.
+   Das Repository ist privat, damit ist auch das Paket privat. Den Schritt nur
+   weglassen, wenn das Paket nachweislich öffentlich ist (Packages → `website` →
+   Package settings). Docker speichert das Token in `/home/deploy/.docker/config.json`.
+
+9. **Deploy-Schlüssel für die CI eintragen.** Die CI meldet sich als `DEPLOY_USER`
+   (`deploy`) bei `DEPLOY_HOST` an, mit dem privaten Schlüssel aus dem Secret
+   `DEPLOY_SSH_KEY`, und prüft den Server gegen das Secret `DEPLOY_KNOWN_HOSTS`
+   (`StrictHostKeyChecking=yes`). `setup-server.sh` im Profil `hostinger` hat `deploy`
+   (Gruppe `docker`) und eine leere `/home/deploy/.ssh/authorized_keys` (700/600)
+   schon angelegt.
+
+   Auf eurem Rechner ein eigenes Schlüsselpaar nur für die CI erzeugen und den
+   öffentlichen Teil hochladen:
+
+   ```sh
+   ssh-keygen -t ed25519 -f github-deploy -N '' -C github-deploy
+   ssh <admin>@SERVER 'mkdir -p -m 700 ~/website-upload'
+   scp github-deploy.pub <admin>@SERVER:website-upload/
+   ```
+
+   Auf dem Server die Zeile mit Forced Command anhängen (die CI darf damit nur
+   `deploy.sh` aufrufen) und die Rechte setzen:
+
+   ```sh
+   ssh-keygen -lf ~/website-upload/github-deploy.pub
+   sudo install -d -m 700 -o deploy -g deploy /home/deploy/.ssh
+   printf 'command="/opt/website/deploy.sh",restrict %s\n' "$(cat ~/website-upload/github-deploy.pub)" \
+     | sudo tee -a /home/deploy/.ssh/authorized_keys >/dev/null
+   sudo chown deploy:deploy /home/deploy/.ssh/authorized_keys
+   sudo chmod 600 /home/deploy/.ssh/authorized_keys
+   rm ~/website-upload/github-deploy.pub && rmdir ~/website-upload
+   sudo ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+   ```
+
+   Die erste Zeile muss einen ED25519-Schlüssel melden, sonst nicht weitermachen. Die
+   letzte zeigt den Fingerabdruck des Servers für den Abgleich unten.
+
+   In GitHub (Settings → Environments → `production` → Environment secrets):
+   - `DEPLOY_SSH_KEY`: der ganze Inhalt der Datei `github-deploy` (privater Teil, mit
+     den Zeilen `-----BEGIN …` und `-----END …`).
+   - `DEPLOY_KNOWN_HOSTS`: die Ausgabe von `ssh-keyscan -t ed25519 <IP des VPS>` auf
+     eurem Rechner. Vorher mit `ssh-keyscan -t ed25519 <IP des VPS> | ssh-keygen -lf -`
+     prüfen, dass der Fingerabdruck zu dem vom Server passt. Dieselbe IP kommt in die
+     Variable `DEPLOY_HOST` (Schritt 10.1).
+
+   Danach `github-deploy` und `github-deploy.pub` auf eurem Rechner löschen. Den
+   Schlüssel nicht von Hand testen: jeder Aufruf mit ihm ist ein Deploy.
 
 10. **Erster Start über die Pipeline**, in GitHub (Settings → Secrets and variables →
     Actions → Variables, und Settings → Environments):
     1. Variablen `SITE_URL=https://funkenundstahl.de`, `DEPLOY_HOST` (IP des VPS) und
        `DEPLOY_USER=deploy` setzen; `SITE_URL` geht beim Bauen ins Image.
-    2. Environment `production`: Secrets aus Schritt 9 und **Required reviewers**
-       eintragen, damit der Deploy auf eure Freigabe wartet.
+    2. Environment `production`: Secrets aus Schritt 9, **Required reviewers** (damit
+       der Deploy auf eure Freigabe wartet) und **Deployment branches: nur `main`**.
     3. Optional zuerst `PUBLISH_ENABLED=true` (sobald der Zweig `ci/publish-ohne-deploy`
        gemergt ist): Die Pipeline veröffentlicht dann nur das Image. Unter Packages →
        `website` prüfen, dass es da ist, und die Sichtbarkeit klären (Schritt 8).
@@ -536,7 +580,8 @@ vor und starten nichts; die Website startet erst mit Schritt 10 über die Pipeli
     6. Der Job „Deploy to production“ wartet auf Freigabe: in Actions den Lauf öffnen,
        „Review deployments“ → `production` → Approve. Danach ruft die CI `deploy.sh`
        mit dem Image-Digest auf (Gesundheitsprüfung, bei Fehler Rollback) und prüft
-       `SITE_URL/healthz`.
+       `SITE_URL/healthz`. Scheitert dieser erste Deploy, bleibt die Website aus (kein
+       früheres Image, siehe Schritt 6); Ursache beheben und einen neuen Lauf freigeben.
 
 11. **Prüfen** nach dem ersten Deploy, auf eurem Rechner. Mit GET (`-o /dev/null -D -`),
     nicht mit `curl -I`: Auf HEAD antwortet die Weiterleitung von Traefik mit `308` statt
@@ -562,18 +607,29 @@ vor und starten nichts; die Website startet erst mit Schritt 10 über die Pipeli
     aufrufen und mit `sudo docker ps` prüfen, dass sein Container weiterläuft.
 
 **Konfiguration ändern:** Änderungen an `compose.hostinger.yml` oder `deploy.sh` laufen
-wie Code über einen Pull Request. Danach Schritt 5 wiederholen (`.env` bleibt dabei
-erhalten) und Schritt 7 zur Prüfung; neue Variablen aus `.env.example` von Hand in
-`/opt/website/.env` nachtragen (`sudo -u deploy nano /opt/website/.env`). Keine Container
-von Hand neu starten: Geänderte Dateien und `.env` wirken mit dem nächsten Deploy der
-Pipeline (`deploy.sh` ruft `docker compose up -d` auf, und Compose erstellt den Container
-bei geänderter Konfiguration neu). Braucht eine Änderung sofort einen Neustart, einen
-Lauf auf `main` auslösen und freigeben wie in Schritt 10.
+wie Code über einen Pull Request. Der Merge startet einen Deploy, der auf eure Freigabe
+wartet. **Vor der Freigabe** Schritt 5 wiederholen (`.env` bleibt dabei erhalten) und
+Schritt 7 zur Prüfung, sonst läuft der Deploy noch mit dem alten `deploy.sh` und der
+alten Compose-Datei. Neue Variablen aus `.env.example` ebenfalls vor der Freigabe von
+Hand in `/opt/website/.env` nachtragen (`sudo -u deploy nano /opt/website/.env`). Erst
+dann freigeben. Keine Container von Hand neu starten: Geänderte Dateien und `.env`
+wirken mit dem Deploy der Pipeline (`deploy.sh` ruft `docker compose up -d` auf, und
+Compose erstellt den Container bei geänderter Konfiguration neu). Braucht eine Änderung
+ohne Merge einen Neustart, einen Lauf auf `main` auslösen und freigeben wie in
+Schritt 10.
 
 **Entfernen** (endgültiger Abbau, kein Teil des Betriebs, nur nach ausdrücklicher
-Entscheidung; vorher `DEPLOY_ENABLED` ausschalten):
-`sudo -u deploy sh -c 'cd /opt/website && docker compose down'` stoppt nur die Website und
-löscht das Netz `funkenundstahl-web`. Traefik nimmt die Routen von selbst heraus.
+Entscheidung):
+
+1. In GitHub `DEPLOY_ENABLED` (und `PUBLISH_ENABLED`, falls gesetzt) ausschalten und im
+   Environment `production` die Secrets `DEPLOY_SSH_KEY` und `DEPLOY_KNOWN_HOSTS`
+   löschen.
+2. Auf dem Server die Zeile mit `command="/opt/website/deploy.sh"` aus
+   `/home/deploy/.ssh/authorized_keys` entfernen, etwa mit
+   `sudo nano /home/deploy/.ssh/authorized_keys`, danach
+   `sudo -u deploy docker logout ghcr.io`.
+3. `sudo -u deploy sh -c 'cd /opt/website && docker compose down'` stoppt nur die Website
+   und löscht das Netz `funkenundstahl-web`. Traefik nimmt die Routen von selbst heraus.
 
 ## Laufender Betrieb
 
