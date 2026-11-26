@@ -18,8 +18,8 @@
 # group docker, empty authorized_keys).
 # Profile oracle: the ACCEPT rules go before the final REJECT of the Oracle image.
 # Profile hostinger: INPUT is open there (policy ACCEPT, no rules); the script adds
-# ACCEPT rules for loopback, replies, ICMP/ICMPv6, the DHCP client and tcp 22/80/443,
-# then a final REJECT (IPv4 and IPv6). It creates ADMIN_USER (group sudo) with
+# ACCEPT rules for loopback, replies, ICMP/ICMPv6, the DHCP client, the SSH port(s),
+# tcp 80/443 and the ports of docker-proxy, then a final REJECT (IPv4 and IPv6). It creates ADMIN_USER (group sudo) with
 # ADMIN_PUBKEY, and keeps root login with password only for the web console of
 # Hostinger (SSH from 169.254.0.1). An existing Docker installation is kept.
 # It does not set up the website; that follows with the layout for live and staging.
@@ -43,6 +43,9 @@
 #               ~ADMIN_USER/.ssh/authorized_keys (700/600) before sshd is reloaded.
 #               Only given at runtime, never stored in the repository.
 #   DRY_RUN=1   only print what would be done; changes nothing and needs no root.
+#   ONLY_SAVE_FIREWALL=1  profile hostinger only: save the rules of INPUT as they are now
+#               to /etc/iptables/rules.v4 and rules.v6 (like step 3) and do nothing else,
+#               e.g. after adding an own rule. Never use netfilter-persistent save there.
 #
 # It is idempotent: a second run changes nothing and does not fail.
 set -euo pipefail
@@ -51,6 +54,7 @@ PROFIL="${PROFIL:-oracle}"
 ADMIN_USER="${ADMIN_USER-}"
 ADMIN_PUBKEY="${ADMIN_PUBKEY-}"
 DRY_RUN="${DRY_RUN:-0}"
+ONLY_SAVE_FIREWALL="${ONLY_SAVE_FIREWALL:-0}"
 DEPLOY_USER=deploy
 CHANGES=0
 # Drop-in of this script; sshd reads it before 50-cloud-init.conf and the like (step 4).
@@ -246,6 +250,192 @@ fw_state() {
        END { printf "%s %d\n", p, f }' <<<"$rules"
 }
 
+# Number of the first rule in INPUT that turns other traffic away, empty if there is
+# none: a REJECT rule, or an unconditional DROP rule (comments do not count as a
+# condition); the same test as fw_state, see FINAL_RULE_AWK. No early exit in awk: with
+# pipefail, iptables could otherwise fail on a closed pipe.
+reject_pos() {
+  "$1" -S INPUT | awk "$FINAL_RULE_AWK"'
+      $1 == "-A" && !found { n++; if (final_rule($0)) { print n; found = 1 } }'
+}
+
+# rule_numbers TOOL RULE...: numbers of the rules in INPUT that equal RULE exactly.
+rule_numbers() {
+  local tool=$1
+  shift
+  "$tool" -S INPUT | awk -v want="-A INPUT $*" '$1 == "-A" { n++; if ($0 == want) print n }'
+}
+
+# Profile hostinger: the rules INPUT needs before its final REJECT, per family, as
+# iptables -S prints them (without "-A INPUT"), each with a name for the messages. One
+# rule per line, the name before the first "|".
+hostinger_rules() {
+  if [[ $1 == iptables ]]; then
+    cat <<'RULES'
+Loopback (lo)|-i lo -j ACCEPT
+Antworten auf eigene Verbindungen (RELATED,ESTABLISHED)|-m state --state RELATED,ESTABLISHED -j ACCEPT
+ICMP|-p icmp -j ACCEPT
+DHCP-Client (udp 67 -> 68)|-p udp -m udp --sport 67 --dport 68 -j ACCEPT
+RULES
+  else
+    cat <<'RULES'
+Loopback (lo)|-i lo -j ACCEPT
+Antworten auf eigene Verbindungen (RELATED,ESTABLISHED)|-m state --state RELATED,ESTABLISHED -j ACCEPT
+ICMPv6 (mit Neighbor Discovery)|-p ipv6-icmp -j ACCEPT
+DHCPv6-Client (udp 547 -> 546, link-local)|-s fe80::/10 -d fe80::/10 -p udp -m udp --sport 547 --dport 546 -j ACCEPT
+RULES
+  fi
+}
+# hostinger_reject TOOL: the final rule the profile hostinger appends.
+hostinger_reject() {
+  if [[ $1 == iptables ]]; then
+    echo "-j REJECT --reject-with icmp-port-unreachable"
+  else
+    echo "-j REJECT --reject-with icmp6-port-unreachable"
+  fi
+}
+# hostinger_ports: the ACCEPT rules for ports, one "NAME|RULE" per line: tcp for each
+# port sshd listens on (SSH_PORTS, from sshd -T), 80 and 443, and each port docker-proxy
+# listens on (DOCKER_PROXY_PORTS, from ss in the checks; see there).
+hostinger_ports() {
+  local port pp
+  for port in $(printf '%s\n' "${SSH_PORTS[@]}" 80 443 | awk '!seen[$0]++'); do
+    echo "Port $port|-p tcp -m state --state NEW -m tcp --dport $port -j ACCEPT"
+  done
+  for pp in "${DOCKER_PROXY_PORTS[@]}"; do
+    echo "Docker-Port ${pp%%/*} ${pp#*/} (docker-proxy)|-p ${pp%%/*} -m ${pp%%/*} --dport ${pp#*/} -j ACCEPT"
+  done
+}
+# hostinger_missing TOOL: names of the needed ACCEPT rules (hostinger_rules and
+# hostinger_ports) that are not in INPUT before the first REJECT; nothing if all are.
+# Without a REJECT rule a rule anywhere in INPUT counts.
+hostinger_missing() {
+  local tool=$1 desc spec pos n found missing=""
+  local -a rule
+  pos=$(reject_pos "$tool")
+  while IFS='|' read -r desc spec; do
+    [[ -n $desc ]] || continue
+    read -r -a rule <<<"$spec"
+    found=0
+    for n in $(rule_numbers "$tool" "${rule[@]}"); do
+      if [[ -z $pos ]] || ((n < pos)); then found=1; fi
+    done
+    ((found)) || missing+="${missing:+, }$desc"
+  done < <(
+    hostinger_rules "$tool"
+    hostinger_ports
+  )
+  printf '%s' "$missing"
+}
+# hostinger_final_pos TOOL: number of the last rule of INPUT if it turns all other
+# traffic away without a condition ("-j REJECT" with at most --reject-with, or
+# "-j DROP"; a comment does not count as a condition), else empty. Unlike reject_pos,
+# a REJECT with a condition (e.g. for one address) is not the end of INPUT here.
+hostinger_final_pos() {
+  "$1" -S INPUT | awk '
+    $1 == "-A" { n++; r = $0
+      gsub(/ -m comment --comment ("([^"\\]|\\.)*"|[^ "]+)/, "", r)
+      last = (r ~ /^-A INPUT -j REJECT( --reject-with [^ ]+)?$/ || r == "-A INPUT -j DROP") ? n : "" }
+    END { if (last != "") print last }'
+}
+
+# save_filter_input TOOL (profile hostinger): prints the rules file for TOOL: the table
+# filter with the policies of INPUT, FORWARD and OUTPUT as they are and the rules of
+# INPUT whose target is built in (ACCEPT, DROP, REJECT, RETURN, LOG). Jumps into other
+# chains (fail2ban's f2b-sshd, which fail2ban sets up again at its start) and every
+# other chain (Docker's FORWARD rules and DOCKER* chains, which Docker sets up at its
+# start) are left out, as are the other tables (nat). After the chain lines comes
+# "-F INPUT": netfilter-persistent loads the file with --noflush (systemd drop-in
+# NFP_DROPIN), so a load replaces only the rules of INPUT and leaves FORWARD, Docker's
+# chains and the table nat alone, at boot (before Docker and fail2ban start) as well as
+# at a restart of the service while Docker runs (e.g. by a package update of
+# netfilter-persistent). Counters are set to 0, so the file only changes with the rules.
+save_filter_input() {
+  local tool=$1
+  echo "# Managed by deploy/setup-server.sh (profile hostinger): table filter, rules of INPUT only."
+  echo "# Docker and fail2ban set up their own chains when they start. Loaded with --noflush"
+  echo "# (systemd drop-in of netfilter-persistent): -F INPUT replaces only INPUT."
+  echo "# Do not run netfilter-persistent save/reload/restart by hand (docs/server.md)."
+  "${tool}-save" -t filter | awk '
+    $1 == "*filter" { print; next }
+    $1 == ":INPUT" || $1 == ":FORWARD" || $1 == ":OUTPUT" { print $1, $2, "[0:0]"; next }
+    ($1 == "-A" || $1 == "COMMIT") && !flushed { print "-F INPUT"; flushed = 1 }
+    $1 == "-A" && $2 == "INPUT" {
+      t = ""
+      for (i = 3; i < NF; i++) if ($i == "-j") t = $(i + 1)
+      if (t == "ACCEPT" || t == "DROP" || t == "REJECT" || t == "RETURN" || t == "LOG") print
+      next
+    }
+    $1 == "COMMIT" { print }'
+}
+
+# docker_fw_sig TOOL (profile hostinger): the policy and rules of FORWARD and the
+# DOCKER* chains of the table filter, as TOOL -S prints them. Docker sets them up; a
+# package operation must not change them (e.g. "ufw-init stop" sets FORWARD to ACCEPT).
+docker_fw_sig() {
+  "$1" -S 2>/dev/null | grep -E '^-(P|A) FORWARD |^-N DOCKER|^-A DOCKER' || true
+}
+# Profile hostinger: netfilter-persistent loads the rules files with --noflush
+# (IPTABLES_RESTORE_NOFLUSH and IP6TABLES_RESTORE_NOFLUSH of its plugins, set as
+# environment of the service). Without it, every start, restart or reload of the
+# service (netfilter-persistent's postinst restarts it on each package upgrade) would
+# replace the whole table filter with the file and wipe Docker's chains while the
+# containers run. Only for loads through systemd; "netfilter-persistent reload" typed
+# in a shell does not get this environment (docs/server.md: never do that here).
+NFP_DROPIN=/etc/systemd/system/netfilter-persistent.service.d/10-noflush.conf
+NFP_DROPIN_CONTENT="# Managed by deploy/setup-server.sh (profile hostinger)
+# Load /etc/iptables/rules.v4 and rules.v6 without flushing the table filter first;
+# the files replace only INPUT (-F INPUT), Docker's chains stay.
+[Service]
+Environment=IPTABLES_RESTORE_NOFLUSH=yes IP6TABLES_RESTORE_NOFLUSH=yes"
+# hostinger_save_rules: writes NFP_DROPIN and the rules files (save_filter_input) if
+# their content differs. Each file is checked first with TOOL-restore --test (loads
+# nothing; only when it is to be written, so a second run only reads), must end INPUT
+# with a REJECT or DROP, and an existing file with other content is kept as
+# FILE.bak-DATE. Stops the script if anything fails.
+hostinger_save_rules() {
+  local fw_tool fw_file fw_rules fw_backup
+  if put "$NFP_DROPIN" 0644 <<<"$NFP_DROPIN_CONTENT"; then
+    run systemctl daemon-reload
+  fi
+  if dry || ! iptables -L INPUT -n >/dev/null 2>&1; then
+    info "[Testlauf] würde /etc/iptables/rules.v4 und rules.v6 schreiben (Modus 0640): Tabelle filter mit den Policies, -F INPUT und den Regeln von INPUT (ohne Sprünge in andere Ketten), ohne Docker-Ketten und ohne Tabelle nat. Vorher Prüfung mit iptables-restore --test bzw. ip6tables-restore --test; eine vorhandene Datei mit anderem Inhalt wird vorher als .bak-DATUM gesichert."
+    return 0
+  fi
+  for fw_tool in iptables ip6tables; do
+    if [[ $fw_tool == iptables ]]; then fw_file=/etc/iptables/rules.v4; else fw_file=/etc/iptables/rules.v6; fi
+    fw_rules=$(save_filter_input "$fw_tool") ||
+      { echo "Abbruch: ${fw_tool}-save -t filter ist gescheitert, die Regeln sind nicht gespeichert (sie gelten bis zum nächsten Neustart)." >&2; exit 1; }
+    if [[ -z "$(hostinger_final_pos "$fw_tool")" ]]; then
+      echo "Abbruch: $fw_tool: INPUT endet nicht mit einer abweisenden Regel (REJECT oder DROP ohne Bedingung), nichts gespeichert." >&2
+      exit 1
+    fi
+    if [[ ! -f $fw_file || "$(cat "$fw_file")" != "$fw_rules" ]]; then
+      "${fw_tool}-restore" --test <<<"$fw_rules" ||
+        { echo "Abbruch: ${fw_tool}-restore --test lehnt die zu speichernden Regeln ab, $fw_file bleibt unverändert." >&2; exit 1; }
+      if [[ -f $fw_file ]]; then
+        fw_backup="$fw_file.bak-$(date +%Y%m%d-%H%M%S)"
+        cp -p -- "$fw_file" "$fw_backup" ||
+          { echo "Abbruch: Sicherung $fw_backup ließ sich nicht anlegen, $fw_file bleibt unverändert." >&2; exit 1; }
+        info "Sicherung der bisherigen Datei: $fw_backup"
+      fi
+    fi
+    put "$fw_file" 0640 <<<"$fw_rules" || true
+  done
+}
+# ssh_ports: the ports sshd listens on (sshd -T, "port" lines), one per line; 22 if
+# sshd -T cannot be read (only in a dry run without root; a real run checks sshd -T).
+ssh_ports() {
+  local out
+  if out=$(sshd -T 2>/dev/null) && [[ -n "$(awk '$1 == "port"' <<<"$out")" ]]; then
+    awk '$1 == "port" { print $2 }' <<<"$out" | awk '!seen[$0]++'
+  else
+    echo 22
+  fi
+}
+SSH_PORTS=(22)
+DOCKER_PROXY_PORTS=()
+
 # ---------------------------------------------------------------------------
 # 0. Checks. Nothing is changed before all of them have passed, except the runtime
 #    directory /run/sshd (see below).
@@ -260,6 +450,33 @@ if hostinger; then
   [[ $EUID -eq 0 ]] || precondition_failed "Bitte als root ausführen (Web-Konsole im hPanel oder SSH als root): PROFIL=hostinger ADMIN_USER=name ADMIN_PUBKEY='ssh-ed25519 AAAA... kommentar' bash setup-server.sh"
 else
   [[ $EUID -eq 0 ]] || precondition_failed "Bitte mit sudo als root ausführen: sudo bash setup-server.sh"
+fi
+
+# ONLY_SAVE_FIREWALL=1 (profile hostinger): only save the current rules of INPUT, the
+# same way step 3 does (hostinger_save_rules), and stop. INPUT must end with an
+# unconditional REJECT or DROP and hold the rules step 3 needs before it.
+[[ $ONLY_SAVE_FIREWALL == 0 || $ONLY_SAVE_FIREWALL == 1 ]] || { echo "ONLY_SAVE_FIREWALL muss 0 oder 1 sein." >&2; exit 1; }
+if [[ $ONLY_SAVE_FIREWALL == 1 ]]; then
+  if ! hostinger; then
+    echo "Abbruch, nichts geändert: ONLY_SAVE_FIREWALL=1 gibt es nur im Profil hostinger." >&2
+    exit 1
+  fi
+  if [[ $EUID -ne 0 ]] || ! iptables -L INPUT -n >/dev/null 2>&1 || ! ip6tables -L INPUT -n >/dev/null 2>&1; then
+    echo "Abbruch, nichts geändert: iptables und ip6tables lassen sich nicht lesen (als root ausführen)." >&2
+    exit 1
+  fi
+  mapfile -t SSH_PORTS < <(ssh_ports)
+  for fw_tool in iptables ip6tables; do
+    fw_missing=$(hostinger_missing "$fw_tool")
+    if [[ -z "$(hostinger_final_pos "$fw_tool")" || -n $fw_missing ]]; then
+      echo "Abbruch, nichts geändert: $fw_tool: INPUT endet nicht mit REJECT oder DROP ohne Bedingung, oder davor fehlt: ${fw_missing:-nichts}. Prüfen mit: sudo $fw_tool -S INPUT" >&2
+      exit 1
+    fi
+  done
+  step "Firewall-Regeln speichern (nur INPUT, Tabelle filter)"
+  hostinger_save_rules
+  info "Fertig. Gespeichert wurden nur die Regeln von INPUT; Docker und fail2ban bleiben unberührt."
+  exit 0
 fi
 
 OS_ID=unknown OS_VERSION=unknown OS_CODENAME=""
@@ -391,6 +608,17 @@ check_admin_pubkey() {
   ADMIN_KEY_LINE="$type $blob${comment:+ $comment}"
   ADMIN_KEY_ID="$type $blob"
   ADMIN_KEY_FPR=$fpr
+}
+# admin_key_in FILE: true if FILE has ADMIN_KEY_ID as a key line of its own: not
+# commented out, the first two fields exactly the type and base64 part of ADMIN_PUBKEY.
+# A line with options in front (from=, command=, cert-authority, expiry-time, ...) does
+# not count: it restricts the key, so the key is added as a line of its own.
+admin_key_in() {
+  [[ -f $1 && -n $ADMIN_KEY_ID ]] || return 1
+  awk -v t="${ADMIN_KEY_ID%% *}" -v b="${ADMIN_KEY_ID#* }" '
+    /^[[:space:]]*#/ { next }
+    $1 == t && $2 == b { f = 1 }
+    END { exit !f }' "$1"
 }
 if hostinger; then
   check_admin_pubkey "$ADMIN_PUBKEY"
@@ -627,25 +855,51 @@ for fw_tool in iptables ip6tables; do
   fi
 done
 
-# Profile hostinger: services that listen on other ports than 22, 80 and 443 (not only
-# on loopback) are no longer reachable from outside once step 3 ends INPUT with REJECT.
-# Only a hint. docker-proxy is the exception: Docker forwards published ports (DNAT in
-# the table nat, then the chain FORWARD), they never pass INPUT.
+# Profile hostinger: SSH port(s), services that listen, ports of docker-proxy.
+# - SSH_PORTS: the ports from sshd -T; step 3 opens these (not a fixed 22). If ssh.socket
+#   (socket activation) or a running sshd listens on another port, a real run stops:
+#   the firewall would close the port SSH really uses.
+# - Services that listen on other ports than SSH_PORTS, 80 and 443 (not only on
+#   loopback) are no longer reachable from outside once step 3 ends INPUT with REJECT.
+#   Only a hint.
+# - docker-proxy: Docker forwards connections to a published port over IPv4 from
+#   outside with DNAT and the chain FORWARD, past INPUT. Connections over IPv6 to a
+#   port docker-proxy listens on with [::] (container without IPv6) and connections from
+#   containers to the server's own address (hairpin) reach docker-proxy itself, through
+#   INPUT. Step 3 therefore accepts each port docker-proxy listens on now
+#   (DOCKER_PROXY_PORTS) before the REJECT. Ports published later need the same: run
+#   the script again (docs/server.md).
+if hostinger; then
+  mapfile -t SSH_PORTS < <(ssh_ports)
+  sock_listen=$(systemctl show ssh.socket -p Listen --value 2>/dev/null) || sock_listen=""
+  bad_ssh=""
+  while read -r lst _; do
+    [[ -n $lst ]] || continue
+    port=${lst##*:}
+    [[ " ${SSH_PORTS[*]} " == *" $port "* ]] || bad_ssh+="${bad_ssh:+, }ssh.socket $lst"
+  done <<<"$sock_listen"
+fi
 if hostinger && command -v ss >/dev/null 2>&1; then
   blocked="" via_docker=""
   while read -r proto addr procs; do
     port=${addr##*:}
     host=${addr%:*}
+    if [[ $proto == tcp && $procs == *'"sshd"'* && " ${SSH_PORTS[*]} " != *" $port "* ]]; then
+      bad_ssh+="${bad_ssh:+, }sshd $addr"
+    fi
     case $host in 127.* | "[::1]" | "[::ffff:127."*) continue ;; esac
     if [[ $proto == tcp ]]; then
-      case $port in 22 | 80 | 443) continue ;; esac
+      case " ${SSH_PORTS[*]} 80 443 " in *" $port "*) continue ;; esac
     else
       # Replies to own requests (DNS, NTP) pass as ESTABLISHED; 68 and 546 are the
       # DHCP clients (allowed in step 3).
       case $port in 68 | 546) continue ;; esac
     fi
     if [[ $procs == *'"docker-proxy"'* ]]; then
-      [[ ", $via_docker, " == *", $proto/$port, "* ]] || via_docker+="${via_docker:+, }$proto/$port"
+      if [[ " ${DOCKER_PROXY_PORTS[*]} " != *" $proto/$port "* ]]; then
+        DOCKER_PROXY_PORTS+=("$proto/$port")
+        via_docker+="${via_docker:+, }$proto/$port"
+      fi
     else
       blocked+="${blocked:+, }$proto/$port ($addr${procs:+ $procs})"
     fi
@@ -656,10 +910,67 @@ if hostinger && command -v ss >/dev/null 2>&1; then
     } | sort -u
   )
   if [[ -n $via_docker ]]; then
-    info "Von Docker veröffentlichte Ports ($via_docker) laufen über DNAT und die Kette FORWARD, nicht über INPUT; Schritt 3 ändert für sie nichts."
+    info "Von Docker veröffentlichte Ports ($via_docker): über IPv4 von außen laufen sie über DNAT und die Kette FORWARD; über IPv6 und von Containern zur eigenen Adresse des Servers (Hairpin) nimmt docker-proxy sie über INPUT an. Schritt 3 erlaubt diese Ports deshalb in INPUT. Später veröffentlichte Ports: Skript erneut starten."
   fi
   if [[ -n $blocked ]]; then
-    warn "Diese Dienste lauschen auf weiteren Ports und sind nach Schritt 3 von außen nicht mehr erreichbar (INPUT endet mit REJECT, offen bleiben nur tcp 22, 80 und 443): $blocked"
+    warn "Diese Dienste lauschen auf weiteren Ports und sind nach Schritt 3 von außen nicht mehr erreichbar (INPUT endet mit REJECT, offen bleiben nur tcp ${SSH_PORTS[*]}, 80, 443 und die von Docker veröffentlichten Ports): $blocked"
+  fi
+fi
+if hostinger && [[ -n ${bad_ssh:-} ]]; then
+  precondition_failed "SSH lauscht auf einem Port, den sshd -T nicht nennt ($bad_ssh; sshd -T: Port ${SSH_PORTS[*]}). Die Firewall würde ihn schließen. Erst klären (sshd_config, ssh.socket), dann das Skript erneut starten."
+fi
+
+# Profile hostinger: restart policies of the running containers, read from Docker's
+# own files (DockerRootDir/containers/*/config.v2.json and hostconfig.json), without
+# the Docker API. After the automatic reboot at 04:00 (unattended-upgrades, when an
+# update needs it) Docker starts only containers with "always" or "unless-stopped".
+# Only a hint.
+if hostinger && command -v docker >/dev/null 2>&1; then
+  docker_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null) || docker_root=""
+  if [[ $docker_root == /* && -d $docker_root/containers ]]; then
+    no_restart=$(python3 -I -B - "$docker_root/containers" <<'PY' 2>/dev/null
+import glob, json, os, sys
+out = []
+for d in sorted(glob.glob(os.path.join(sys.argv[1], "*"))):
+    try:
+        cfg = json.load(open(os.path.join(d, "config.v2.json")))
+        host = json.load(open(os.path.join(d, "hostconfig.json")))
+    except (OSError, ValueError):
+        continue
+    if not cfg.get("State", {}).get("Running"):
+        continue
+    pol = (host.get("RestartPolicy") or {}).get("Name") or "no"
+    if pol not in ("always", "unless-stopped"):
+        out.append("%s (%s)" % (cfg.get("Name", "?").lstrip("/"), pol))
+print(", ".join(out))
+PY
+    ) || no_restart=""
+    if [[ -n $no_restart ]]; then
+      warn "Diese laufenden Container haben keine Neustart-Regel always oder unless-stopped und starten nach einem Neustart des Servers (automatisch um 04:00, wenn ein Update es verlangt) nicht von selbst wieder: $no_restart"
+    else
+      info "Container: alle laufenden haben die Neustart-Regel always oder unless-stopped (oder es laufen keine)."
+    fi
+  else
+    info "Neustart-Regeln der Container nicht ermittelbar (DockerRootDir unbekannt). Nach einem Neustart um 04:00 starten nur Container mit always oder unless-stopped wieder: sudo docker inspect -f '{{.Name}} {{.HostConfig.RestartPolicy.Name}}' \$(sudo docker ps -q)"
+  fi
+fi
+
+# Profile hostinger: where the script runs from. Started over SSH as root from another
+# address than the web console, the next login as root from there fails once sshd is
+# reloaded; the running session stays. Recommended: run it in the web console. The
+# journal shows whether the web console has logged in as root before (only a hint).
+if hostinger && [[ -n ${SSH_CONNECTION:-} && ${SSH_CONNECTION%% *} != "$CONSOLE_ADDR" ]]; then
+  warn "################################################################"
+  warn "Du bist per SSH von ${SSH_CONNECTION%% *} verbunden, nicht über die Web-Konsole des hPanels ($CONSOLE_ADDR). Nach dem Lauf kommt root von dort nicht mehr herein (diese Sitzung bleibt bestehen). Empfehlung: das Skript in der Web-Konsole starten und sie offen lassen, bis der Login als $ADMIN_USER und sudo -v geklappt haben."
+  warn "################################################################"
+fi
+if hostinger && command -v journalctl >/dev/null 2>&1; then
+  console_logins=$(timeout 20 journalctl -q --no-pager --since "-30 days" -t sshd -t sshd-session 2>/dev/null |
+    grep -c "Accepted password for root from $CONSOLE_ADDR " || true)
+  if [[ ${console_logins:-0} =~ ^[1-9][0-9]*$ ]]; then
+    info "Journal: In den letzten 30 Tagen hat sich root ${console_logins}-mal mit Passwort von $CONSOLE_ADDR angemeldet (Web-Konsole)."
+  else
+    info "Journal: Keine Anmeldung von root mit Passwort von $CONSOLE_ADDR gefunden. Vor dem Lauf prüfen, dass die Web-Konsole im hPanel funktioniert; sie ist danach der einzige Weg für root."
   fi
 fi
 
@@ -740,6 +1051,7 @@ if "hosts" in cfg:
     notes.append("Es gibt einen hosts-Eintrag. Docker soll nicht über TCP erreichbar sein.")
 for n in notes:
     print("NOTE " + n)
+print("LR " + ("true" if cfg.get("live-restore") is True else "false"))
 print("---")
 if cfg == before and text.strip():
     sys.stdout.write(text.rstrip("\n") + "\n")
@@ -751,13 +1063,14 @@ PY
 # the file changed and dockerd runs. Stops the script before any change if the file is
 # no valid JSON object or dockerd --validate rejects the result.
 docker_daemon_hostinger() {
-  local out merged notes rc=0 backup line
+  local out merged notes rc=0 backup line want_lr swarm
   out=$(python3 -I -B -c "$DAEMON_MERGE_PY" "$DAEMON_JSON") || rc=$?
   if ((rc != 0)); then
     echo "Abbruch: $(sed -n 's/^ERROR //p' <<<"$out" | head -n 1) $DAEMON_JSON bleibt, wie es ist; Docker wurde nicht angefasst." >&2
     exit 1
   fi
   notes=$(sed -n '/^---$/q; s/^NOTE //p' <<<"$out")
+  want_lr=$(sed -n '/^---$/q; s/^LR //p' <<<"$out")
   merged=$(sed '0,/^---$/d' <<<"$out")
   while IFS= read -r line; do
     [[ -n $line ]] && warn "$DAEMON_JSON: $line"
@@ -785,11 +1098,14 @@ docker_daemon_hostinger() {
     # SIGHUP: dockerd rereads daemon.json; live-restore takes effect, running
     # containers are not touched.
     run systemctl reload docker
-    if ! dry && command -v docker >/dev/null 2>&1; then
+    # The reload must have switched live-restore on (unless daemon.json says false on
+    # purpose); otherwise stop before the package updates.
+    if ! dry && [[ $want_lr == true ]]; then
       if [[ "$(docker info --format '{{.LiveRestoreEnabled}}' 2>/dev/null)" == true ]]; then
         info "live-restore ist aktiv (docker info): Container laufen bei einem Neustart von Docker weiter."
       else
-        warn "live-restore ist laut docker info nicht aktiv. Ein Neustart von Docker (auch durch ein Paket-Update) würde alle Container stoppen. Prüfen: sudo docker info | grep -i 'live restore'"
+        echo "Abbruch: live-restore ist nach systemctl reload docker laut docker info nicht aktiv. $DAEMON_JSON ist geschrieben (Sicherung daneben), Docker läuft weiter wie bisher; Paket-Updates wurden noch nicht eingespielt. Prüfen: sudo docker info | grep -i 'live restore' und sudo journalctl -u docker -n 50; danach das Skript erneut starten." >&2
+        exit 1
       fi
     fi
   fi
@@ -798,6 +1114,15 @@ docker_daemon_hostinger() {
 DOCKER_DAEMON_DONE=0
 if hostinger && command -v docker >/dev/null 2>&1; then
   step "Docker: live-restore vor den Updates (ohne Neustart von Docker)"
+  # live-restore does not cover Swarm services; this script is not written for a
+  # Swarm node. Read only.
+  swarm=$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null) || swarm=""
+  case $swarm in
+    active | pending | locked | error)
+      echo "Abbruch: Docker ist Teil eines Swarm (docker info: Swarm $swarm). live-restore schützt Swarm-Dienste nicht, und dieses Skript ist dafür nicht geschrieben. Nichts an Docker geändert." >&2
+      exit 1
+      ;;
+  esac
   docker_daemon_hostinger
   DOCKER_DAEMON_DONE=1
 fi
@@ -831,6 +1156,13 @@ fi
 # its input, so they stay as they are (e.g. chains Docker set up meanwhile). Used only if fw_after_packages finds INPUT changed. Only taken if
 # fw_state could read INPUT before; without a copy a change still stops the script.
 FW_SAVED_V4="" FW_SAVED_V6=""
+# Profile hostinger: FORWARD and Docker's chains before the packages (docker_fw_sig);
+# fw_after_packages restores the table filter if they changed.
+FW_DOCKER_V4="" FW_DOCKER_V6=""
+if hostinger && ! dry; then
+  FW_DOCKER_V4=$(docker_fw_sig iptables)
+  FW_DOCKER_V6=$(docker_fw_sig ip6tables)
+fi
 if ! dry; then
   for fw_tool in iptables ip6tables; do
     if [[ $fw_tool == iptables ]]; then fw_before=$FW_BEFORE_V4; else fw_before=$FW_BEFORE_V6; fi
@@ -844,15 +1176,47 @@ if ! dry; then
     fi
   done
 fi
+# Profile hostinger: Docker's packages stay at their installed version during this
+# script's apt runs. An update of docker-ce or containerd.io restarts dockerd, and
+# live-restore only carries containers across patch releases of Docker. Instead of
+# apt-mark hold (a lasting change that would have to be undone, also after an abort),
+# apt-get gets a preferences file of this run (Dir::Etc::Preferences, in the temporary
+# directory, removed on exit) that pins each installed Docker package to its installed
+# version with priority 1001. /etc/apt/preferences, if there is one, is copied in
+# first; /etc/apt/preferences.d is read as usual. Nothing outside this run changes.
+# Docker updates are left to the operator (docs/server.md).
+APT_HOLD=()
+DOCKER_HELD=()
+if hostinger; then
+  for pkg in docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras; do
+    if pkg_installed "$pkg"; then DOCKER_HELD+=("$pkg"); fi
+  done
+fi
+if ((${#DOCKER_HELD[@]} > 0)); then
+  if dry; then
+    APT_HOLD=(-o "Dir::Etc::Preferences=<TMPDIR>/apt-preferences")
+  else
+    ensure_tmp_dir
+    apt_pref="$TMP_DIR/apt-preferences"
+    {
+      if [[ -f /etc/apt/preferences ]]; then cat /etc/apt/preferences && echo; fi
+      for pkg in "${DOCKER_HELD[@]}"; do
+        printf 'Package: %s\nPin: version %s\nPin-Priority: 1001\n\n' "$pkg" "$(dpkg-query -W -f='${Version}' "$pkg")"
+      done
+    } >"$apt_pref" || { echo "Abbruch: Die Pin-Datei für die Docker-Pakete ließ sich nicht schreiben, keine Paket-Updates eingespielt." >&2; exit 1; }
+    APT_HOLD=(-o "Dir::Etc::Preferences=$apt_pref")
+  fi
+  info "Docker-Pakete bleiben in diesem Lauf auf ihrer installierten Version (${DOCKER_HELD[*]}). Updates von Docker spielst du selbst ein, in einem Wartungsfenster (docs/server.md)."
+fi
 run apt-get update -q
 # full-upgrade: on a fresh server also take updates that add or remove packages
 # (e.g. a new kernel package). Not interactive, see APT_OPTS.
-run apt-get "${APT_OPTS[@]}" full-upgrade
+run apt-get "${APT_OPTS[@]}" "${APT_HOLD[@]}" full-upgrade
 APT_PKGS=(ca-certificates curl gnupg unattended-upgrades
   fail2ban iptables iptables-persistent netfilter-persistent)
 # Profile hostinger: ADMIN_USER gets its root rights through the group sudo.
 if hostinger; then APT_PKGS+=(sudo); fi
-run apt-get "${APT_OPTS[@]}" install "${APT_PKGS[@]}"
+run apt-get "${APT_OPTS[@]}" "${APT_HOLD[@]}" install "${APT_PKGS[@]}"
 
 # apt removes ufw for iptables-persistent (see the checks); the prerm of ufw calls
 # "ufw-init stop", which can flush INPUT and set its policy to ACCEPT. Compare with the
@@ -861,7 +1225,7 @@ run apt-get "${APT_OPTS[@]}" install "${APT_PKGS[@]}"
 # fw_deviation TOOL BEFORE: prints how INPUT of TOOL differs from BEFORE (output of
 # fw_state before the packages) in a way that opens the server, nothing if it does not.
 fw_deviation() {
-  local tool=$1 before=$2 now p0 f0 p1="" f1="" what=""
+  local tool=$1 before=$2 now p0 f0 p1="" f1="" what="" sig_before
   read -r p0 f0 <<<"$before"
   if now=$(fw_state "$tool"); then
     read -r p1 f1 <<<"$now"
@@ -869,6 +1233,12 @@ fw_deviation() {
     if [[ $p0 == DROP && $p1 == ACCEPT ]]; then what="${what:+$what; }die Policy von INPUT ist von DROP auf ACCEPT gewechselt"; fi
   else
     what="INPUT lässt sich nicht mehr lesen"
+  fi
+  if hostinger; then
+    if [[ $tool == iptables ]]; then sig_before=$FW_DOCKER_V4; else sig_before=$FW_DOCKER_V6; fi
+    if [[ "$(docker_fw_sig "$tool")" != "$sig_before" ]]; then
+      what="${what:+$what; }FORWARD oder die Docker-Ketten der Tabelle filter haben sich verändert"
+    fi
   fi
   printf '%s' "$what"
 }
@@ -927,6 +1297,19 @@ else
 fi
 
 step "Automatische Updates mit Neustart um 04:00"
+# Profile hostinger: needrestart (Ubuntu's default config already leaves docker alone,
+# qr(^docker)) must not restart containerd either after an update; a restart of
+# containerd or dockerd would stop or disturb the containers. Its own file in
+# /etc/needrestart/conf.d, which needrestart.conf reads in name order.
+if hostinger && { pkg_installed needrestart || [[ -d /etc/needrestart ]]; }; then
+  put /etc/needrestart/conf.d/50-setup-server-docker.conf 0644 <<'CONF' || true
+# Managed by deploy/setup-server.sh (profile hostinger)
+# Never restart Docker or containerd automatically after updates; the containers
+# (Traefik of Hostinger and others) would stop.
+$nrconf{override_rc}{qr(^docker)} = 0;
+$nrconf{override_rc}{qr(^containerd)} = 0;
+CONF
+fi
 put /etc/apt/apt.conf.d/20auto-upgrades 0644 <<'CONF' || true
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
@@ -965,12 +1348,17 @@ CONF
 # discovery and router advertisements need; without them IPv6 stops working), the DHCP
 # client (as in ufw's before.rules: udp 67 -> 68, and for DHCPv6 udp 547 -> 546 between
 # link-local addresses; replies to a DHCPv6 request sent to a multicast address are not
-# seen as ESTABLISHED), tcp 22, 80 and 443, and as the last rule a REJECT. The REJECT
-# is appended only after every ACCEPT rule is in place. The policy stays ACCEPT.
-# FORWARD, the DOCKER* chains and the table nat stay untouched: ports that Docker
-# publishes (e.g. 0.0.0.0:32768 of another container) are forwarded with DNAT and
-# FORWARD and never pass INPUT, so they stay reachable; they can only be restricted in
-# the chain DOCKER-USER, which this script leaves alone. Traefik of Hostinger (host
+# seen as ESTABLISHED), tcp for the port(s) sshd listens on (SSH_PORTS from sshd -T),
+# 80 and 443, the ports docker-proxy listens on (DOCKER_PROXY_PORTS, see the checks),
+# and as the last rule a REJECT. The REJECT is appended only after every ACCEPT rule is
+# in place, and only an unconditional REJECT or DROP as the last rule counts as the end
+# of INPUT. The policy stays ACCEPT.
+# FORWARD, the DOCKER* chains and the table nat stay untouched. Ports that Docker
+# publishes (e.g. 0.0.0.0:32768 of another container) reach the container from outside
+# over IPv4 with DNAT and FORWARD, past INPUT; they can only be restricted in the chain
+# DOCKER-USER, which this script leaves alone. Over IPv6 (docker-proxy on [::]) and
+# from containers to the server's own address (hairpin) they go through docker-proxy
+# and INPUT, hence the ACCEPT rules for DOCKER_PROXY_PORTS. Traefik of Hostinger (host
 # network, 80 and 443) passes INPUT and is covered by the rules for 80 and 443. Its
 # connections to containers leave through OUTPUT; the replies come in over docker0 or
 # br-* and pass as RELATED,ESTABLISHED. Connections that containers open to the host
@@ -981,30 +1369,16 @@ CONF
 # not affected. A service of the host that containers need gets its own rule before
 # the REJECT (interface and port), see docs/server.md.
 # Saved: only the table filter with the policies and the INPUT rules whose target is a
-# built-in one (see save_filter_input), not with netfilter-persistent save: that would
-# also save Docker's chains and nat rules with the container addresses of today, which
-# would come back at boot before Docker sets up its own.
+# built-in one (save_filter_input, hostinger_save_rules), loaded with --noflush
+# (NFP_DROPIN). Not with netfilter-persistent save: that would also save Docker's
+# chains and nat rules with the container addresses of today, which would come back at
+# boot before Docker sets up its own.
 # The hPanel of Hostinger has its own firewall in front of the server as well.
 
 step "Firewall: Ports 22, 80 und 443"
 FW_CHANGED=0
 DRY_SHIFT=0
 
-# Number of the first rule in INPUT that turns other traffic away, empty if there is
-# none: a REJECT rule, or an unconditional DROP rule (comments do not count as a
-# condition); the same test as fw_state, see FINAL_RULE_AWK. No early exit in awk: with
-# pipefail, iptables could otherwise fail on a closed pipe.
-reject_pos() {
-  "$1" -S INPUT | awk "$FINAL_RULE_AWK"'
-      $1 == "-A" && !found { n++; if (final_rule($0)) { print n; found = 1 } }'
-}
-
-# rule_numbers TOOL RULE...: numbers of the rules in INPUT that equal RULE exactly.
-rule_numbers() {
-  local tool=$1
-  shift
-  "$tool" -S INPUT | awk -v want="-A INPUT $*" '$1 == "-A" { n++; if ($0 == want) print n }'
-}
 
 # ensure_accept TOOL DESC RULE...: make sure the ACCEPT rule RULE (as iptables -S
 # prints it, without "-A INPUT") sits in INPUT before the REJECT rule (or the
@@ -1084,62 +1458,14 @@ open_ports() {
   fi
 }
 
-# Profile hostinger: the rules INPUT needs before its final REJECT, per family, as
-# iptables -S prints them (without "-A INPUT"), each with a name for the messages. One
-# rule per line, the name before the first "|".
-hostinger_rules() {
-  if [[ $1 == iptables ]]; then
-    cat <<'RULES'
-Loopback (lo)|-i lo -j ACCEPT
-Antworten auf eigene Verbindungen (RELATED,ESTABLISHED)|-m state --state RELATED,ESTABLISHED -j ACCEPT
-ICMP|-p icmp -j ACCEPT
-DHCP-Client (udp 67 -> 68)|-p udp -m udp --sport 67 --dport 68 -j ACCEPT
-RULES
-  else
-    cat <<'RULES'
-Loopback (lo)|-i lo -j ACCEPT
-Antworten auf eigene Verbindungen (RELATED,ESTABLISHED)|-m state --state RELATED,ESTABLISHED -j ACCEPT
-ICMPv6 (mit Neighbor Discovery)|-p ipv6-icmp -j ACCEPT
-DHCPv6-Client (udp 547 -> 546, link-local)|-s fe80::/10 -d fe80::/10 -p udp -m udp --sport 547 --dport 546 -j ACCEPT
-RULES
-  fi
-}
-# hostinger_reject TOOL: the final rule the profile hostinger appends.
-hostinger_reject() {
-  if [[ $1 == iptables ]]; then
-    echo "-j REJECT --reject-with icmp-port-unreachable"
-  else
-    echo "-j REJECT --reject-with icmp6-port-unreachable"
-  fi
-}
-# hostinger_missing TOOL: names of the needed ACCEPT rules (hostinger_rules and tcp
-# 22/80/443) that are not in INPUT before the first REJECT; nothing if all are. Without
-# a REJECT rule a rule anywhere in INPUT counts.
-hostinger_missing() {
-  local tool=$1 desc spec pos n found missing="" port
-  local -a rule
-  pos=$(reject_pos "$tool")
-  while IFS='|' read -r desc spec; do
-    [[ -n $desc ]] || continue
-    read -r -a rule <<<"$spec"
-    found=0
-    for n in $(rule_numbers "$tool" "${rule[@]}"); do
-      if [[ -z $pos ]] || ((n < pos)); then found=1; fi
-    done
-    ((found)) || missing+="${missing:+, }$desc"
-  done < <(
-    hostinger_rules "$tool"
-    for port in 22 80 443; do echo "Port $port|-p tcp -m state --state NEW -m tcp --dport $port -j ACCEPT"; done
-  )
-  printf '%s' "$missing"
-}
-# close_input TOOL (profile hostinger): append the missing ACCEPT rules (ensure_accept,
-# allow_port), then the final REJECT, unless INPUT has a REJECT or unconditional DROP
-# rule already (then the ACCEPT rules go before it, as on Oracle). Only inserts and
+# close_input TOOL (profile hostinger): append the missing ACCEPT rules (ensure_accept;
+# hostinger_rules, then hostinger_ports), then the final REJECT, unless the last rule
+# of INPUT is an unconditional REJECT or DROP already (hostinger_final_pos; new ACCEPT
+# rules go before the first REJECT, as on Oracle). Only inserts and
 # appends, never deletes. Before the REJECT is appended, every ACCEPT rule must be
 # there (hostinger_missing), otherwise the script stops without appending it.
 close_input() {
-  local tool=$1 desc spec port missing final
+  local tool=$1 desc spec missing final
   local -a rule
   DRY_SHIFT=0
   while IFS='|' read -r desc spec; do
@@ -1147,9 +1473,15 @@ close_input() {
     read -r -a rule <<<"$spec"
     ensure_accept "$tool" "$desc" "${rule[@]}"
   done < <(hostinger_rules "$tool")
-  for port in 22 80 443; do allow_port "$tool" "$port"; done
-  if [[ -n "$(reject_pos "$tool")" ]]; then
-    info "$tool: INPUT endet schon mit einer abweisenden Regel (REJECT oder DROP, Regel $(reject_pos "$tool"))"
+  while IFS='|' read -r desc spec; do
+    [[ -n $desc ]] || continue
+    read -r -a rule <<<"$spec"
+    ensure_accept "$tool" "$desc" "${rule[@]}"
+  done < <(hostinger_ports)
+  # Only an unconditional REJECT or DROP as the last rule closes INPUT
+  # (hostinger_final_pos); a REJECT with a condition somewhere does not.
+  if [[ -n "$(hostinger_final_pos "$tool")" ]]; then
+    info "$tool: INPUT endet schon mit einer abweisenden Regel ohne Bedingung (REJECT oder DROP, Regel $(hostinger_final_pos "$tool"))"
   else
     read -r -a final <<<"$(hostinger_reject "$tool")"
     if ! dry; then
@@ -1169,37 +1501,14 @@ close_input() {
       echo "Abbruch: $tool: Vor der abweisenden Regel in INPUT fehlen: $missing. Prüfen mit: sudo $tool -L INPUT --line-numbers -n" >&2
       exit 1
     fi
-    info "in Ordnung: $tool: vor der abweisenden Regel in INPUT stehen $(hostinger_rules "$tool" | cut -d'|' -f1 | paste -sd, - | sed 's/,/, /g'), tcp 22, 80 und 443"
+    info "in Ordnung: $tool: vor der abweisenden Regel in INPUT stehen $({ hostinger_rules "$tool"; hostinger_ports; } | cut -d'|' -f1 | paste -sd, - | sed 's/,/, /g')"
   fi
 }
 
-# save_filter_input TOOL (profile hostinger): prints the rules file for TOOL: the table
-# filter with the policies of INPUT, FORWARD and OUTPUT as they are and the rules of
-# INPUT whose target is built in (ACCEPT, DROP, REJECT, RETURN, LOG). Jumps into other
-# chains (fail2ban's f2b-sshd, which fail2ban sets up again at its start) and every
-# other chain (Docker's FORWARD rules and DOCKER* chains, which Docker sets up at its
-# start) are left out, as are the other tables (nat): at boot netfilter-persistent
-# loads this file before Docker and fail2ban start, and TOOL-restore replaces only the
-# table filter. Counters are set to 0, so the file only changes with the rules.
-save_filter_input() {
-  local tool=$1
-  echo "# Managed by deploy/setup-server.sh (profile hostinger): table filter, rules of INPUT only."
-  echo "# Docker and fail2ban set up their own chains when they start."
-  "${tool}-save" -t filter | awk '
-    $1 == "*filter" { print; next }
-    $1 == ":INPUT" || $1 == ":FORWARD" || $1 == ":OUTPUT" { print $1, $2, "[0:0]"; next }
-    $1 == "-A" && $2 == "INPUT" {
-      t = ""
-      for (i = 3; i < NF; i++) if ($i == "-j") t = $(i + 1)
-      if (t == "ACCEPT" || t == "DROP" || t == "REJECT" || t == "RETURN" || t == "LOG") print
-      next
-    }
-    $1 == "COMMIT" { print }'
-}
 
 if ! iptables -L INPUT -n >/dev/null 2>&1; then
   if dry && hostinger; then
-    info "[Testlauf] iptables nicht lesbar (kein root). Ein echter Lauf hängt an INPUT (IPv4 und IPv6) an, was fehlt: ACCEPT für Loopback, RELATED,ESTABLISHED, ICMP bzw. ICMPv6, den DHCP-Client, tcp 22, 80 und 443, danach REJECT."
+    info "[Testlauf] iptables nicht lesbar (kein root). Ein echter Lauf hängt an INPUT (IPv4 und IPv6) an, was fehlt: ACCEPT für Loopback, RELATED,ESTABLISHED, ICMP bzw. ICMPv6, den DHCP-Client, tcp ${SSH_PORTS[*]}, 80 und 443 und die Ports von docker-proxy, danach REJECT."
   elif dry; then
     info "[Testlauf] iptables nicht lesbar (kein root). Ein echter Lauf ermittelt die REJECT- oder abschließende DROP-Regel in INPUT und fügt davor ACCEPT für tcp 22, 80, 443 ein, falls sie fehlen."
   else
@@ -1225,35 +1534,7 @@ else
 fi
 
 if hostinger; then
-  # Written on every run if the content differs (put), checked first with TOOL-restore
-  # --test, which loads nothing. An earlier rules file (e.g. from netfilter-persistent
-  # save) is replaced by this one, after a copy FILE.bak-DATE.
-  if dry || ! iptables -L INPUT -n >/dev/null 2>&1; then
-    info "[Testlauf] würde /etc/iptables/rules.v4 und rules.v6 schreiben (Modus 0640): Tabelle filter mit den Policies und den Regeln von INPUT (ohne Sprünge in andere Ketten), ohne Docker-Ketten und ohne Tabelle nat. Vorher Prüfung mit iptables-restore --test bzw. ip6tables-restore --test; eine vorhandene Datei mit anderem Inhalt wird vorher als .bak-DATUM gesichert."
-  else
-    for fw_tool in iptables ip6tables; do
-      if [[ $fw_tool == iptables ]]; then fw_file=/etc/iptables/rules.v4; else fw_file=/etc/iptables/rules.v6; fi
-      fw_rules=$(save_filter_input "$fw_tool") ||
-        { echo "Abbruch: ${fw_tool}-save -t filter ist gescheitert, die Regeln sind nicht gespeichert (sie gelten bis zum nächsten Neustart)." >&2; exit 1; }
-      if ! grep -qE -- "^-A INPUT .*-j (REJECT|DROP)( |$)" <<<"$fw_rules"; then
-        echo "Abbruch: $fw_tool: Die zu speichernden Regeln enthalten keine abweisende Regel in INPUT, nichts gespeichert." >&2
-        exit 1
-      fi
-      # Checked only when the file is to be written (a second run only reads). An
-      # existing file with other content is kept as FILE.bak-DATE first.
-      if [[ ! -f $fw_file || "$(cat "$fw_file")" != "$fw_rules" ]]; then
-        "${fw_tool}-restore" --test <<<"$fw_rules" ||
-          { echo "Abbruch: ${fw_tool}-restore --test lehnt die zu speichernden Regeln ab, $fw_file bleibt unverändert." >&2; exit 1; }
-        if [[ -f $fw_file ]]; then
-          fw_backup="$fw_file.bak-$(date +%Y%m%d-%H%M%S)"
-          cp -p -- "$fw_file" "$fw_backup" ||
-            { echo "Abbruch: Sicherung $fw_backup ließ sich nicht anlegen, $fw_file bleibt unverändert." >&2; exit 1; }
-          info "Sicherung der bisherigen Datei: $fw_backup"
-        fi
-      fi
-      put "$fw_file" 0640 <<<"$fw_rules" || true
-    done
-  fi
+  hostinger_save_rules
 elif [[ $FW_CHANGED == 1 ]]; then
   # Save only after a change, so a second run does not write the rules file again.
   # On a fresh server this runs before Docker and fail2ban add their own chains.
@@ -1332,7 +1613,7 @@ elif hostinger; then
     local path=$1 mode=$2 cur
     cur=$(stat -c '%U:%G %a' "$path")
     if [[ $cur != "$ADMIN_USER:$ADMIN_GROUP ${mode#0}" ]]; then
-      run chown "$ADMIN_USER:$ADMIN_GROUP" "$path"
+      run chown -h "$ADMIN_USER:$ADMIN_GROUP" "$path"
       run chmod "$mode" "$path"
       changed
     fi
@@ -1344,26 +1625,28 @@ elif hostinger; then
     changed
   fi
   key_present=0
-  if [[ -f $ADMIN_AUTH_KEYS ]] && awk -v t="${ADMIN_KEY_ID%% *}" -v b="${ADMIN_KEY_ID#* }" '
-      { for (i = 1; i < NF; i++) if ($i == t && $(i + 1) == b) f = 1 }
-      END { exit !f }' "$ADMIN_AUTH_KEYS"; then
-    key_present=1
-  fi
+  if admin_key_in "$ADMIN_AUTH_KEYS"; then key_present=1; fi
   if ((key_present)); then
     info "unverändert: Schlüssel $ADMIN_KEY_FPR steht in $ADMIN_AUTH_KEYS"
     fix_owner_mode "$ADMIN_AUTH_KEYS" 0600
   elif dry; then
-    info "[Testlauf] würde $ADMIN_AUTH_KEYS ${ADMIN_KEY_FPR:+um den Schlüssel $ADMIN_KEY_FPR }ergänzen (Besitzer $ADMIN_USER:$ADMIN_GROUP, Modus 600, Verzeichnis 700):"
-    printf '      | %s\n' "$ADMIN_KEY_LINE"
+    # Only the fingerprint, never the key itself.
+    info "[Testlauf] würde $ADMIN_AUTH_KEYS um den Schlüssel $ADMIN_KEY_FPR (${ADMIN_KEY_ID%% *}) ergänzen (Besitzer $ADMIN_USER:$ADMIN_GROUP, Modus 600, Verzeichnis 700)"
     changed
   else
+    # ~/.ssh belongs to the user. The new file is created by mktemp in that directory
+    # (O_EXCL, mode 600, owned by root, so it cannot be a link planted beforehand),
+    # written, handed over with chown -h and moved onto authorized_keys with mv -T
+    # after checking again that neither ~/.ssh nor authorized_keys is a symlink.
     old_keys=""
     if [[ -f $ADMIN_AUTH_KEYS ]]; then old_keys=$(cat "$ADMIN_AUTH_KEYS"); fi
-    tmp="$ADMIN_AUTH_KEYS.tmp.$$"
-    if ! { if [[ -n $old_keys ]]; then printf '%s\n' "$old_keys"; fi; printf '%s\n' "$ADMIN_KEY_LINE"; } >"$tmp" ||
-      ! chown "$ADMIN_USER:$ADMIN_GROUP" "$tmp" || ! chmod 600 "$tmp" || ! mv -f "$tmp" "$ADMIN_AUTH_KEYS"; then
-      rm -f -- "$tmp"
-      echo "Abbruch: $ADMIN_AUTH_KEYS ließ sich nicht schreiben. SSH wurde nicht geändert." >&2
+    tmp=""
+    if [[ -L $ADMIN_SSH || ! -d $ADMIN_SSH ]] || ! tmp=$(mktemp "$ADMIN_SSH/.authorized_keys.XXXXXX") ||
+      ! { if [[ -n $old_keys ]]; then printf '%s\n' "$old_keys"; fi; printf '%s\n' "$ADMIN_KEY_LINE"; } >"$tmp" ||
+      ! chown -h "$ADMIN_USER:$ADMIN_GROUP" "$tmp" || ! chmod 600 "$tmp" ||
+      [[ -L $ADMIN_SSH || -L $ADMIN_AUTH_KEYS ]] || ! mv -fT -- "$tmp" "$ADMIN_AUTH_KEYS"; then
+      [[ -z $tmp ]] || rm -f -- "$tmp"
+      echo "Abbruch: $ADMIN_AUTH_KEYS ließ sich nicht sicher schreiben (Verzeichnis oder Datei ein symbolischer Link, oder ein Schreibfehler). SSH wurde nicht geändert." >&2
       exit 1
     fi
     info "Schlüssel $ADMIN_KEY_FPR in $ADMIN_AUTH_KEYS eingetragen"
@@ -1550,7 +1833,7 @@ sshd_expect() {
 #     operator sets one; without PAM sshd refuses a locked account even with a key).
 # ADMIN_USER from the internet is checked like on Oracle (check_sshd_effective).
 check_sshd_hostinger() {
-  local eff pat spec
+  local eff pat spec methods
   eff=$(sshd -T -C "$SSHD_ROOT_PUBLIC_SPEC" 2>/dev/null) ||
     sshd_check_failed "sshd -T -C $SSHD_ROOT_PUBLIC_SPEC meldet einen Fehler." error
   sshd_expect "sshd -T -C $SSHD_ROOT_PUBLIC_SPEC" "$eff" "permitrootlogin no" \
@@ -1566,6 +1849,12 @@ check_sshd_hostinger() {
     sshd_check_failed "sshd -T -C $SSHD_ROOT_CONSOLE_SPEC meldet einen Fehler." error
   sshd_expect "sshd -T -C $SSHD_ROOT_CONSOLE_SPEC" "$eff" "permitrootlogin yes" \
     "passwordauthentication yes" "allowusers root@$CONSOLE_ADDR"
+  # AuthenticationMethods must allow the password alone: "any", or a list that is
+  # exactly "password".
+  methods=$(awk '$1 == "authenticationmethods" { $1 = ""; sub(/^ +/, ""); print; exit }' <<<"$eff")
+  if [[ $methods != any && " $methods " != *" password "* ]]; then
+    sshd_check_failed "AuthenticationMethods erlaubt root von der Web-Konsole keine Anmeldung nur mit Passwort (laut sshd -T -C $SSHD_ROOT_CONSOLE_SPEC: ${methods:-kein Eintrag}). Dateien mit AuthenticationMethods: $(sshd_candidates authenticationmethods)."
+  fi
   eff=$(sshd -T -C "$SSHD_DEPLOY_SPEC" 2>/dev/null) ||
     sshd_check_failed "sshd -T -C $SSHD_DEPLOY_SPEC meldet einen Fehler." error
   sshd_expect "sshd -T -C $SSHD_DEPLOY_SPEC" "$eff" "passwordauthentication no" \
@@ -1640,10 +1929,7 @@ if ! dry; then
     check_sshd_hostinger
     # Do not lock yourself out: the key of ADMIN_USER must be in place before sshd is
     # reloaded (step 4a wrote it; checked again here, on every run).
-    if [[ $(key_file_state "$ADMIN_AUTH_KEYS") != yes ]] ||
-      ! awk -v t="${ADMIN_KEY_ID%% *}" -v b="${ADMIN_KEY_ID#* }" '
-          { for (i = 1; i < NF; i++) if ($i == t && $(i + 1) == b) f = 1 }
-          END { exit !f }' "$ADMIN_AUTH_KEYS"; then
+    if [[ $(key_file_state "$ADMIN_AUTH_KEYS") != yes ]] || ! admin_key_in "$ADMIN_AUTH_KEYS"; then
       sshd_check_failed "Der Schlüssel aus ADMIN_PUBKEY steht nicht in $ADMIN_AUTH_KEYS. Ohne ihn wäre $ADMIN_USER ausgesperrt."
     fi
     if [[ "$(stat -c '%U %a' "$ADMIN_HOME/.ssh" "$ADMIN_AUTH_KEYS" | tr '\n' ' ')" != "$ADMIN_USER 700 $ADMIN_USER 600 " ]]; then
@@ -1658,6 +1944,24 @@ else
   info "[Testlauf] sshd -t, danach Prüfung mit sshd -T und sshd -T -C $SSHD_TEST_SPEC (bei jedem echten Lauf, auch wenn $SSHD_CONF unverändert bleibt): AllowUsers enthält $ADMIN_USER, PasswordAuthentication, KbdInteractiveAuthentication, PermitRootLogin, GSSAPIAuthentication und HostbasedAuthentication sind no, PubkeyAuthentication ist yes, AuthenticationMethods ist any oder hat eine Liste nur mit publickey, DenyUsers, AllowGroups und DenyGroups schließen $ADMIN_USER nicht aus (sonst Abbruch); für $DEPLOY_USER mit sshd -T und sshd -T -C $SSHD_DEPLOY_SPEC nur als Warnung: AllowUsers enthält $DEPLOY_USER, DenyUsers, AllowGroups und DenyGroups schließen $DEPLOY_USER nicht aus, PubkeyAuthentication ist yes, AuthenticationMethods ist any oder hat eine Liste nur mit publickey (die leere authorized_keys von $DEPLOY_USER wird nicht geprüft)"
   if hostinger; then
     info "[Testlauf] Profil hostinger, zusätzlich (sonst Abbruch und $SSHD_CONF zurückgesetzt): sshd -T -C $SSHD_ROOT_PUBLIC_SPEC: PermitRootLogin, PasswordAuthentication und KbdInteractiveAuthentication no, AllowUsers lässt root von dort nicht herein; sshd -T -C $SSHD_ROOT_CONSOLE_SPEC: PermitRootLogin yes, PasswordAuthentication yes, AllowUsers root@$CONSOLE_ADDR; sshd -T -C $SSHD_DEPLOY_SPEC: PasswordAuthentication und KbdInteractiveAuthentication no, PubkeyAuthentication yes; sshd -T -C $SSHD_ADMIN_CONSOLE_SPEC und $SSHD_DEPLOY_CONSOLE_SPEC: ebenso nur Schlüssel (die Ausnahme gilt nur für root); sshd -T -C $SSHD_TEST_SPEC: UsePAM yes; der Schlüssel aus ADMIN_PUBKEY steht in $ADMIN_AUTH_KEYS (Besitzer $ADMIN_USER, ~/.ssh 700, Datei 600), bevor SSH neu geladen wird"
+  fi
+fi
+# Profile hostinger: before sshd is reloaded (root then only via the web console),
+# ADMIN_USER must have a password, so that sudo works as a second way to root. With a
+# terminal the script runs passwd; without one it stops and puts the drop-in back.
+if [[ $SSHD_CHANGED == 1 ]] && hostinger; then
+  if dry; then
+    info "[Testlauf] Vor dem Neuladen von SSH verlangt ein echter Lauf ein Passwort für $ADMIN_USER (passwd -S: P). Fehlt es, fragt er mit passwd danach (nur im Terminal), sonst bricht er ab und setzt $SSHD_CONF zurück."
+  else
+    pw_state=$(passwd -S "$ADMIN_USER" 2>/dev/null | awk '{ print $2 }') || pw_state=""
+    if [[ $pw_state != P && -t 0 ]]; then
+      info "Für $ADMIN_USER ist noch kein Passwort gesetzt (für sudo). Bitte jetzt eingeben:"
+      passwd "$ADMIN_USER" || true
+      pw_state=$(passwd -S "$ADMIN_USER" 2>/dev/null | awk '{ print $2 }') || pw_state=""
+    fi
+    if [[ $pw_state != P ]]; then
+      sshd_check_failed "Für $ADMIN_USER ist kein Passwort gesetzt (passwd -S: ${pw_state:-unbekannt}). Ohne Passwort klappt sudo nicht, und root käme nach dem Neuladen nur noch über die Web-Konsole herein. Als root ausführen: passwd $ADMIN_USER, danach das Skript erneut starten (der Benutzer und sein Schlüssel bleiben)."
+    fi
   fi
 fi
 if [[ $SSHD_CHANGED == 1 ]] && hostinger; then
@@ -1727,11 +2031,14 @@ fi
 # internet is exempted. Logins from there are still logged (journal, auth.log) and are
 # limited by the hPanel login. 127.0.0.1/8 and ::1 are fail2ban's usual entries
 # (commented out in jail.conf); ignoreself stays on.
+F2B_PORT=ssh
+# Profile hostinger: the ports sshd -T names, if that is not just 22 (ssh).
+if hostinger && [[ "${SSH_PORTS[*]}" != 22 ]]; then F2B_PORT=$(IFS=,; echo "${SSH_PORTS[*]}"); fi
 JAIL_LOCAL="# Managed by deploy/setup-server.sh
 [sshd]
 enabled = true
 backend = systemd
-port = ssh
+port = $F2B_PORT
 maxretry = 5
 findtime = 10m
 bantime = 10m"
@@ -2251,13 +2558,15 @@ TEXT
   fi
   if [[ $UFW_INACTIVE == 1 ]] && dry; then
     info "ufw: Ein echter Lauf entfernt das inaktive ufw (apt, mit der Installation von iptables-persistent; gewollt). Firewall sind danach die iptables-Regeln (/etc/iptables/rules.v4, rules.v6) und die Firewall im hPanel."
-  elif [[ $UFW_INACTIVE == 1 ]]; then
+  elif [[ $UFW_INACTIVE == 1 ]] && ! pkg_installed ufw; then
     info "ufw: apt hat das inaktive ufw mit der Installation von iptables-persistent entfernt (gewollt). Firewall sind jetzt die iptables-Regeln (/etc/iptables/rules.v4, rules.v6) und die Firewall im hPanel."
+  elif [[ $UFW_INACTIVE == 1 ]]; then
+    warn "ufw ist laut dpkg noch installiert, obwohl apt es mit iptables-persistent hätte entfernen sollen. Prüfen: dpkg -l ufw iptables-persistent. ufw nicht aktivieren."
   fi
   cat <<TEXT
 
-Abnahme: bitte prüfen und das Ergebnis melden. Die Web-Konsole im hPanel bleibt
-dabei offen, bis Punkt 3 geklappt hat.
+Abnahme: bitte prüfen und das Ergebnis melden. Die Web-Konsole im hPanel, in der
+du gerade bist, bleibt offen, bis Punkt 4 (sudo -v) und Punkt 7 geklappt haben.
 
 Auf deinem eigenen Rechner (<ip> = öffentliche IP des Servers):
 1. Login in einem zweiten Fenster: ssh $ADMIN_USER@<ip>
@@ -2267,24 +2576,28 @@ Auf deinem eigenen Rechner (<ip> = öffentliche IP des Servers):
 3. ssh root@<ip>
    Erwartung: "Permission denied", kein Login als root aus dem Internet.
 
-Auf dem Server (als $ADMIN_USER, nach "passwd $ADMIN_USER" als root):
+Auf dem Server (in der Sitzung aus Punkt 1, als $ADMIN_USER):
 4. sudo -v
    Erwartung: fragt nach dem Passwort von $ADMIN_USER und klappt.
 5. sudo fail2ban-client status sshd
    Erwartung: Jail sshd mit "Currently failed" und "Currently banned".
 6. sudo iptables -S INPUT; sudo ip6tables -S INPUT
    Erwartung: ACCEPT für lo, RELATED,ESTABLISHED, ICMP bzw. ICMPv6, DHCP-Client,
-   tcp 22, 80 und 443, als letzte Regel REJECT.
+   tcp ${SSH_PORTS[*]}, 80 und 443 und die Ports von docker-proxy, als letzte Regel REJECT.
 
 Im hPanel:
-7. Web-Konsole (Browser-Terminal) neu öffnen.
-   Erwartung: Login als root klappt wie vorher.
+7. Eine ZWEITE Web-Konsole (Browser-Terminal) öffnen, die erste noch nicht schließen.
+   Erwartung: Login als root klappt wie vorher. Erst dann die erste schließen.
 
 Auf deinem eigenen Rechner:
 8. curl -I http://<ip> und curl -I http://<ip>:32768
    Erwartung: Antworten von Traefik bzw. der anderen App wie vor dem Lauf.
    Ein Timeout auf 80 heißt: eine Firewall blockt Port 80, auf dem Server
    oder in der Firewall im hPanel.
+
+Firewall-Regeln später ändern: eigene Regel vor das REJECT einfügen und mit
+PROFIL=hostinger ONLY_SAVE_FIREWALL=1 bash setup-server.sh speichern. Nie
+netfilter-persistent save, reload oder restart von Hand aufrufen.
 TEXT
   exit 0
 fi

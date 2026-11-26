@@ -277,13 +277,13 @@ veröffentlichten Port `0.0.0.0:32768`).
 
 ### Ausgangslage und was das Profil anders macht
 
-| Thema           | Hostinger vorher                                                         | Nach dem Skript                                                                                                                                         |
-| --------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Anmeldung       | nur root (Web-Konsole im hPanel oder SSH), root mit Passwort             | `ADMIN_USER` mit Schlüssel (Gruppe `sudo`), `deploy` für die CI, root nur noch von der Web-Konsole (`169.254.0.1`) mit Passwort                         |
-| SSH             | `PermitRootLogin yes`, `PasswordAuthentication yes`                      | global `PermitRootLogin no`, `PasswordAuthentication no`, `KbdInteractiveAuthentication no`; Ausnahme `Match User root Address 169.254.0.1`             |
-| Firewall        | `INPUT` offen (Policy `ACCEPT`, keine Regeln, IPv4 und IPv6), UFW inaktiv | `INPUT` endet mit `REJECT`; davor nur Loopback, Antworten, ICMP/ICMPv6, DHCP-Client, TCP 22, 80, 443; UFW entfernt                                      |
-| fail2ban        | nicht eingerichtet                                                       | wie bei Oracle, zusätzlich `ignoreip = 127.0.0.1/8 ::1 169.254.0.1`                                                                                     |
-| Docker          | installiert, läuft                                                       | bleibt installiert und läuft weiter; `daemon.json` ergänzt (`live-restore`, Log-Grenzen), **kein** Neustart von Docker                                  |
+| Thema     | Hostinger vorher                                                          | Nach dem Skript                                                                                                                       |
+| --------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| Anmeldung | nur root (Web-Konsole im hPanel oder SSH), root mit Passwort              | `ADMIN_USER` mit Schlüssel und sudo-Passwort, `deploy` für die CI, root nur noch von der Web-Konsole (`169.254.0.1`) mit Passwort     |
+| SSH       | `PermitRootLogin yes`, `PasswordAuthentication yes`                       | global `PermitRootLogin no`, `PasswordAuthentication no`, `KbdInteractiveAuthentication no`; Ausnahme `Match User root Address 169.254.0.1` |
+| Firewall  | `INPUT` offen (Policy `ACCEPT`, keine Regeln, IPv4 und IPv6), UFW inaktiv | `INPUT` endet mit `REJECT`; davor Loopback, Antworten, ICMP/ICMPv6, DHCP-Client, SSH-Port, 80, 443, Ports von docker-proxy; UFW entfernt |
+| fail2ban  | nicht eingerichtet                                                        | wie bei Oracle, zusätzlich `ignoreip = 127.0.0.1/8 ::1 169.254.0.1`                                                                   |
+| Docker    | installiert, läuft                                                        | läuft weiter, wird nie neu gestartet und in den apt-Läufen des Skripts nicht aktualisiert; `daemon.json` ergänzt (`live-restore`, Log-Grenzen) |
 
 Alles andere (Updates mit Neustart um 04:00, Aufbewahrung der Protokolle, Benutzer
 `deploy`, die Prüfungen gegen das Aussperren, `DRY_RUN=1`) ist wie im Profil `oracle`.
@@ -300,13 +300,20 @@ Alles andere (Updates mit Neustart um 04:00, Aufbewahrung der Protokolle, Benutz
   `-nistp521`, `ssh-rsa` ab 2048 Bit. Abgelehnt: private Schlüssel, mehrere Zeilen,
   Steuerzeichen, Optionen vor dem Schlüssel (`command=`, `from=`, `restrict` …), andere
   Typen, alles, was `ssh-keygen -l` nicht als öffentlichen Schlüssel genau dieses Typs
-  erkennt. Der Schlüssel erscheint in keiner Fehlermeldung, nur sein Fingerabdruck.
+  erkennt. Der Schlüssel erscheint in keiner Ausgabe, auch nicht im Testlauf, nur sein
+  Fingerabdruck.
+- `ONLY_SAVE_FIREWALL=1` (optional, später): speichert nur die Regeln von `INPUT`
+  (siehe „Firewall-Regeln ändern“) und tut sonst nichts.
 
-**sudo mit Passwort.** Das Skript legt `ADMIN_USER` ohne Passwort an und trägt kein
-`NOPASSWD` ein. Ihr setzt das Passwort selbst als root mit `passwd ADMIN_USER`; das
-Skript zeigt den Schritt am Ende an, solange keines gesetzt ist. Die Anmeldung mit dem
-Schlüssel klappt auch ohne Passwort (das Skript prüft, dass sshd `UsePAM yes` verwendet),
-nur `sudo` nicht. Ein gestohlener Schlüssel allein gibt so noch keine Root-Rechte.
+**sudo mit Passwort, Pflicht vor dem Neuladen von SSH.** Das Skript legt `ADMIN_USER`
+ohne Passwort an und trägt kein `NOPASSWD` ein. Bevor es sshd neu lädt (danach kommt
+root nur noch über die Web-Konsole herein), verlangt es ein Passwort für `ADMIN_USER`
+(`passwd -S` zeigt `P`), damit `sudo` ein zweiter Weg zu root ist. Läuft das Skript in
+einem Terminal (Web-Konsole), fragt es mit `passwd` danach. Ohne Terminal bricht es ab,
+setzt die SSH-Datei zurück und lässt SSH unverändert; dann als root `passwd ADMIN_USER`
+und das Skript erneut starten (Benutzer und Schlüssel bleiben). Die Anmeldung mit dem
+Schlüssel klappt auch ohne Passwort (das Skript prüft `UsePAM yes`). Ein gestohlener
+Schlüssel allein gibt so noch keine Root-Rechte.
 
 ### Ablauf (für den Betreiber)
 
@@ -319,9 +326,14 @@ nur `sudo` nicht. Ein gestohlener Schlüssel allein gibt so noch keine Root-Rech
    (40-stelliger Hash). In eurem Klon:
    `git fetch origin && git show COMMIT:deploy/setup-server.sh | sha256sum`.
    Die Prüfsumme notieren.
-3. **Web-Konsole öffnen:** im hPanel den VPS wählen und das Browser-Terminal öffnen
-   (Login als root). Dieses Fenster bleibt bis Schritt 9 offen.
-4. **Skript auf den Server holen** (in der Web-Konsole, als root):
+3. **hPanel absichern:** Zwei-Faktor-Anmeldung für das hPanel einschalten, und das
+   root-Passwort (für die Web-Konsole) im hPanel auf ein langes, nur hier verwendetes
+   Passwort setzen. Das root-Passwort später immer im hPanel ändern, nicht mit `passwd`
+   auf dem Server, damit hPanel und Server übereinstimmen.
+4. **Web-Konsole öffnen:** im hPanel den VPS wählen und das Browser-Terminal öffnen
+   (Login als root). Das Skript in dieser Konsole starten, nicht über SSH von eurem
+   Rechner (sonst warnt es). Diese Konsole bleibt offen, bis Schritt 10 geklappt hat.
+5. **Skript auf den Server holen** (in der Web-Konsole, als root):
 
    ```sh
    cd /root
@@ -335,20 +347,26 @@ nur `sudo` nicht. Ein gestohlener Schlüssel allein gibt so noch keine Root-Rech
    und `git -C claude-webseiten checkout COMMIT`, oder vor dem ersten Lauf
    `scp deploy/setup-server.sh root@SERVER:/root/` von eurem Rechner (root darf sich bis
    zum Lauf noch mit Passwort anmelden). Immer einen festen Commit nehmen, nie `main`.
-5. **Testlauf** (ändert nichts):
+6. **Testlauf** (ändert nichts):
 
    ```sh
    PROFIL=hostinger ADMIN_USER=name ADMIN_PUBKEY='ssh-ed25519 AAAA... name@rechner' DRY_RUN=1 bash setup-server.sh
    ```
 
    Den Schlüssel in einfachen Anführungszeichen einfügen, in einer Zeile. Die Ausgabe
-   lesen: Zeilen mit „Ein echter Lauf würde hier abbrechen“ zuerst beheben. Die Warnung
-   „Diese Dienste lauschen auf weiteren Ports …“ nennt Dienste des Servers, die nach dem
-   Lauf von außen nicht mehr erreichbar sind; von Docker veröffentlichte Ports (z. B.
-   32768) sind davon nicht betroffen (siehe unten).
-6. **Echter Lauf:** derselbe Befehl ohne `DRY_RUN=1`. Er endet mit „Änderungen in
-   diesem Lauf: …“ und der Abnahmeliste.
-7. **Passwort für sudo setzen** (Web-Konsole, als root): `passwd name`.
+   lesen: Zeilen mit „Ein echter Lauf würde hier abbrechen“ zuerst beheben. Außerdem:
+   - „Diese Dienste lauschen auf weiteren Ports …“: Dienste des Servers, die nach dem
+     Lauf von außen nicht mehr erreichbar sind.
+   - „Von Docker veröffentlichte Ports …“: diese Ports erlaubt das Skript in `INPUT`
+     (siehe unten).
+   - „Diese laufenden Container haben keine Neustart-Regel …“: Sie starten nach dem
+     automatischen Neustart um 04:00 nicht von selbst wieder. Vorher klären (z. B. in
+     der Compose-Datei `restart: unless-stopped`).
+   - „Journal: Keine Anmeldung von root … gefunden“: Erst prüfen, dass die Web-Konsole
+     wirklich funktioniert.
+7. **Echter Lauf:** derselbe Befehl ohne `DRY_RUN=1`. Vor dem Neuladen von SSH fragt er
+   nach dem Passwort für `ADMIN_USER` (für sudo). Er endet mit „Änderungen in diesem
+   Lauf: …“ und der Abnahmeliste.
 8. **Zweite Anmeldung testen, bevor ihr irgendetwas schließt.** Auf eurem Rechner in
    einem neuen Fenster: `ssh name@SERVER`, dann `sudo -v` (fragt nach dem Passwort aus
    Schritt 7). Gegenproben: `ssh root@SERVER` und
@@ -358,22 +376,29 @@ nur `sudo` nicht. Ein gestohlener Schlüssel allein gibt so noch keine Root-Rech
    `rm /etc/ssh/sshd_config.d/10-haertung.conf && systemctl reload ssh`. Damit gilt
    wieder die SSH-Konfiguration von Hostinger; Ursache suchen und das Skript erneut
    starten.
-9. **Web-Konsole neu öffnen** (im hPanel schließen und neu starten): Der Login als root
-   muss weiter klappen. Erst danach ist die alte Sitzung entbehrlich.
-10. **Dienste prüfen** (auf eurem Rechner): `curl -I http://SERVER` und
-    `curl -I http://SERVER:32768` antworten wie vor dem Lauf (Traefik bzw. die andere
-    App). Auf dem Server: `sudo iptables -S INPUT`, `sudo ip6tables -S INPUT`,
-    `sudo fail2ban-client status sshd`, `sudo docker info | grep -i 'live restore'`
-    (zeigt `Live Restore Enabled: true`).
-11. **Firewall im hPanel** zusätzlich einrichten: eingehend TCP 22, 80 und 443 erlauben
-    (und 32768, solange die andere App von außen erreichbar sein soll), den Rest
-    verwerfen. Sie filtert vor dem Server und ist die einzige Stelle, an der sich
-    Docker-Ports wie 32768 ohne Eingriff in Docker beschränken lassen. Danach Schritt 8
-    bis 10 wiederholen, auch die Web-Konsole.
+9. **Dienste prüfen** (auf eurem Rechner): `curl -I http://SERVER` und
+   `curl -I http://SERVER:32768` antworten wie vor dem Lauf (Traefik bzw. die andere
+   App), über IPv6 ebenso (`curl -6 -I …`, falls der VPS IPv6 hat). Auf dem Server:
+   `sudo iptables -S INPUT`, `sudo ip6tables -S INPUT`, `sudo fail2ban-client status sshd`,
+   `sudo docker info | grep -i 'live restore'` (zeigt `Live Restore Enabled: true`).
+10. **Zweite Web-Konsole öffnen**, die erste noch nicht schließen: Der Login als root
+    muss weiter klappen. Erst wenn Schritt 8 (einschließlich `sudo -v`) und dieser
+    Schritt geklappt haben, die erste Konsole schließen.
+11. **Firewall im hPanel** zusätzlich einrichten: eingehend TCP 22 (bzw. euren SSH-Port),
+    80 und 443 erlauben (und 32768, solange die andere App von außen erreichbar sein
+    soll), den Rest verwerfen. Sie filtert vor dem Server und ist die einzige Stelle, an
+    der sich Docker-Ports wie 32768 ohne Eingriff in Docker beschränken lassen. Prüfen,
+    dass sie Antworten auf Verbindungen des Servers durchlässt (zustandsbehaftet, sonst
+    scheitern apt und DNS), ICMP nicht sperrt und die Web-Konsole (`169.254.0.1`) nicht
+    betrifft. Danach Schritt 8 bis 10 wiederholen.
 12. **Optional, in einer ruhigen Stunde:** einmal `sudo reboot` und danach Schritt 8 bis
-    10 wiederholen. Das prüft, dass die Firewall-Regeln beim Start geladen werden
-    (`netfilter-persistent`). Ein zweiter Lauf des Skripts meldet „Änderungen in diesem
+    10 wiederholen. Das prüft, dass die Firewall-Regeln beim Start geladen werden und die
+    Container wieder starten. Ein zweiter Lauf des Skripts meldet „Änderungen in diesem
     Lauf: 0“.
+
+**Letzter Ausweg**, wenn weder SSH noch die Web-Konsole gehen: im hPanel den
+Wiederherstellungsmodus (Recovery) oder die Notfall-Konsole (VNC) des VPS starten,
+`/etc/ssh/sshd_config.d/10-haertung.conf` entfernen und die Firewall-Regeln prüfen.
 
 ### Was das Profil im Einzelnen tut
 
@@ -382,90 +407,156 @@ Profils `oracle`, soweit sie gelten: Aufruf als root (ohne `sudo` erlaubt; mit `
 gilt wie bei Oracle, dass der aufrufende und der angemeldete Benutzer `ADMIN_USER`
 sein müssen); `ADMIN_USER` und `ADMIN_PUBKEY` wie oben; sshd liest für `ADMIN_USER`
 die Datei `~/.ssh/authorized_keys` (`AuthorizedKeysFile` laut `sshd -T`), in die das
-Skript den Schlüssel legt; `iptables` und `ip6tables` lassen sich lesen. UFW aktiv
-bricht ab wie bei Oracle; ein installiertes, inaktives UFW (Normalfall bei Hostinger)
-entfernt apt mit `iptables-persistent`, das Skript sagt das deutlich. UFW danach nicht
-wieder installieren.
+Skript den Schlüssel legt; `iptables` und `ip6tables` lassen sich lesen; SSH lauscht
+nur auf den Ports, die `sshd -T` nennt (geprüft an `ssh.socket` und am laufenden sshd
+laut `ss`), denn genau diese öffnet die Firewall. UFW aktiv bricht ab wie bei Oracle;
+ein installiertes, inaktives UFW (Normalfall bei Hostinger) entfernt apt mit
+`iptables-persistent`, das Skript sagt das deutlich und prüft am Ende, ob es geschehen
+ist. UFW danach nicht wieder installieren. Nur Hinweise, kein Abbruch: Start über SSH
+statt über die Web-Konsole, keine Anmeldung der Web-Konsole im Journal, Container ohne
+Neustart-Regel `always` oder `unless-stopped`, weitere lauschende Dienste.
 
-**Docker** (vor den Paket-Updates, damit ein Update von `docker-ce` schon mit
-`live-restore` läuft): Das Skript startet Docker nie neu, denn das würde Traefik von
-Hostinger und alle anderen Container stoppen. Es führt seine Werte in
-`/etc/docker/daemon.json` zusammen, statt die Datei zu ersetzen: vorhandene Schlüssel
-bleiben, ergänzt werden nur fehlende (`"live-restore": true`; `"log-driver": "local"`
-mit `max-size` 10m und `max-file` 3, bzw. nur `max-size` und `max-file`, wenn schon
-`json-file` oder `local` gesetzt ist). Vorher legt es eine Kopie
-`daemon.json.bak-DATUM` an und prüft das Ergebnis mit `dockerd --validate`. Danach
-`systemctl reload docker` (SIGHUP): `live-restore` wirkt sofort, laufende Container
-bleiben unberührt. Log-Treiber und Log-Grenzen liest dockerd erst bei seinem nächsten
-Start (Neustart des Servers, Paket-Update), und sie gelten nur für danach neu erstellte
-Container. Ist `live-restore` ausdrücklich auf `false` gesetzt oder ein anderer
-Log-Treiber eingetragen, bleibt das so und das Skript warnt. Ein ungültiges
-`daemon.json` bricht ab, bevor etwas geändert wird. Docker selbst wird nicht neu
-installiert und kein Repository-Eintrag angelegt; das Skript meldet nur die Versionen.
+**Docker** (vor den Paket-Updates): Das Skript startet Docker nie neu, denn das würde
+Traefik von Hostinger und alle anderen Container stoppen.
+
+- Ist Docker Teil eines Swarm, bricht es ab (`live-restore` schützt Swarm-Dienste
+  nicht).
+- Es führt seine Werte in `/etc/docker/daemon.json` zusammen, statt die Datei zu
+  ersetzen: vorhandene Schlüssel bleiben, ergänzt werden nur fehlende
+  (`"live-restore": true`; `"log-driver": "local"` mit `max-size` 10m und `max-file` 3,
+  bzw. nur `max-size` und `max-file`, wenn schon `json-file` oder `local` gesetzt ist).
+  Vorher legt es eine Kopie `daemon.json.bak-DATUM` an und prüft das Ergebnis mit
+  `dockerd --validate`. Danach `systemctl reload docker` (SIGHUP): `live-restore` wirkt
+  sofort, laufende Container bleiben unberührt. Zeigt `docker info` danach
+  `live-restore` nicht als aktiv, bricht das Skript vor den Paket-Updates ab.
+- Log-Treiber und Log-Grenzen liest dockerd erst bei seinem nächsten Start (Neustart des
+  Servers, Paket-Update), und sie gelten nur für danach neu erstellte Container.
+- Ist `live-restore` ausdrücklich auf `false` gesetzt oder ein anderer Log-Treiber
+  eingetragen, bleibt das so und das Skript warnt. Ein ungültiges `daemon.json` bricht
+  ab, bevor etwas geändert wird.
+- **Docker-Pakete werden in den apt-Läufen des Skripts nicht aktualisiert.** `docker-ce`,
+  `docker-ce-cli`, `containerd.io`, `docker-buildx-plugin`, `docker-compose-plugin` und
+  `docker-ce-rootless-extras` (soweit installiert) bleiben auf ihrer Version: apt-get
+  bekommt für diese Läufe eine Pin-Datei (`Dir::Etc::Preferences`, Priorität 1001 auf die
+  installierte Version) im temporären Verzeichnis des Laufs. Anders als `apt-mark hold`
+  bleibt danach nichts zurück, auch nicht nach einem Abbruch. Ein Update von Docker
+  startet dockerd neu, und `live-restore` hält Container laut Docker nur über
+  Patch-Versionen hinweg am Laufen. Docker-Updates spielt ihr deshalb selbst ein, in
+  einem Wartungsfenster: `sudo apt-get update && sudo apt-get install --only-upgrade
+  docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin`,
+  danach Traefik, die anderen Apps und die Website prüfen. Die automatischen Updates
+  (unattended-upgrades) nehmen nur Pakete von Ubuntu, nicht aus dem Repository von Docker.
+- needrestart startet nach Updates weder Docker noch containerd neu
+  (`/etc/needrestart/conf.d/50-setup-server-docker.conf`; Docker nimmt Ubuntu schon von
+  sich aus aus).
+- Docker wird nicht neu installiert und kein Repository-Eintrag angelegt; das Skript
+  meldet nur die Versionen.
+
+**Neustart um 04:00:** Braucht ein Sicherheitsupdate einen Neustart, startet der Server
+um 04:00 neu. Danach startet Docker nur Container mit der Neustart-Regel `always` oder
+`unless-stopped` wieder; die Prüfung listet laufende Container ohne sie auf. Traefik von
+Hostinger und die anderen Apps sind für die Dauer des Neustarts nicht erreichbar.
 
 **Firewall:** Das Skript hängt an `INPUT` (IPv4 und IPv6) an, was fehlt, in dieser
 Reihenfolge: `-i lo`, `RELATED,ESTABLISHED` (ohne sie bräche die laufende SSH-Sitzung ab
 und keine Antwort auf apt, DNS oder NTP käme an), ICMP bzw. alles von ICMPv6 (Neighbor
 Discovery und Router Advertisements; ohne sie funktioniert IPv6 nicht), den DHCP-Client
 (wie in den Standardregeln von UFW: UDP 67 → 68, bei IPv6 UDP 547 → 546 zwischen
-link-lokalen Adressen), TCP 22, 80 und 443, und erst wenn alle diese Regeln da sind, als
-letzte Regel `REJECT`. Die Policy bleibt `ACCEPT`. Es fügt nur ein und hängt an, es
-löscht keine Regel; ein zweiter Lauf erzeugt keine Kopien. `FORWARD`, die Ketten
-`DOCKER*` und die Tabelle `nat` bleiben unberührt.
+link-lokalen Adressen), TCP für die SSH-Ports laut `sshd -T`, 80 und 443, die Ports, auf
+denen docker-proxy lauscht, und erst wenn alle diese Regeln da sind, als letzte Regel
+`REJECT`. Als Ende von `INPUT` zählt nur ein `REJECT` oder `DROP` ohne Bedingung an
+letzter Stelle. Die Policy bleibt `ACCEPT`. Es fügt nur ein und hängt an, es löscht
+keine Regel; ein zweiter Lauf erzeugt keine Kopien. `FORWARD`, die Ketten `DOCKER*` und
+die Tabelle `nat` bleiben unberührt; verändert die Paketinstallation sie (etwa
+`ufw-init stop`, das `FORWARD` auf `ACCEPT` setzen kann), spielt das Skript die Tabelle
+`filter` von vor der Installation zurück und bricht ab, wenn das nicht hilft.
 
-- **Port 32768 und andere Docker-Ports** bleiben erreichbar: Docker leitet sie mit DNAT
-  in der Tabelle `nat` und über die Kette `FORWARD` weiter, sie laufen nie durch
-  `INPUT`. Beschränken lässt sich das nur in der Kette `DOCKER-USER` oder in der
-  Firewall im hPanel; das Skript lässt beides in Ruhe.
+- **Port 32768 und andere Docker-Ports:** Über IPv4 von außen leitet Docker sie mit DNAT
+  in der Tabelle `nat` über die Kette `FORWARD` an den Container, an `INPUT` vorbei.
+  Beschränken lässt sich das nur in der Kette `DOCKER-USER` oder in der Firewall im
+  hPanel; das Skript lässt beides in Ruhe. Über IPv6 (docker-proxy lauscht auf `[::]`,
+  der Container hat kein IPv6) und von Containern zur eigenen Adresse des Servers
+  (Hairpin) nimmt dagegen docker-proxy die Verbindung an, und die läuft durch `INPUT`.
+  Deshalb erlaubt das Skript jeden Port, auf dem beim Lauf docker-proxy lauscht, in
+  `INPUT` (IPv4 und IPv6) und nennt ihn in der Ausgabe. **Später veröffentlichte Ports**
+  brauchen dasselbe: das Skript erneut starten (oder die Regel von Hand einfügen und
+  speichern, siehe unten).
 - **Traefik von Hostinger** (Host-Netz, 80 und 443) läuft durch `INPUT` und ist durch
   die Regeln für 80 und 443 abgedeckt. Seine Verbindungen zu Containern gehen über
   `OUTPUT` hinaus; die Antworten kommen über `docker0` bzw. `br-*` zurück und sind
   `RELATED,ESTABLISHED`.
 - **Verbindungen von Containern zum Server selbst** (nicht zu einem veröffentlichten
-  Port) laufen ebenfalls durch `INPUT`: zu 22, 80 und 443 erlaubt, zu jedem anderen
+  Port) laufen ebenfalls durch `INPUT`: zu SSH, 80 und 443 erlaubt, zu jedem anderen
   Port des Servers abgewiesen. Es gibt bewusst kein `-i docker0 -j ACCEPT` oder
   `-i br-+ -j ACCEPT`; das würde jedem Container alle Dienste des Servers öffnen.
-  Health-Checks von Docker laufen im Container und sind nicht betroffen. Braucht ein
-  Container doch einen Dienst des Servers, eine eigene Regel vor dem `REJECT` setzen,
-  z. B. `sudo iptables -I INPUT <Nummer des REJECT> -i br-xxxx -p tcp --dport PORT -j ACCEPT`
-  (Nummer mit `sudo iptables -L INPUT --line-numbers -n`), und das Skript erneut
-  starten, damit es die Regeln speichert.
+  Health-Checks von Docker laufen im Container und sind nicht betroffen.
 - **Gespeichert** wird in `/etc/iptables/rules.v4` und `rules.v6` (Modus 0640) nur die
-  Tabelle `filter` mit den Policies und den Regeln von `INPUT`, deren Ziel eingebaut ist
-  (`ACCEPT`, `DROP`, `REJECT`, `RETURN`, `LOG`), vorher geprüft mit
-  `iptables-restore --test`. Eine vorhandene Datei mit anderem Inhalt sichert das Skript
-  vorher als `rules.v4.bak-DATUM` bzw. `rules.v6.bak-DATUM`. Nicht `netfilter-persistent save`: Das würde auch die Ketten
-  und NAT-Regeln von Docker mit den Container-Adressen von heute speichern, die beim
-  Start vor Docker geladen würden. Die Sprungregel von fail2ban fehlt ebenfalls, fail2ban
-  legt sie beim Start selbst an. Beim Start lädt `netfilter-persistent` die Dateien.
+  Tabelle `filter` mit den Policies, der Zeile `-F INPUT` und den Regeln von `INPUT`,
+  deren Ziel eingebaut ist (`ACCEPT`, `DROP`, `REJECT`, `RETURN`, `LOG`), vorher geprüft
+  mit `iptables-restore --test`. Eine vorhandene Datei mit anderem Inhalt sichert das
+  Skript vorher als `rules.v4.bak-DATUM` bzw. `rules.v6.bak-DATUM`. Die Sprungregel von
+  fail2ban fehlt, fail2ban legt sie beim Start selbst an.
+- **Laden ohne Docker zu stören:** netfilter-persistent lädt die Dateien beim Start
+  (vor Docker), aber auch bei jedem `start`, `restart` oder `reload` des Dienstes, und
+  das Paket `netfilter-persistent` startet den Dienst bei jedem Paket-Update neu
+  (postinst: `deb-systemd-invoke restart`). Ohne Vorkehrung würde `iptables-restore` dabei
+  die ganze Tabelle `filter` ersetzen und die Ketten von Docker löschen, während die Container
+  laufen. Das Skript legt deshalb
+  `/etc/systemd/system/netfilter-persistent.service.d/10-noflush.conf` an
+  (`IPTABLES_RESTORE_NOFLUSH=yes`, `IP6TABLES_RESTORE_NOFLUSH=yes`): Geladen wird mit
+  `--noflush`, und `-F INPUT` ersetzt nur `INPUT`. Das gilt nur für den Dienst über
+  systemd (Boot, `systemctl restart netfilter-persistent`, Paket-Updates); danach
+  fail2ban neu starten (`sudo systemctl restart fail2ban`), weil `-F INPUT` seine
+  Sprungregel entfernt.
+
+**Firewall-Regeln ändern:** Auf diesem Server **nie** `netfilter-persistent save`,
+`netfilter-persistent reload` oder `netfilter-persistent restart` von Hand aufrufen.
+`save` schriebe die Ketten und NAT-Regeln von Docker mit den Container-Adressen von heute in
+die Dateien, `reload`/`restart` aus der Shell laufen ohne die Umgebung des Dienstes und
+ersetzen die ganze Tabelle `filter`. Stattdessen eine eigene Regel vor das `REJECT`
+einfügen, z. B. für einen Dienst des Servers, den ein Container braucht:
+`sudo iptables -I INPUT <Nummer des REJECT> -i br-xxxx -p tcp --dport PORT -j ACCEPT`
+(Nummer mit `sudo iptables -L INPUT --line-numbers -n`), und nur die Regeln von `INPUT`
+speichern:
+
+```sh
+sudo PROFIL=hostinger ONLY_SAVE_FIREWALL=1 bash setup-server.sh
+```
+
+Das prüft, dass `INPUT` noch mit `REJECT` endet und davor die nötigen Regeln stehen,
+und schreibt die beiden Dateien wie oben (mit Sicherung); sonst ändert es nichts.
 
 **SSH:** `/etc/ssh/sshd_config.d/10-haertung.conf` mit `PasswordAuthentication no`,
 `KbdInteractiveAuthentication no`, `PermitRootLogin no`, `GSSAPIAuthentication no`,
 `HostbasedAuthentication no`, `AllowUsers ADMIN_USER deploy root@169.254.0.1` und am
 Ende `Match User root Address 169.254.0.1` mit `PermitRootLogin yes` und
 `PasswordAuthentication yes`, abgeschlossen mit `Match all`. Die Ausnahme gilt nur für
-root; `ADMIN_USER` und `deploy` brauchen auch von `169.254.0.1` aus den Schlüssel. sshd nimmt den ersten Wert,
-den es liest, und liest `sshd_config.d` am Anfang von `sshd_config` in Namensreihenfolge;
-`10-` kommt vor `50-cloud-init.conf` (dort `PasswordAuthentication yes`) und
-`60-cloudimg-settings.conf`. Ein `Match`-Block in einer per `Include` gelesenen Datei
-endet mit dieser Datei (OpenSSH 9.6, nachgeprüft mit `sshd -T`: Einstellungen aus
-`60-cloudimg-settings.conf` und dem Rest von `sshd_config` gelten weiter für alle
-Verbindungen); `Match all` schließt ihn trotzdem ausdrücklich. Bei jedem echten Lauf
-prüft das Skript mit `sshd -t` und `sshd -T -C`:
+root; `ADMIN_USER` und `deploy` brauchen auch von `169.254.0.1` aus den Schlüssel. sshd
+nimmt den ersten Wert, den es liest, und liest `sshd_config.d` am Anfang von
+`sshd_config` in Namensreihenfolge; `10-` kommt vor `50-cloud-init.conf` (dort
+`PasswordAuthentication yes`) und `60-cloudimg-settings.conf`. Ein `Match`-Block in einer
+per `Include` gelesenen Datei endet mit dieser Datei (OpenSSH 9.6, nachgeprüft mit
+`sshd -T`: Einstellungen aus `60-cloudimg-settings.conf` und dem Rest von `sshd_config`
+gelten weiter für alle Verbindungen); `Match all` schließt ihn trotzdem ausdrücklich.
+Bei jedem echten Lauf prüft das Skript mit `sshd -t` und `sshd -T -C`:
 
-| Verbindung                                  | Erwartung                                                                                   |
-| ------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| `ADMIN_USER` von `203.0.113.10` (Internet)  | wie bei Oracle: nur Schlüssel, in `AllowUsers`, kein Passwort; zusätzlich `UsePAM yes`      |
-| root von `203.0.113.10`                     | `PermitRootLogin no`, `PasswordAuthentication no`, kein `AllowUsers`-Eintrag für root von dort |
-| root von `169.254.0.1` (Web-Konsole)        | `PermitRootLogin yes`, `PasswordAuthentication yes`, `AllowUsers root@169.254.0.1`          |
-| `deploy` von `203.0.113.10`                 | `PasswordAuthentication no`, `KbdInteractiveAuthentication no`, `PubkeyAuthentication yes`  |
-| `ADMIN_USER` und `deploy` von `169.254.0.1` | ebenso nur Schlüssel: `PasswordAuthentication no`, `KbdInteractiveAuthentication no`        |
+| Verbindung                                  | Erwartung                                                                                                  |
+| ------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `ADMIN_USER` von `203.0.113.10` (Internet)  | wie bei Oracle: nur Schlüssel, in `AllowUsers`, kein Passwort; zusätzlich `UsePAM yes`                     |
+| root von `203.0.113.10`                     | `PermitRootLogin no`, `PasswordAuthentication no`, kein `AllowUsers`-Eintrag für root von dort             |
+| root von `169.254.0.1` (Web-Konsole)        | `PermitRootLogin yes`, `PasswordAuthentication yes`, `AllowUsers root@169.254.0.1`, `AuthenticationMethods` erlaubt das Passwort allein |
+| `deploy` von `203.0.113.10`                 | `PasswordAuthentication no`, `KbdInteractiveAuthentication no`, `PubkeyAuthentication yes`                 |
+| `ADMIN_USER` und `deploy` von `169.254.0.1` | ebenso nur Schlüssel: `PasswordAuthentication no`, `KbdInteractiveAuthentication no`                       |
 
-Dazu muss der Schlüssel aus `ADMIN_PUBKEY` in `~ADMIN_USER/.ssh/authorized_keys` stehen
-(Besitzer `ADMIN_USER`, Verzeichnis 700, Datei 600), bevor sshd neu geladen wird.
-Scheitert eine Prüfung, setzt das Skript die Datei zurück, lädt SSH nicht neu und bricht
-ab. `203.0.113.10` ist eine Dokumentationsadresse (RFC 5737) und steht für jede Adresse
-aus dem Internet.
+Dazu muss der Schlüssel aus `ADMIN_PUBKEY` in `~ADMIN_USER/.ssh/authorized_keys` als
+eigene Zeile stehen (nicht auskommentiert, ohne Optionen davor; eine Zeile mit `from=`
+oder `command=` zählt nicht, dann ergänzt das Skript den Schlüssel), mit Besitzer
+`ADMIN_USER`, Verzeichnis 700 und Datei 600, und `ADMIN_USER` muss ein Passwort haben,
+bevor sshd neu geladen wird. Die Datei schreibt das Skript über eine mit `mktemp` im
+Verzeichnis angelegte Datei, `chown -h` und `mv -T`, nachdem es geprüft hat, dass weder
+`~/.ssh` noch die Datei ein symbolischer Link ist. Scheitert eine Prüfung, setzt das
+Skript die SSH-Datei zurück, lädt SSH nicht neu und bricht ab. `203.0.113.10` ist eine
+Dokumentationsadresse (RFC 5737) und steht für jede Adresse aus dem Internet.
 
 **fail2ban** wie bei Oracle, zusätzlich `ignoreip = 127.0.0.1/8 ::1 169.254.0.1` im Jail
 `sshd` (geprüft mit `fail2ban-client -d`, genau diese Liste). Grund: Die Web-Konsole
@@ -474,6 +565,7 @@ würden sonst diese Adresse sperren und damit die Web-Konsole, den einzigen Zuga
 nicht vom SSH-Schlüssel abhängt (etwa nachdem man sich ausgesperrt hat). `169.254.0.0/16`
 ist link-lokal: Pakete mit dieser Absenderadresse kommen nur von Hostingers eigener
 Seite des Netzes, nicht aus dem Internet. Versuche von dort werden weiter protokolliert.
+Lauscht sshd nicht auf 22, überwacht der Jail die Ports laut `sshd -T`.
 
 ### Risiken und Grenzen
 
@@ -483,16 +575,21 @@ Seite des Netzes, nicht aus dem Internet. Versuche von dort werden weiter protok
   fail2ban. Deshalb: ein langes, nur hier verwendetes root-Passwort und
   Zwei-Faktor-Anmeldung für das hPanel, denn wer ins hPanel kommt, kommt über die
   Web-Konsole als root auf den Server. Ändert Hostinger die Adresse der Web-Konsole,
-  funktioniert sie nicht mehr; der Zugang über `ADMIN_USER` bleibt.
-- `apt-get full-upgrade` kann `docker-ce` aktualisieren; das Paket startet dockerd neu.
-  Dank `live-restore` (vor den Updates gesetzt) laufen die Container weiter; bei
-  veröffentlichten Ports kann es eine kurze Unterbrechung geben.
-- Dienste des Servers auf anderen Ports als 22, 80 und 443 sind von außen und aus
-  Containern nicht mehr erreichbar (die Prüfung listet sie vorher auf).
-- Die Datenschutzerklärung (`site/src/texte/datenschutz.md`) sagt „Wartungszugriffe nur
-  über SSH mit Schlüssel“ und nennt die Sperre durch fail2ban ohne Ausnahme. Mit der
-  Web-Konsole stimmt das für Hostinger nicht mehr ganz; Text und Angaben zum
-  Hosting-Anbieter vor dem Umzug anpassen.
+  funktioniert sie nicht mehr; der Zugang über `ADMIN_USER` mit sudo bleibt.
+- Docker-Updates bleiben liegen, bis ihr sie selbst einspielt (siehe „Docker“); dabei
+  startet dockerd neu, und bei mehr als einem Patch-Sprung können die Container kurz
+  stoppen.
+- Dienste des Servers auf anderen Ports als SSH, 80, 443 und den Ports von docker-proxy
+  sind von außen und aus Containern nicht mehr erreichbar (die Prüfung listet sie
+  vorher auf). Später veröffentlichte Docker-Ports sind über IPv6 und per Hairpin erst
+  nach einem erneuten Lauf erreichbar.
+- Ein `netfilter-persistent reload` von Hand würde die Ketten von Docker löschen (siehe
+  „Firewall-Regeln ändern“).
+- Die Datenschutzerklärung (`site/src/texte/datenschutz.md`, Abschnitt „Schutz des
+  Servers vor Angriffen“) sagt „Wartungszugriffe nur über SSH mit Schlüssel“ und nennt
+  die Sperre durch fail2ban ohne Ausnahme. Für Hostinger stimmt das nicht mehr (root
+  mit Passwort über die Web-Konsole, `169.254.0.1` nie gesperrt). Text und Angaben zum
+  Hosting-Anbieter vor dem Umzug anpassen, in einem eigenen Pull Request.
 
 ## Website einrichten (folgt mit dem Aufbau von Live und Staging)
 
