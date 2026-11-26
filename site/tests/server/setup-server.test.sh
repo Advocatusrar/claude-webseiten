@@ -24,6 +24,11 @@
 #   the script compares with ADMIN_USER): "not set" unless the scenario sets one. The
 #   session the tests are started from does not matter; if the kernel does not allow
 #   setting it, the tests do not run (exit code 2).
+# - Profile hostinger (PROFIL=hostinger, scenarios h_*): hostinger_fixture and
+#   hostinger_v4/v6 build a Hostinger VPS (Docker running, docker is a stub that never
+#   talks to a daemon, dockerd only answers --help and --validate; INPUT open, Docker's
+#   chains and a DNAT for 32768; root with password). ADMIN_PUBKEY gets throwaway keys made
+#   with ssh-keygen for this run (prepare_ssh_keys).
 # Nothing on the host changes; the temporary directory is removed at the end.
 #
 # Usage (as root): bash site/tests/server/setup-server.test.sh
@@ -50,6 +55,20 @@ RACE_WANT='-A INPUT -p tcp -m state --state NEW -m tcp --dport 80 -j ACCEPT'
 # SC_LOGINUID (see run_setup). LOGINUID_NOUSER is a UID without a user.
 LOGINUID_UNSET=4294967295
 LOGINUID_NOUSER=3999999999
+# Profile hostinger (PROFIL=hostinger). H_ADMIN is the admin user the script creates;
+# the fixtures create H_SYSUSER (system user), H_NOLOGIN (normal UID, shell nologin) and
+# the group H_GROUP (no user of that name). None of them may exist on the host.
+# H_CONSOLE is the address of Hostinger's web console; H_PUBLIC stands for any address
+# on the internet in the sshd -T -C checks of the tests (TEST-NET-2, RFC 5737; on
+# purpose not the address the script uses for its own checks).
+H_ADMIN=hadmin
+H_SYSUSER=hsys
+H_NOLOGIN=hnolog
+H_GROUP=hgrp
+H_CONSOLE=169.254.0.1
+H_PUBLIC=198.51.100.7
+# The fail2ban addresses that are never banned in the profile hostinger, exactly these.
+H_IGNOREIP='127.0.0.1/8 ::1 169.254.0.1'
 
 # ===========================================================================
 # Inside the sandbox (called as: unshare -m -n ... bash THIS __inner ARTDIR)
@@ -167,6 +186,176 @@ cond_drop_v4() {
 -A INPUT -i lo -j ACCEPT
 COMMIT
 RULES
+}
+
+# Hostinger VPS: INPUT open (policy ACCEPT, no rules), Docker's chains in the table
+# filter and a published port 32768 of another app's container (DNAT in the table nat).
+hostinger_v4() {
+  cat <<'RULES'
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+:DOCKER - [0:0]
+:DOCKER-ISOLATION-STAGE-1 - [0:0]
+:DOCKER-ISOLATION-STAGE-2 - [0:0]
+:DOCKER-USER - [0:0]
+-A FORWARD -j DOCKER-USER
+-A FORWARD -j DOCKER-ISOLATION-STAGE-1
+-A FORWARD -o docker0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A FORWARD -o docker0 -j DOCKER
+-A FORWARD -i docker0 ! -o docker0 -j ACCEPT
+-A FORWARD -i docker0 -o docker0 -j ACCEPT
+-A DOCKER -d 172.17.0.2/32 ! -i docker0 -o docker0 -p tcp -m tcp --dport 80 -j ACCEPT
+-A DOCKER-ISOLATION-STAGE-1 -i docker0 ! -o docker0 -j DOCKER-ISOLATION-STAGE-2
+-A DOCKER-ISOLATION-STAGE-1 -j RETURN
+-A DOCKER-ISOLATION-STAGE-2 -o docker0 -j DROP
+-A DOCKER-ISOLATION-STAGE-2 -j RETURN
+-A DOCKER-USER -j RETURN
+COMMIT
+*nat
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+:DOCKER - [0:0]
+-A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
+-A OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER
+-A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE
+-A POSTROUTING -s 172.17.0.2/32 -d 172.17.0.2/32 -p tcp -m tcp --dport 80 -j MASQUERADE
+-A DOCKER -i docker0 -j RETURN
+-A DOCKER ! -i docker0 -p tcp -m tcp --dport 32768 -j DNAT --to-destination 172.17.0.2:80
+COMMIT
+RULES
+}
+
+hostinger_v6() {
+  cat <<'RULES'
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+:DOCKER - [0:0]
+:DOCKER-USER - [0:0]
+-A FORWARD -j DOCKER-USER
+-A FORWARD -o docker0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A FORWARD -o docker0 -j DOCKER
+-A FORWARD -i docker0 ! -o docker0 -j ACCEPT
+-A DOCKER -d fd00:dead:beef::2/128 ! -i docker0 -o docker0 -p tcp -m tcp --dport 80 -j ACCEPT
+-A DOCKER-USER -j RETURN
+COMMIT
+*nat
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+:DOCKER - [0:0]
+-A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
+-A POSTROUTING -s fd00:dead:beef::/64 ! -o docker0 -j MASQUERADE
+-A DOCKER ! -i docker0 -p tcp -m tcp --dport 32768 -j DNAT --to-destination [fd00:dead:beef::2]:80
+COMMIT
+RULES
+}
+
+# hostinger_fixture ARTDIR: the rest of a Hostinger VPS (SC_HOSTINGER=1), see the
+# scenarios of the profile hostinger in main.
+# - sshd: root logs in with a password (PermitRootLogin yes in sshd_config and in
+#   60-cloudimg-settings.conf, PasswordAuthentication yes there and in 50-cloud-init.conf);
+#   root's authorized_keys is empty.
+# - Docker is installed and runs (systemctl stub state), /usr/bin/docker is a stub that
+#   never talks to a daemon: "docker info" reports live-restore as daemon.json has it
+#   (as after "systemctl reload docker"). SC_DAEMON_JSON: content of daemon.json ("\n"
+#   separates lines), else there is none; ARTDIR/daemon.json.orig keeps it.
+# - A system user H_SYSUSER, a user H_NOLOGIN with shell nologin and a group H_GROUP.
+# - SC_H_EXISTING=1: H_ADMIN exists already (bash, not in sudo), with ~/.ssh mode
+#   SC_H_SSH_MODE (default 755) and authorized_keys (content SC_H_OLDKEYS, "\n" separates
+#   lines; mode SC_H_KEYS_MODE, default 644); ARTDIR/h_keys0 keeps the file.
+# - SC_SS=hostinger: ss lists sshd on 22, Hostinger's Traefik on 80 and 443 (host
+#   network), docker-proxy on 32768, systemd-resolved on loopback and the DHCP client;
+#   SC_SS=other: the same and a service on 0.0.0.0:8080.
+hostinger_fixture() {
+  local art=$1
+  printf '%s\n' '# Hostinger image (test fixture)' 'PermitRootLogin yes' 'PasswordAuthentication yes' \
+    >/etc/ssh/sshd_config.d/60-cloudimg-settings.conf
+  chmod 644 /etc/ssh/sshd_config.d/50-cloud-init.conf /etc/ssh/sshd_config.d/60-cloudimg-settings.conf
+  sed -i -E 's|^(Include /etc/ssh/sshd_config\.d/\*\.conf)$|\1\nPermitRootLogin yes|' /etc/ssh/sshd_config
+  grep -qx 'PermitRootLogin yes' /etc/ssh/sshd_config || {
+    echo "fixture: PermitRootLogin yes not in sshd_config" >&2
+    return 1
+  }
+  install -d -m 700 /root/.ssh
+  : >/root/.ssh/authorized_keys
+  chmod 600 /root/.ssh/authorized_keys
+
+  rm -f /usr/bin/docker
+  cat >/usr/bin/docker <<'EOF'
+#!/bin/bash
+# docker (test stub): logs its calls, never talks to a daemon.
+{ printf 'docker'; printf ' %s' "$@"; printf '\n'; } >>"${STUB_LOG:-/dev/null}"
+case ${1:-} in
+  --version) echo "Docker version 27.0.0-test, build test" ;;
+  info)
+    python3 -I -c 'import json
+try:
+    v = json.load(open("/etc/docker/daemon.json")).get("live-restore") is True
+except (OSError, ValueError, AttributeError):
+    v = False
+print("true" if v else "false")'
+    ;;
+  *) echo "docker (test stub): unexpected call: $*" >&2; exit 99 ;;
+esac
+EOF
+  chmod 755 /usr/bin/docker
+  touch "$art/state/enabled.docker" "$art/state/active.docker"
+  if [[ -n ${SC_DAEMON_JSON:-} ]]; then
+    mkdir -p /etc/docker
+    printf '%b\n' "$SC_DAEMON_JSON" >/etc/docker/daemon.json
+    chmod 644 /etc/docker/daemon.json
+    cp -p /etc/docker/daemon.json "$art/daemon.json.orig"
+  else
+    rm -f /etc/docker/daemon.json
+  fi
+
+  useradd --system --shell /usr/sbin/nologin "$H_SYSUSER"
+  useradd --create-home --shell /usr/sbin/nologin "$H_NOLOGIN"
+  groupadd "$H_GROUP"
+  if [[ ${SC_H_EXISTING:-0} == 1 ]]; then
+    useradd --create-home --shell /bin/bash "$H_ADMIN"
+    install -d -o "$H_ADMIN" -g "$H_ADMIN" -m "${SC_H_SSH_MODE:-755}" "/home/$H_ADMIN/.ssh"
+    printf '%b' "${SC_H_OLDKEYS:-}" >"/home/$H_ADMIN/.ssh/authorized_keys"
+    chown "$H_ADMIN:$H_ADMIN" "/home/$H_ADMIN/.ssh/authorized_keys"
+    chmod "${SC_H_KEYS_MODE:-644}" "/home/$H_ADMIN/.ssh/authorized_keys"
+    cp -p "/home/$H_ADMIN/.ssh/authorized_keys" "$art/h_keys0"
+  fi
+
+  case ${SC_SS:-} in
+    "") ;;
+    hostinger | other)
+      printf '%s\n' \
+        'LISTEN 0 4096 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=801,fd=3))' \
+        'LISTEN 0 4096 [::]:22 [::]:* users:(("sshd",pid=801,fd=4))' \
+        'LISTEN 0 4096 0.0.0.0:80 0.0.0.0:* users:(("traefik",pid=1201,fd=7))' \
+        'LISTEN 0 4096 [::]:80 [::]:* users:(("traefik",pid=1201,fd=8))' \
+        'LISTEN 0 4096 0.0.0.0:443 0.0.0.0:* users:(("traefik",pid=1201,fd=9))' \
+        'LISTEN 0 4096 [::]:443 [::]:* users:(("traefik",pid=1201,fd=10))' \
+        'LISTEN 0 4096 0.0.0.0:32768 0.0.0.0:* users:(("docker-proxy",pid=1302,fd=4))' \
+        'LISTEN 0 4096 [::]:32768 [::]:* users:(("docker-proxy",pid=1303,fd=4))' \
+        'LISTEN 0 4096 127.0.0.53%lo:53 0.0.0.0:* users:(("systemd-resolve",pid=501,fd=15))' \
+        >"$art/state/ss_tcp"
+      if [[ $SC_SS == other ]]; then
+        echo 'LISTEN 0 128 0.0.0.0:8080 0.0.0.0:* users:(("python3",pid=1500,fd=3))' >>"$art/state/ss_tcp"
+      fi
+      printf '%s\n' \
+        'UNCONN 0 0 127.0.0.53%lo:53 0.0.0.0:* users:(("systemd-resolve",pid=501,fd=14))' \
+        'UNCONN 0 0 203.0.113.20%eth0:68 0.0.0.0:* users:(("systemd-network",pid=480,fd=22))' \
+        >"$art/state/ss_udp"
+      chmod 644 "$art/state/ss_tcp" "$art/state/ss_udp"
+      ;;
+    *)
+      echo "fixture: unknown SC_SS $SC_SS" >&2
+      return 1
+      ;;
+  esac
 }
 
 # put_key USER CONTENT [WHERE]: WHERE is "home" (home directory from getent passwd,
@@ -319,6 +508,7 @@ fixture() {
     open) printf '%s\n' '*filter' ':INPUT ACCEPT [0:0]' '-A INPUT -i lo -j ACCEPT' 'COMMIT' | iptables-restore ;;
     # The final REJECT of the Oracle rules with a comment in front of the target.
     oracle_comment) oracle_v4 | sed -E 's/^-A INPUT -j REJECT/-A INPUT -m comment --comment final-reject -j REJECT/' | iptables-restore ;;
+    hostinger) hostinger_v4 | iptables-restore ;;
   esac
   case ${SC_V6:-reject} in
     reject) oracle_v6 | ip6tables-restore ;;
@@ -331,6 +521,7 @@ fixture() {
       ip6tables -A INPUT -p tcp -m state --state NEW -m tcp --dport 22 -j ACCEPT
       ip6tables -A INPUT -p tcp -m state --state NEW -m tcp --dport 443 -j ACCEPT
       ;;
+    hostinger) hostinger_v6 | ip6tables-restore ;;
   esac
   # NAT rules in both families (like Docker's masquerading): restoring the table filter
   # must leave them as they are. $art/nat_fixture records that they were set.
@@ -345,6 +536,9 @@ fixture() {
     mkdir -p /etc/iptables
     iptables-save >/etc/iptables/rules.v4
     ip6tables-save >/etc/iptables/rules.v6
+    # Copies to compare with later (backups of the profile hostinger).
+    cp -p /etc/iptables/rules.v4 "$art/rules.v4.orig"
+    cp -p /etc/iptables/rules.v6 "$art/rules.v6.orig"
   fi
   # deploy exists already, with a home directory other than /home/deploy.
   if [[ -n ${SC_DEPLOY_HOME:-} ]]; then
@@ -466,6 +660,9 @@ EOF
     chmod 600 /etc/systemd/journald.conf.d/10-aufbewahrung.conf
   fi
 
+  # The rest of a Hostinger VPS (profile hostinger).
+  if [[ ${SC_HOSTINGER:-0} == 1 ]]; then hostinger_fixture "$art"; fi
+
   # Directories that cannot be written (read-only bind mount inside the sandbox).
   for d in ${SC_RO:-}; do
     mount --bind "$d" "$d"
@@ -556,6 +753,8 @@ run_setup() {
   if [[ -n ${SC_DRY_RUN+x} ]]; then envs+=(DRY_RUN="$SC_DRY_RUN"); fi
   if [[ -n ${SC_ADMIN_USER+x} ]]; then envs+=(ADMIN_USER="$SC_ADMIN_USER"); fi
   if [[ -n ${SC_SUDO_USER+x} ]]; then envs+=(SUDO_USER="$SC_SUDO_USER"); fi
+  if [[ -n ${SC_PROFIL+x} ]]; then envs+=(PROFIL="$SC_PROFIL"); fi
+  if [[ -n ${SC_ADMIN_PUBKEY+x} ]]; then envs+=(ADMIN_PUBKEY="$SC_ADMIN_PUBKEY"); fi
   if [[ ${SC_AS:-root} == nobody ]]; then
     pre=(setpriv --reuid=nobody --regid=nogroup --clear-groups --)
   fi
@@ -581,7 +780,7 @@ run_setup() {
 }
 
 post_checks() {
-  local art=$1 dh
+  local art=$1 dh rc
   /usr/sbin/sshd -T >"$art/sshd_T" 2>&1 || true
   /usr/sbin/sshd -T -C user=ubuntu,host=localhost,addr=127.0.0.1 >"$art/sshd_T_admin" 2>&1 || true
   /usr/sbin/sshd -T -C user=deploy,host=localhost,addr=127.0.0.1 >"$art/sshd_T_deploy" 2>&1 || true
@@ -598,9 +797,49 @@ post_checks() {
   ls -1 /etc/ssh/sshd_config.d >"$art/sshd_dir" 2>&1 || true
   sshd_state >"$art/sshd_state_end"
   if command -v dockerd >/dev/null 2>&1 && [[ -f /etc/docker/daemon.json ]]; then
-    dockerd --validate --config-file=/etc/docker/daemon.json >"$art/dockerd_validate" 2>&1
-    echo "rc=$?" >>"$art/dockerd_validate"
+    # set -e: a rejected file (fixtures of the profile hostinger) must not end inner here.
+    rc=0
+    dockerd --validate --config-file=/etc/docker/daemon.json >"$art/dockerd_validate" 2>&1 || rc=$?
+    echo "rc=$rc" >>"$art/dockerd_validate"
   fi
+  if [[ ${SC_HOSTINGER:-0} == 1 ]]; then h_post_checks "$art"; fi
+}
+
+# h_post_checks ARTDIR (profile hostinger): sshd -T -C for the admin user (SC_ADMIN_USER,
+# default H_ADMIN), root and deploy, each from the internet (sshdT_WHO_pub) and from the
+# web console (sshdT_WHO_con); sshd -t; account, groups, ~/.ssh and authorized_keys of the
+# admin user; sudo -l for it; iptables-restore --test of the saved rules files.
+h_post_checks() {
+  local art=$1 who u rc h f
+  for who in admin root deploy; do
+    if [[ $who == admin ]]; then u=${SC_ADMIN_USER:-$H_ADMIN}; else u=$who; fi
+    /usr/sbin/sshd -T -C "user=$u,host=public.invalid,addr=$H_PUBLIC" >"$art/sshdT_${who}_pub" 2>&1 || true
+    /usr/sbin/sshd -T -C "user=$u,host=console.invalid,addr=$H_CONSOLE" >"$art/sshdT_${who}_con" 2>&1 || true
+  done
+  rc=0
+  /usr/sbin/sshd -t >"$art/sshd_t" 2>&1 || rc=$?
+  echo "rc=$rc" >>"$art/sshd_t"
+  u=${SC_ADMIN_USER:-$H_ADMIN}
+  getent passwd "$u" >"$art/h_passwd" || true
+  id -nG "$u" >"$art/h_groups" 2>/dev/null || true
+  h=$(getent passwd "$u" | cut -d: -f6) || h=""
+  if [[ -n $h ]]; then
+    stat -c '%n %U %G %a' "$h/.ssh" "$h/.ssh/authorized_keys" >"$art/h_stat" 2>&1 || true
+    cp "$h/.ssh/authorized_keys" "$art/h_keys" 2>/dev/null || true
+  fi
+  # shellcheck disable=SC2024 # runs as root already; sudo only lists the rights of $u
+  sudo -n -l -U "$u" >"$art/h_sudo" 2>&1 || true
+  for f in v4 v6; do
+    if [[ -f /etc/iptables/rules.$f ]]; then
+      rc=0
+      if [[ $f == v4 ]]; then
+        iptables-restore --test </etc/iptables/rules.$f >"$art/rules_test_$f" 2>&1 || rc=$?
+      else
+        ip6tables-restore --test </etc/iptables/rules.$f >"$art/rules_test_$f" 2>&1 || rc=$?
+      fi
+      echo "rc=$rc" >>"$art/rules_test_$f"
+    fi
+  done
 }
 
 # What happens on a real server between the first and a later run: the CI key is
@@ -613,6 +852,20 @@ between_runs() {
   iptables -N DOCKER-USER
   iptables -A DOCKER-USER -j RETURN
   iptables -I FORWARD 1 -j DOCKER-USER
+}
+
+# Profile hostinger, between the first and a later run on a real server: the CI key is
+# added for deploy, fail2ban (started by run 1) puts its chain and a jump to it at the
+# top of INPUT, in both families.
+h_between_runs() {
+  local dh tool
+  dh=$(getent passwd deploy | cut -d: -f6)
+  printf 'command="/bin/true",restrict %s\n' "$TEST_KEY" >>"$dh/.ssh/authorized_keys"
+  for tool in iptables ip6tables; do
+    "$tool" -N f2b-sshd
+    "$tool" -A f2b-sshd -j RETURN
+    "$tool" -I INPUT 1 -p tcp -m multiport --dports 22 -j f2b-sshd
+  done
 }
 
 # f2b_edit local|jail: between run 1 and run 2, someone puts an older version of
@@ -695,6 +948,10 @@ inner() {
   iptables -S INPUT >"$art/v4_0"
   ip6tables -S INPUT >"$art/v6_0"
   sshd_state >"$art/sshd_state0"
+  # Profile hostinger: root from the internet before the run (fixture in effect).
+  if [[ ${SC_HOSTINGER:-0} == 1 ]]; then
+    /usr/sbin/sshd -T -C "user=root,host=public.invalid,addr=$H_PUBLIC" >"$art/sshdT0_root_pub" 2>&1 || true
+  fi
   for ((i = 1; i <= ${SC_RUNS:-1}; i++)); do
     run_setup "$art" "$i"
     snapshot "$art" >"$art/snap$i"
@@ -706,6 +963,11 @@ inner() {
     if ((i == 1)) && [[ ${SC_BETWEEN:-0} == 1 ]]; then
       between_runs
       # State before the second run, including these changes.
+      snapshot "$art" >"$art/snap$i"
+      dump_fw >"$art/fw$i"
+    fi
+    if ((i == 1)) && [[ ${SC_H_BETWEEN:-0} == 1 ]]; then
+      h_between_runs
       snapshot "$art" >"$art/snap$i"
       dump_fw >"$art/fw$i"
     fi
@@ -944,10 +1206,30 @@ if [[ \${1:-} == status ]]; then
 fi
 exit 0
 EOF
+  # STUB_STATE/ss_tcp and ss_udp (fixture SC_SS, profile hostinger): what "ss -H...t..."
+  # and "ss -H...u..." print (listening sockets); without them nothing.
   cat >"$dir/ss" <<EOF
 #!/bin/bash
 $log
+case \${1:-} in
+  -*u*) f=ss_udp ;;
+  *) f=ss_tcp ;;
+esac
+if [[ -f \${STUB_STATE:-/nonexistent}/\$f ]]; then cat "\$STUB_STATE/\$f"; fi
 exit 0
+EOF
+  # Only the read-only calls (--help, --validate) reach the real dockerd; anything else,
+  # such as starting the daemon, fails.
+  cat >"$dir/dockerd" <<EOF
+#!/bin/bash
+$log
+case \${1:-} in
+  --help | --validate)
+    [[ -x /usr/bin/dockerd ]] || exit 127
+    exec /usr/bin/dockerd "\$@"
+    ;;
+  *) echo "dockerd (test stub): refused: \$*" >&2; exit 99 ;;
+esac
 EOF
   cat >"$dir/sshd" <<EOF
 #!/bin/bash
@@ -1169,6 +1451,8 @@ modifying_calls() { # LOGFILE MODE
       else if (c == "ufw" && $2 == "status" && NF == 2) ro = 1
       else if (c == "sshd" && ($2 == "-t" || $2 == "-T")) ro = 1
       else if (c == "fail2ban-client" && ($2 == "-t" || $2 == "-d")) ro = 1
+      else if (c == "docker" && ($2 == "--version" || $2 == "info")) ro = 1
+      else if (c == "dockerd" && ($2 == "--help" || $2 == "--validate")) ro = 1
       else if (mode == "rerun" && (c == "apt-get" || c == "debconf-set-selections")) ro = 1
       if (!ro) print }' "$1"
 }
@@ -3312,6 +3596,651 @@ t_loginuid_defined() {
   return $((1 - ok))
 }
 
+# --- tests: profile hostinger ----------------------------------------------------
+
+# Path of the absolute PATH in the upper layer of SCENARIO (PATH under an overlaid
+# directory).
+upper_path() { # SCENARIO PATH
+  local top=${2#/}
+  top=${top%%/*}
+  echo "$(upper "$1" "$top")${2#/"$top"}"
+}
+
+# Stat line and sha256 line of the absolute PATH (under an overlaid directory) in
+# snapshot N of SCENARIO; empty if PATH is not in the upper layer.
+snap_path() { # SCENARIO N PATH
+  local top=${3#/}
+  top=${top%%/*}
+  awk -v p="./$top/u${3#/"$top"}" '{ split($0, f, "|") } f[1] == p || substr($0, 67) == p' "$(art "$1")/snap$2"
+}
+
+# Lines of FILE that hold the type and the base64 part of the key line KEY (whatever the
+# comment and options in front).
+h_key_count() { # FILE KEY
+  local t b
+  read -r t b _ <<<"$2"
+  [[ -f $1 ]] || {
+    echo 0
+    return
+  }
+  awk -v t="$t" -v b="$b" '{ for (i = 1; i < NF; i++) if ($i == t && $(i + 1) == b) { n++; break } }
+    END { print n + 0 }' "$1"
+}
+
+# h_rule_class FAMILY LINE: class of one line of "iptables -S INPUT" (FAMILY v4) or
+# "ip6tables -S INPUT" (v6) in the profile hostinger: lo, est (RELATED,ESTABLISHED), icmp
+# (all of ICMP or ICMPv6), dhcp (DHCP client: udp 67 -> 68; IPv6 udp 547 -> 546 from a
+# link-local address), tcp22, tcp80, tcp443 (new connections from anywhere, on any
+# interface), reject (unconditional REJECT), f2b (jump into a chain of fail2ban), other.
+# Nothing for a line that is no rule.
+h_rule_class() { # FAMILY LINE
+  local fam=$1 l=$2
+  local re_est='^-A INPUT -m (state|conntrack) --(state|ctstate) (RELATED,ESTABLISHED|ESTABLISHED,RELATED) -j ACCEPT$'
+  local re_icmp6='^-A INPUT -p (ipv6-icmp|icmpv6) -j ACCEPT$'
+  local re_dhcp4='^-A INPUT( .*)? -p udp (.* )?--sport 67 (.* )?--dport 68 -j ACCEPT$'
+  local re_dhcp6='^-A INPUT -s fe80::/10( .*)? -p udp (.* )?--sport 547 (.* )?--dport 546 -j ACCEPT$'
+  local re_tcp='^-A INPUT -p tcp (.* )?--dport (22|80|443) -j ACCEPT$'
+  local re_reject='^-A INPUT( -m comment --comment [^ ]+)? -j REJECT( --reject-with [^ ]+)?$'
+  [[ $l == "-A INPUT "* ]] || return 0
+  if [[ $l == "-A INPUT -i lo -j ACCEPT" ]]; then
+    echo lo
+  elif [[ $l =~ $re_est ]]; then
+    echo est
+  elif [[ $fam == v4 && $l == "-A INPUT -p icmp -j ACCEPT" ]] || [[ $fam == v6 && $l =~ $re_icmp6 ]]; then
+    echo icmp
+  elif [[ $fam == v4 && $l =~ $re_dhcp4 && $l != *" -i "* ]] || [[ $fam == v6 && $l =~ $re_dhcp6 ]]; then
+    echo dhcp
+  elif [[ $l =~ $re_tcp && $l != *" -s "* && $l != *" -i "* ]]; then
+    echo "tcp${BASH_REMATCH[2]}"
+  elif [[ $l =~ $re_reject ]]; then
+    echo reject
+  elif [[ $l == *" -j f2b-"* ]]; then
+    echo f2b
+  else
+    echo other
+  fi
+}
+
+# INPUT of FAMILY (v4, v6) after run RUN of SCENARIO; before run 1 it was open and empty
+# (policy ACCEPT, no rule). Afterwards: policy still ACCEPT, the rules lo, est, icmp,
+# dhcp, tcp22, tcp80, tcp443 (h_rule_class) in this order, each exactly once, and an
+# unconditional REJECT as the very last rule; nothing else (no "-i docker0 -j ACCEPT" or
+# the like). With "f2b" a jump into fail2ban's chain at the top is expected as well (put
+# there between the runs). Run RUN exited with 0.
+t_h_fw_input() { # SCENARIO FAMILY RUN [f2b]
+  local ok=1 a f l classes want="lo est icmp dhcp tcp22 tcp80 tcp443 reject"
+  have_run "$1" "$3" || return 1
+  a=$(art "$1")
+  f="$a/$2_0"
+  if [[ $(grep -c '^-A INPUT' "$f") != 0 ]] || ! grep -qx -- '-P INPUT ACCEPT' "$f"; then
+    no "fixture: $2 INPUT before the run is not open and empty:" "$(cat "$f")"
+  fi
+  [[ $(rc_of "$1" "$3") == 0 ]] || no "run $3: expected exit code 0, got: $(rc_of "$1" "$3")" "$(grep '^Abbruch' "$a/err$3")"
+  f="$a/$2_$3"
+  grep -qx -- '-P INPUT ACCEPT' "$f" || no "$2: INPUT policy is no longer ACCEPT: $(head -1 "$f")"
+  classes=$(while IFS= read -r l; do h_rule_class "$2" "$l"; done <"$f" | tr '\n' ' ')
+  classes=${classes% }
+  if [[ ${4:-} == f2b ]]; then want="f2b $want"; fi
+  [[ $classes == "$want" ]] || no "$2: classes of the INPUT rules after run $3: '$classes', expected '$want'" "$(cat "$f")"
+  return $((1 - ok))
+}
+
+# h_table FILE TABLE: the lines of TABLE (from "*TABLE" to its COMMIT) in an
+# ip(6)tables-save dump.
+h_table() { # FILE TABLE
+  awk -v t="*$2" '$0 == t { p = 1 } p { print } p && $0 == "COMMIT" { p = 0 }' "$1"
+}
+
+# Runs 1 to RUN of SCENARIO changed nothing in the firewall apart from the rules of INPUT
+# in the table filter, in both families: the table nat (with Docker's DNAT for port
+# 32768) byte for byte as before, in the table filter the policies, FORWARD and Docker's
+# chains as before, no table added or removed.
+t_h_fw_others_untouched() { # SCENARIO RUN
+  local ok=1 a fam s0 s1 d
+  have_run "$1" "$2" || return 1
+  a=$(art "$1")
+  for fam in 4 6; do
+    s0="$a/save${fam}_0" s1="$a/save${fam}_$2"
+    grep -q -- '--dport 32768 -j DNAT' <(h_table "$s0" nat) || no "fixture: IPv$fam nat has no DNAT for port 32768"
+    grep -q '^:DOCKER-USER ' <(h_table "$s0" filter) || no "fixture: IPv$fam filter has no chain DOCKER-USER"
+    d=$(diff <(h_table "$s0" nat) <(h_table "$s1" nat)) || no "IPv$fam: table nat changed (< before, > after run $2):" "$d"
+    d=$(diff <(h_table "$s0" filter | grep -v '^-A INPUT ') <(h_table "$s1" filter | grep -v '^-A INPUT ')) ||
+      no "IPv$fam: table filter changed outside the rules of INPUT (< before, > after run $2):" "$d"
+    d=$(diff <(grep '^\*' "$s0") <(grep '^\*' "$s1")) || no "IPv$fam: tables added or removed:" "$d"
+  done
+  return $((1 - ok))
+}
+
+# /etc/iptables/rules.v4 and rules.v6 after run RUN of SCENARIO: mode 640 root:root, only
+# the table filter, no chain apart from INPUT, FORWARD and OUTPUT (no Docker or fail2ban
+# chain), rules only in INPUT, and exactly the rules INPUT has after the run (jumps into
+# fail2ban's chain left out), the last one a REJECT; ip(6)tables-restore --test accepts
+# the file. In no run did the script call ip(6)tables-restore without --test (loading
+# rules), and every input of ip(6)tables-restore --test held only the table filter.
+t_h_rules_files() { # SCENARIO RUN
+  local ok=1 a fam f live saved chains other tool n inp
+  have_run "$1" "$2" || return 1
+  a=$(art "$1")
+  for fam in v4 v6; do
+    f="$(upper "$1" etc)/iptables/rules.$fam"
+    if [[ ! -f $f ]]; then
+      no "/etc/iptables/rules.$fam was not written"
+      continue
+    fi
+    [[ $(stat -c '%a %U:%G' "$f") == "640 root:root" ]] || no "rules.$fam: mode and owner $(stat -c '%a %U:%G' "$f"), expected 640 root:root"
+    [[ $(grep '^\*' "$f" | tr '\n' ' ') == '*filter ' ]] || no "rules.$fam holds the tables '$(grep '^\*' "$f" | tr '\n' ' ')', expected only *filter"
+    chains=$(grep '^:' "$f" | awk '{ print $1 }' | LC_ALL=C sort | tr '\n' ' ')
+    [[ $chains == ':FORWARD :INPUT :OUTPUT ' ]] || no "rules.$fam declares the chains '$chains', expected only :FORWARD :INPUT :OUTPUT"
+    ! grep -qE 'DOCKER|f2b-' "$f" || no "rules.$fam mentions chains of Docker or fail2ban:" "$(grep -E 'DOCKER|f2b-' "$f")"
+    other=$(grep '^-A ' "$f" | grep -v '^-A INPUT ')
+    [[ -z $other ]] || no "rules.$fam has rules outside INPUT:" "$other"
+    live=$(grep '^-A INPUT ' "$a/${fam}_$2" | grep -v -- ' -j f2b-')
+    saved=$(grep '^-A INPUT ' "$f")
+    [[ $saved == "$live" ]] ||
+      no "rules.$fam: rules of INPUT differ from those in effect after run $2 (< in effect, > saved):" "$(diff <(printf '%s\n' "$live") <(printf '%s\n' "$saved"))"
+    [[ $(tail -n 1 <<<"$saved") == *" -j REJECT"* ]] || no "rules.$fam: the last rule of INPUT is no REJECT"
+    grep -qx 'COMMIT' "$f" || no "rules.$fam has no COMMIT"
+    grep -qx 'rc=0' "$a/rules_test_$fam" 2>/dev/null || no "rules.$fam: ip(6)tables-restore --test rejects it:" "$(cat "$a/rules_test_$fam" 2>/dev/null)"
+  done
+  for tool in iptables ip6tables; do
+    n=$(cat "$a"/log[0-9]* | grep -E "^${tool}-restore( |\$)" | grep -cvE "^${tool}-restore( [^ ]+)* (--test|-t)( |\$)")
+    ((n == 0)) || no "$tool-restore without --test (rules loaded):" "$(cat "$a"/log[0-9]* | grep -E "^${tool}-restore")"
+    for inp in "$a/state/$tool-restore.in."*; do
+      [[ -f $inp ]] || continue
+      [[ $(grep '^\*' "$inp" | LC_ALL=C sort -u | tr '\n' ' ') == '*filter ' ]] ||
+        no "$tool-restore --test got the tables '$(grep '^\*' "$inp" | LC_ALL=C sort -u | tr '\n' ' ')', expected only *filter"
+    done
+  done
+  return $((1 - ok))
+}
+
+# Exactly one copy PATH.bak-YYYYMMDD-HHMMSS next to PATH after the runs of SCENARIO, with
+# the content of ORIG (PATH before run 1, kept by the fixture); PATH itself has another
+# content now.
+t_h_backup() { # SCENARIO PATH ORIG
+  local ok=1 f
+  local -a baks
+  have_run "$1" 1 || return 1
+  f=$(upper_path "$1" "$2")
+  [[ -s $3 ]] || {
+    no "fixture: no copy of $2 from before the run ($3)"
+    return 1
+  }
+  mapfile -t baks < <(find "$(dirname "$f")" -maxdepth 1 -name "$(basename "$f").bak-*" 2>/dev/null | LC_ALL=C sort)
+  if ((${#baks[@]} != 1)); then
+    no "expected exactly one backup $2.bak-*, found ${#baks[@]}:" "${baks[@]##*/}"
+  else
+    [[ ${baks[0]##*/} =~ \.bak-[0-9]{8}-[0-9]{6}$ ]] || no "backup name is not $(basename "$2").bak-YYYYMMDD-HHMMSS: ${baks[0]##*/}"
+    cmp -s "${baks[0]}" "$3" || no "backup ${baks[0]##*/} differs from $2 before the run"
+  fi
+  if [[ ! -f $f ]] || cmp -s "$f" "$3"; then no "fixture: $2 was not replaced, so there was nothing to back up"; fi
+  return $((1 - ok))
+}
+
+# No copy PATH.bak-* after the runs of SCENARIO.
+t_h_no_backup() { # SCENARIO PATH
+  local ok=1 f left
+  have_run "$1" 1 || return 1
+  f=$(upper_path "$1" "$2")
+  left=$(find "$(dirname "$f")" -maxdepth 1 -name "$(basename "$f").bak-*" 2>/dev/null)
+  [[ -z $left ]] || no "backup made although there was nothing to back up:" "$left"
+  return $((1 - ok))
+}
+
+# /etc/docker/daemon.json after the runs of SCENARIO is exactly the JSON object WANT (no
+# key lost, none added, same values); mode 644; dockerd --validate accepts it (if dockerd
+# is installed on the host).
+t_h_daemon_json() { # SCENARIO WANT
+  local ok=1 f out
+  have_run "$1" 1 || return 1
+  f="$(upper "$1" etc)/docker/daemon.json"
+  [[ -f $f ]] || {
+    no "/etc/docker/daemon.json missing after the run"
+    return 1
+  }
+  out=$(
+    python3 -I - "$f" "$2" <<'PY'
+import json
+import sys
+
+try:
+    got = json.load(open(sys.argv[1], encoding="utf-8"))
+except ValueError as e:
+    print("invalid JSON: %s" % e)
+    sys.exit(1)
+want = json.loads(sys.argv[2])
+if got != want:
+    print("got:      " + json.dumps(got, sort_keys=True))
+    print("expected: " + json.dumps(want, sort_keys=True))
+    sys.exit(1)
+PY
+  ) || no "daemon.json is not as expected:" "$out"
+  [[ $(stat -c %a "$f") == 644 ]] || no "daemon.json: mode $(stat -c %a "$f"), expected 644"
+  if [[ -f $(art "$1")/dockerd_validate ]]; then
+    grep -qx 'rc=0' "$(art "$1")/dockerd_validate" || no "dockerd --validate rejects it:" "$(cat "$(art "$1")/dockerd_validate")"
+  else
+    echo "      (info: dockerd not installed, dockerd --validate skipped)" >&2
+  fi
+  return $((1 - ok))
+}
+
+# h_docker_hits LOGFILE: calls that restart, stop, start or reinstall Docker: systemctl
+# with docker/containerd and any verb other than is-active, is-enabled, cat, show,
+# status and reload (SIGHUP); dockerd other than --help or --validate; apt-get install
+# of Docker's packages; the Docker key fetched.
+h_docker_hits() { # LOGFILE
+  awk '
+    $1 == "systemctl" {
+      d = 0
+      for (i = 3; i <= NF; i++) if ($i ~ /^(docker|containerd)(\.service|\.socket)?$/) d = 1
+      if (d && $2 != "is-active" && $2 != "is-enabled" && $2 != "cat" && $2 != "show" && $2 != "status" && $2 != "reload") print
+      next }
+    $1 == "dockerd" && $2 != "--help" && $2 != "--validate" { print; next }
+    $1 == "apt-get" && / install / && / (docker-ce|docker-ce-cli|containerd\.io|docker\.io)( |$)/ { print; next }
+    $1 == "curl" && /download\.docker\.com/ { print }' "$1"
+}
+
+# Docker in SCENARIO: no run restarted, stopped, started or reinstalled it (h_docker_hits),
+# no apt source or key added; "systemctl reload docker" exactly RELOADS times in run 1 and
+# never in later runs; in run 1 the reload comes before "apt-get ... full-upgrade" (an
+# update of docker-ce there restarts dockerd, live-restore must be on by then).
+t_h_docker_calls() { # SCENARIO RELOADS
+  local ok=1 a f r n hits u
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  for f in "$a"/log[0-9]*; do
+    r=${f##*/log}
+    hits=$(h_docker_hits "$f")
+    [[ -z $hits ]] || no "run $r restarted, stopped, started or reinstalled Docker:" "$hits"
+    n=$(grep -cxE 'systemctl reload docker(\.service)?' "$f")
+    if [[ $r == 1 ]]; then
+      ((n == $2)) || no "run 1: $n reloads of docker, expected $2"
+    else
+      ((n == 0)) || no "run $r: $n reloads of docker, expected 0"
+    fi
+  done
+  if (($2 > 0)); then
+    r=$(grep -nxE 'systemctl reload docker(\.service)?' "$a/log1" | head -1 | cut -d: -f1)
+    u=$(grep -nE '^apt-get .* full-upgrade( |$)' "$a/log1" | head -1 | cut -d: -f1)
+    if [[ -z $r || -z $u ]] || ((r > u)); then
+      no "run 1: reload of docker (log line ${r:-none}) not before apt-get full-upgrade (line ${u:-none})"
+    fi
+  fi
+  [[ -z $(find "$(upper "$1" etc)/apt/sources.list.d" "$(upper "$1" etc)/apt/keyrings" -mindepth 1 2>/dev/null) ]] ||
+    no "apt source or key for Docker added"
+  return $((1 - ok))
+}
+
+# No run of any scenario of the profile hostinger (h_*) restarted, stopped, started or
+# reinstalled Docker (h_docker_hits). Enough logs, and some with a reload, otherwise this
+# test would look at nothing.
+t_h_docker_never_restarted() {
+  local ok=1 f n=0 reloads=0 hits
+  for f in "$WORK"/h_*/log[0-9]*; do
+    [[ -f $f ]] || continue
+    n=$((n + 1))
+    hits=$(h_docker_hits "$f")
+    [[ -z $hits ]] || no "${f#"$WORK"/}:" "$hits"
+    if grep -qxE 'systemctl reload docker(\.service)?' "$f"; then reloads=$((reloads + 1)); fi
+  done
+  ((n >= 20 && reloads >= 3)) || no "too little to check: $n call logs, $reloads with a reload of docker"
+  return $((1 - ok))
+}
+
+# daemon.json with "live-restore": false and another log driver (syslog): exit 0, the
+# file stays as it is (inode, mode, times, content), no backup, Docker neither reloaded nor
+# restarted, a warning about live-restore and one about the log driver.
+t_h_dj_keep() { # SCENARIO
+  local ok=1 a w d p=/etc/docker/daemon.json
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)" "$(grep '^Abbruch' "$a/err1")"
+  [[ -n $(snap_path "$1" 0 "$p") ]] || no "fixture: no $p before the run"
+  d=$(diff <(snap_path "$1" 0 "$p") <(snap_path "$1" 1 "$p")) || no "$p changed:" "$d"
+  w=$(grep 'WARNUNG:' "$a/err1" | grep -F 'daemon.json')
+  grep -q 'live-restore' <<<"$w" || no "no warning about live-restore:" "$(grep 'WARNUNG' "$a/err1")"
+  grep -qE 'log-driver|syslog' <<<"$w" || no "no warning about the log driver:" "$(grep 'WARNUNG' "$a/err1")"
+  t_h_no_backup "$1" "$p" || ok=0
+  t_h_docker_calls "$1" 0 || ok=0
+  return $((1 - ok))
+}
+
+# Run 1 of SCENARIO created the admin user H_ADMIN (it did not exist before): home
+# /home/H_ADMIN, shell /bin/bash, member of sudo; ~/.ssh 700 and authorized_keys 600, both
+# H_ADMIN:H_ADMIN; KEY exactly once in it; no NOPASSWD (t_h_no_nopasswd); the user was
+# created before ssh was reloaded.
+t_h_admin_created() { # SCENARIO KEY
+  local ok=1 a u=$H_ADMIN n r1 r2
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)" "$(grep '^Abbruch' "$a/err1")"
+  [[ -z $(snap_path "$1" 0 "/home/$u") ]] || no "fixture: /home/$u existed before the run"
+  [[ $(cut -d: -f1,6,7 "$a/h_passwd") == "$u:/home/$u:/bin/bash" ]] ||
+    no "account: '$(cat "$a/h_passwd")', expected home /home/$u and shell /bin/bash"
+  grep -qx sudo <<<"$(tr ' ' '\n' <"$a/h_groups")" || no "$u is not in group sudo: $(cat "$a/h_groups")"
+  grep -qxF "/home/$u/.ssh $u $u 700" "$a/h_stat" || no "/home/$u/.ssh is not $u:$u 700:" "$(cat "$a/h_stat")"
+  grep -qxF "/home/$u/.ssh/authorized_keys $u $u 600" "$a/h_stat" || no "authorized_keys is not $u:$u 600:" "$(cat "$a/h_stat")"
+  n=$(h_key_count "$a/h_keys" "$2")
+  ((n == 1)) || no "the key is $n times in authorized_keys, expected once:" "$(cat "$a/h_keys" 2>/dev/null)"
+  t_h_no_nopasswd "$1" || ok=0
+  r1=$(grep -nE "^useradd( .*)? $u\$" "$a/log1" | head -1 | cut -d: -f1)
+  r2=$(grep -nxE 'systemctl reload ssh(\.service)?' "$a/log1" | head -1 | cut -d: -f1)
+  if [[ -z $r1 || -z $r2 ]] || ((r1 > r2)); then
+    no "useradd for $u (log line ${r1:-none}) not before the reload of ssh (line ${r2:-none})"
+  fi
+  return $((1 - ok))
+}
+
+# H_ADMIN existed before (fixture SC_H_EXISTING: not in sudo, ~/.ssh 755, authorized_keys
+# 644 with the lines of h_keys0): not created again, now in sudo, ~/.ssh 700 and
+# authorized_keys 600 (owner H_ADMIN), the lines from before kept in their order at the
+# start of the file, then KEY, once; nothing else added; no NOPASSWD.
+t_h_admin_existing() { # SCENARIO KEY
+  local ok=1 a u=$H_ADMIN n0 d
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)" "$(grep '^Abbruch' "$a/err1")"
+  [[ -s $a/h_keys0 ]] || no "fixture: no authorized_keys before the run"
+  ! grep -qE "^useradd( .*)? $u\$" "$a/log1" || no "useradd ran for the existing user $u"
+  grep -qx sudo <<<"$(tr ' ' '\n' <"$a/h_groups")" || no "$u is not in group sudo: $(cat "$a/h_groups")"
+  grep -qxF "/home/$u/.ssh $u $u 700" "$a/h_stat" || no "/home/$u/.ssh is not $u:$u 700:" "$(cat "$a/h_stat")"
+  grep -qxF "/home/$u/.ssh/authorized_keys $u $u 600" "$a/h_stat" || no "authorized_keys is not $u:$u 600:" "$(cat "$a/h_stat")"
+  n0=$(grep -c '' "$a/h_keys0")
+  d=$(diff "$a/h_keys0" <(head -n "$n0" "$a/h_keys" 2>/dev/null)) || no "the lines from before are not kept at the start of authorized_keys:" "$d"
+  [[ $(h_key_count "$a/h_keys" "$2") == 1 ]] || no "the key is not exactly once in authorized_keys:" "$(cat "$a/h_keys" 2>/dev/null)"
+  [[ $(grep -c '' "$a/h_keys" 2>/dev/null) == $((n0 + 1)) ]] ||
+    no "authorized_keys has $(grep -c '' "$a/h_keys" 2>/dev/null) lines, expected $((n0 + 1)) (those from before and the key)"
+  t_h_no_nopasswd "$1" || ok=0
+  return $((1 - ok))
+}
+
+# The key was in authorized_keys before, with another comment (fixture: ~/.ssh 700, file
+# 600): exit 0, authorized_keys exactly as before (inode, mode, times, content).
+t_h_key_kept() { # SCENARIO
+  local ok=1 p=/home/$H_ADMIN/.ssh/authorized_keys d
+  have_run "$1" 1 || return 1
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)" "$(grep '^Abbruch' "$(art "$1")/err1")"
+  [[ -n $(snap_path "$1" 0 "$p") ]] || no "fixture: $p not there before the run"
+  d=$(diff <(snap_path "$1" 0 "$p") <(snap_path "$1" 1 "$p")) || no "$p changed:" "$d"
+  return $((1 - ok))
+}
+
+# sudo for H_ADMIN in SCENARIO only with its password: no NOPASSWD in /etc/sudoers or
+# /etc/sudoers.d (upper layer), and "sudo -l -U H_ADMIN" lists (ALL : ALL) ALL without
+# NOPASSWD.
+t_h_no_nopasswd() { # SCENARIO
+  local ok=1 a hits
+  a=$(art "$1")
+  hits=$(grep -rlsE 'NOPASSWD' "$(upper "$1" etc)/sudoers" "$(upper "$1" etc)/sudoers.d")
+  [[ -z $hits ]] || no "NOPASSWD in:" "$hits"
+  if grep -q 'may run the following commands' "$a/h_sudo" 2>/dev/null; then
+    grep -qE '^[[:space:]]+\(ALL( : ALL)?\) ALL$' "$a/h_sudo" || no "sudo -l: $H_ADMIN may not run everything (with its password):" "$(cat "$a/h_sudo")"
+    ! grep -q 'NOPASSWD' "$a/h_sudo" || no "sudo -l shows NOPASSWD:" "$(cat "$a/h_sudo")"
+  else
+    no "sudo -l -U $H_ADMIN does not list any rights:" "$(cat "$a/h_sudo" 2>/dev/null)"
+  fi
+  return $((1 - ok))
+}
+
+# sshd after run 1 of SCENARIO, with the files of Hostinger's image in place (before the
+# run root could log in from the internet with a password; 50-cloud-init.conf and
+# 60-cloudimg-settings.conf stay unchanged):
+#   global (sshd -T): PasswordAuthentication, KbdInteractiveAuthentication and
+#     PermitRootLogin no;
+#   from the internet (H_PUBLIC): admin user and deploy only with the key, root neither
+#     with a key nor with a password;
+#   from the web console (H_CONSOLE): root with password, admin user and deploy still
+#     only with the key;
+#   AllowUsers exactly H_ADMIN, deploy and root@H_CONSOLE in every view;
+# sshd -t passes, ssh reloaded once.
+t_h_sshd() { # SCENARIO
+  local ok=1 a v f s got want d
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  { grep -qx 'permitrootlogin yes' "$a/sshdT0_root_pub" && grep -qx 'passwordauthentication yes' "$a/sshdT0_root_pub"; } ||
+    no "fixture: before the run root from the internet could not log in with a password:" "$(grep -E '^(permitrootlogin|passwordauthentication) ' "$a/sshdT0_root_pub")"
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)" "$(grep '^Abbruch' "$a/err1")"
+  for v in \
+    "_T:passwordauthentication no" "_T:kbdinteractiveauthentication no" "_T:permitrootlogin no" \
+    "T_admin_pub:passwordauthentication no" "T_admin_pub:kbdinteractiveauthentication no" \
+    "T_admin_pub:pubkeyauthentication yes" "T_admin_pub:authenticationmethods any" \
+    "T_root_pub:permitrootlogin no" "T_root_pub:passwordauthentication no" "T_root_pub:kbdinteractiveauthentication no" \
+    "T_deploy_pub:passwordauthentication no" "T_deploy_pub:kbdinteractiveauthentication no" \
+    "T_deploy_pub:pubkeyauthentication yes" \
+    "T_root_con:permitrootlogin yes" "T_root_con:passwordauthentication yes" \
+    "T_admin_con:passwordauthentication no" "T_admin_con:kbdinteractiveauthentication no" \
+    "T_admin_con:pubkeyauthentication yes" \
+    "T_deploy_con:passwordauthentication no" "T_deploy_con:kbdinteractiveauthentication no" \
+    "T_deploy_con:pubkeyauthentication yes"; do
+    f="$a/sshd${v%%:*}" s=${v#*:}
+    grep -qx "$s" "$f" || no "${f##*/}: lacks '$s', has '$(grep -E "^${s%% *} " "$f" | tr '\n' ' ')'"
+  done
+  want=$(printf '%s\n' "$H_ADMIN" deploy "root@$H_CONSOLE" | LC_ALL=C sort | tr '\n' ' ')
+  for f in "$a/sshd_T" "$a"/sshdT_*_pub "$a"/sshdT_*_con; do
+    got=$(awk '$1 == "allowusers" { print $2 }' "$f" | LC_ALL=C sort | tr '\n' ' ')
+    [[ $got == "$want" ]] || no "${f##*/}: AllowUsers '$got', expected '$want'"
+  done
+  grep -qx 'rc=0' "$a/sshd_t" || no "sshd -t fails after the run:" "$(cat "$a/sshd_t")"
+  [[ $(grep -cxE 'systemctl reload ssh(\.service)?' "$a/log1") == 1 ]] || no "ssh was not reloaded exactly once in run 1"
+  for f in /etc/ssh/sshd_config.d/50-cloud-init.conf /etc/ssh/sshd_config.d/60-cloudimg-settings.conf; do
+    [[ -n $(snap_path "$1" 0 "$f") ]] || no "fixture: $f missing before the run"
+    d=$(diff <(snap_path "$1" 0 "$f") <(snap_path "$1" 1 "$f")) || no "$f changed:" "$d"
+  done
+  return $((1 - ok))
+}
+
+# A setting from before the run conflicts with the profile hostinger. The run aborts and
+# the abort message names REGEX (case-insensitive); /etc/ssh/sshd_config.d is as before
+# the run (names, modes, owners, contents: the drop-in removed again), ssh not reloaded,
+# sshd -t passes afterwards, the run stops there (no jail.local, no user deploy). The
+# fixture is in effect: FILE (sshd_T or sshdT_WHO_pub|con, after the run) has LINE.
+t_h_sshd_rollback() { # SCENARIO REGEX FILE LINE
+  local ok=1 a rc d
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  rc=$(rc_of "$1" 1)
+  [[ $rc =~ ^[0-9]+$ && $rc -ne 0 ]] || no "expected exit code != 0, got: $rc"
+  grep -qiE -- "$2" <<<"$(grep '^Abbruch' "$a/err1")" || no "the abort message does not name /$2/:" "$(cat "$a/err1")"
+  d=$(diff "$a/sshd_state0" "$a/sshd_state_end") || no "/etc/ssh/sshd_config.d is not as before the run (name mode owner sha256):" "$d"
+  ! grep -qE '^systemctl [a-z-]*(reload|restart)[a-z-]* ssh' "$a/log1" || no "ssh was reloaded:" "$(grep -E '^systemctl .* ssh' "$a/log1")"
+  grep -qx 'rc=0' "$a/sshd_t" || no "sshd -t fails after the abort:" "$(cat "$a/sshd_t")"
+  [[ ! -e $(upper "$1" etc)/fail2ban/jail.local ]] || no "the script went on after the failed check (jail.local written)"
+  ! grep -qE '^useradd( .*)? deploy$' "$a/log1" || no "the script went on after the failed check (user deploy created)"
+  grep -qxF -- "$4" "$a/$3" || no "fixture not in effect: $3 lacks '$4'"
+  return $((1 - ok))
+}
+
+# fail2ban-client -d after the runs of SCENARIO: the jail sshd ignores exactly the
+# addresses of H_IGNOREIP, no more and no fewer.
+t_h_f2b_ignoreip() { # SCENARIO
+  local ok=1 out
+  have_run "$1" 1 || return 1
+  [[ -s $(art "$1")/f2b_dump ]] || no "fail2ban-client -d after the run printed nothing"
+  out=$(
+    python3 -I - "$(art "$1")/f2b_dump" "$H_IGNOREIP" <<'PY'
+import ast
+import sys
+
+got = []
+with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
+    for line in f:
+        line = line.strip()
+        if line.startswith("['set', 'sshd', 'addignoreip'"):
+            got += [str(x) for x in ast.literal_eval(line)[3:]]
+want = sys.argv[2].split()
+if sorted(got) != sorted(want):
+    print("ignoreip of the jail sshd: %r, expected exactly %r" % (got, want))
+    sys.exit(1)
+PY
+  ) || no "$out"
+  return $((1 - ok))
+}
+
+# ufw installed and inactive: run 1 of SCENARIO asks "ufw status", goes on to the end with
+# exit 0 and says that ufw goes away and where the firewall is then: a line that names
+# ufw and the rules file /etc/iptables/rules.v4.
+t_h_ufw_note() { # SCENARIO
+  local ok=1 a
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)" "$(grep '^Abbruch' "$a/err1")"
+  grep -qx 'ufw status' "$a/log1" || no "the script did not ask 'ufw status'"
+  grep -qF 'rules.v4' <<<"$(grep -ihF 'ufw' "$a/out1" "$a/err1")" ||
+    no "no note naming ufw and the rules that replace it (rules.v4):" "$(cat "$a/out1" "$a/err1" | grep -iF ufw)"
+  grep -qE 'Änderungen in diesem Lauf: [0-9]' "$a/out1" || no "the run did not reach the end"
+  return $((1 - ok))
+}
+
+# None of STRING... (parts of the key passed as ADMIN_PUBKEY) appears in the output
+# (stdout, stderr) of any run of SCENARIO.
+t_h_key_hidden() { # SCENARIO STRING...
+  local ok=1 s=$1 a f str n=0
+  shift
+  have_run "$s" 1 || return 1
+  a=$(art "$s")
+  for str in "$@"; do
+    [[ ${#str} -ge 16 ]] || {
+      no "test: string '$str' too short to look for"
+      continue
+    }
+    n=$((n + 1))
+    for f in "$a"/out[0-9]* "$a"/err[0-9]*; do
+      ! grep -qF -- "$str" "$f" || no "${f##*/} shows key material: $(grep -F -- "$str" "$f" | head -2 | cut -c1-120)"
+    done
+  done
+  ((n > 0)) || no "test: nothing to look for"
+  return $((1 - ok))
+}
+
+# h_key_parts KEYFILE: what t_h_key_hidden looks for: of a public key the base64 part and
+# 20 characters from its middle; of a private key every line between the armor lines.
+h_key_parts() { # KEYFILE
+  local b
+  if grep -q -- '-----BEGIN' "$1"; then
+    grep -v -- '-----' "$1"
+  else
+    b=$(awk '{ print $2 }' "$1")
+    printf '%s\n' "$b" "${b:40:20}"
+  fi
+}
+
+# The fingerprint of KEYFILE (ssh-keygen -l, SHA256) is in the output of run 1 of SCENARIO.
+t_h_key_fpr_shown() { # SCENARIO KEYFILE
+  local ok=1 fpr
+  have_run "$1" 1 || return 1
+  fpr=$(ssh-keygen -l -f "$2" | awk '{ print $2 }')
+  [[ $fpr == SHA256:* ]] || no "test: no fingerprint for $2"
+  grep -qF -- "$fpr" "$(art "$1")/out1" "$(art "$1")/err1" || no "run 1 does not show the fingerprint $fpr"
+  return $((1 - ok))
+}
+
+# Run 2 of SCENARIO: runs 1 and 2 exit 0, run 1 reports changes, run 2 reports 0 changes,
+# changes no file and no firewall rule and runs no modifying command (package updates
+# excepted).
+t_h_rerun() { # SCENARIO
+  local ok=1 a d calls r
+  have_run "$1" 2 || return 1
+  a=$(art "$1")
+  for r in 1 2; do
+    [[ $(rc_of "$1" "$r") == 0 ]] || no "run $r: expected exit code 0, got: $(rc_of "$1" "$r")" "$(grep '^Abbruch' "$a/err$r")"
+  done
+  grep -qE 'Änderungen in diesem Lauf: [1-9]' "$a/out1" || no "run 1 does not report changes"
+  grep -qE 'Änderungen in diesem Lauf: 0([^0-9]|$)' "$a/out2" || no "run 2 does not report 0 changes:" "$(grep 'Änderungen' "$a/out2")"
+  d=$(diff "$a/snap1" "$a/snap2") || no "run 2 changed files:" "$d"
+  d=$(diff "$a/fw1" "$a/fw2") || no "run 2 changed firewall rules:" "$d"
+  calls=$(modifying_calls "$a/log2" rerun)
+  [[ -z $calls ]] || no "run 2 ran modifying commands:" "$calls"
+  return $((1 - ok))
+}
+
+# Dry run of the profile hostinger: exit 0, nothing changed (files, firewall, no modifying
+# command), no "a real run would abort", and the output shows every REGEX.
+t_h_dry() { # SCENARIO REGEX...
+  local ok=1 s=$1 a all re
+  shift
+  have_run "$s" 1 || return 1
+  a=$(art "$s")
+  [[ $(rc_of "$s" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$s" 1)"
+  assert_unchanged "$s" 1
+  ! grep -qE '\[Testlauf\].*abbrechen' "$a/err1" || no "the dry run says a real run would abort:" "$(grep -E 'abbrechen' "$a/err1")"
+  all=$(cat "$a/out1" "$a/err1")
+  for re in "$@"; do
+    grep -qE -- "$re" <<<"$all" || no "dry-run output lacks: $re"
+  done
+  return $((1 - ok))
+}
+
+# Listening services (ss) in run 1 of SCENARIO. none: only sshd (22), Hostinger's
+# Traefik (80, 443), docker-proxy (32768), loopback and the DHCP client listen, so no
+# warning names traefik, docker-proxy or 32768. 8080: a service on 0.0.0.0:8080 as well,
+# a warning names 8080 (it is not reachable from outside afterwards), none names
+# traefik, docker-proxy or 32768.
+t_h_ss() { # SCENARIO none|8080
+  local ok=1 a w
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  grep -qE '^ss -H?[a-zA-Z]*t' "$a/log1" || no "the script did not ask ss for listening TCP sockets"
+  w=$(grep 'WARNUNG:' "$a/err1")
+  ! grep -qE 'traefik|docker-proxy|32768' <<<"$w" || no "warning about Traefik or a port Docker publishes:" "$(grep -E 'traefik|docker-proxy|32768' <<<"$w")"
+  if [[ $2 == 8080 ]]; then
+    grep -q '8080' <<<"$w" || no "no warning about the service on port 8080:" "$w"
+  else
+    ! grep -q '8080' <<<"$w" || no "fixture: a service on 8080 although none should listen there"
+  fi
+  return $((1 - ok))
+}
+
+# Profile oracle (SCENARIO with the default or PROFIL=oracle) has nothing of the profile
+# hostinger: exit 0; no Match block and no 169.254 in the drop-in; no ignoreip in
+# jail.local, fail2ban ignores no 169.254 address; daemon.json written as before (log
+# limits, no live-restore); Docker installed from the repository as before.
+t_oracle_profile() { # SCENARIO
+  local ok=1 a f
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)" "$(grep '^Abbruch' "$a/err1")"
+  f="$(upper "$1" etc)${SSHD_DROPIN#/etc}"
+  [[ -f $f ]] || no "$SSHD_DROPIN missing"
+  ! grep -qiE 'match|169\.254' "$f" 2>/dev/null || no "the drop-in has a Match block or 169.254:" "$(cat "$f")"
+  ! grep -qi 'ignoreip' "$(upper "$1" etc)/fail2ban/jail.local" 2>/dev/null || no "jail.local sets ignoreip"
+  ! grep -q '169\.254' "$a/f2b_dump" || no "fail2ban ignores a 169.254 address:" "$(grep '169\.254' "$a/f2b_dump")"
+  t_h_daemon_json "$1" '{"log-driver": "local", "log-opts": {"max-size": "10m", "max-file": "3"}}' || ok=0
+  grep -qE '^apt-get .* install .*docker-ce( |$)' "$a/log1" || no "docker-ce not installed"
+  return $((1 - ok))
+}
+
+# Profile oracle with ADMIN_PUBKEY (KEYFILE) set: exit 0, a warning that names
+# ADMIN_PUBKEY, ubuntu's authorized_keys as before (inode, mode, times, content), the key
+# not in it.
+t_oracle_pubkey_ignored() { # SCENARIO KEYFILE
+  local ok=1 a p=/home/ubuntu/.ssh/authorized_keys d
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)" "$(grep '^Abbruch' "$a/err1")"
+  grep -qF 'ADMIN_PUBKEY' <<<"$(grep 'WARNUNG:' "$a/err1")" || no "no warning that names ADMIN_PUBKEY:" "$(grep 'WARNUNG' "$a/err1")"
+  [[ -n $(snap_path "$1" 0 "$p") ]] || no "fixture: $p not there before the run"
+  d=$(diff <(snap_path "$1" 0 "$p") <(snap_path "$1" 1 "$p")) || no "$p changed:" "$d"
+  [[ $(h_key_count "$(upper "$1" home)/ubuntu/.ssh/authorized_keys" "$(<"$2")") == 0 ]] || no "the key was added for ubuntu"
+  return $((1 - ok))
+}
+
+# prepare_ssh_keys DIR: throwaway SSH keys for ADMIN_PUBKEY, made for this run with
+# ssh-keygen (no passphrase) and removed with the work directory: ed25519, other (a
+# second ed25519), ecdsa256, ecdsa384, ecdsa521, rsa2048, rsa1024 (DIR/NAME and NAME.pub).
+prepare_ssh_keys() {
+  local dir=$1 spec name type bits
+  local -a size
+  install -d -m 700 "$dir" || return 1
+  for spec in ed25519:ed25519: other:ed25519: ecdsa256:ecdsa:256 ecdsa384:ecdsa:384 ecdsa521:ecdsa:521 \
+    rsa2048:rsa:2048 rsa1024:rsa:1024; do
+    IFS=: read -r name type bits <<<"$spec"
+    size=()
+    if [[ -n $bits ]]; then size=(-b "$bits"); fi
+    ssh-keygen -q -t "$type" "${size[@]}" -N '' -C "$name@example.invalid" -f "$dir/$name" </dev/null >/dev/null 2>&1 || return 1
+    [[ $(ssh-keygen -l -f "$dir/$name.pub" | awk '{ print $1 }') == "${bits:-256}" ]] || return 1
+  done
+}
+
 # --- tests: host untouched --------------------------------------------------
 
 host_state() {
@@ -3366,6 +4295,229 @@ prepare_keys() {
   [[ -z $(key_fprs "$dir/invalid.asc") ]] || return 1
 }
 
+# Scenarios of the profile hostinger (PROFIL=hostinger), and the profile oracle next to
+# it. H: a Hostinger VPS (hostinger_fixture, hostinger_v4/v6: Docker installed and
+# running with docker-ce from Docker's repository, ufw installed and inactive, INPUT open,
+# Docker's chains and a DNAT for 32768, root with password), run as root from the web
+# console or an SSH login as root (audit login UID 0, no SUDO_USER); nobody else has a
+# key. HA: the same with ADMIN_USER=H_ADMIN and ADMIN_PUBKEY=the ed25519 key.
+hostinger_scenarios() {
+  local k=$WORK/sshkeys ed other dpkg b64
+  local -a H HA
+  ed=$(<"$k/ed25519.pub")
+  other=$(<"$k/other.pub")
+  dpkg=$(printf '%s\n' 'docker-ce=install ok installed' 'docker-ce-cli=install ok installed' \
+    'containerd.io=install ok installed' 'docker-compose-plugin=install ok installed' 'ufw=install ok installed')
+  H=(SC_PROFIL=hostinger SC_HOSTINGER=1 SC_LOGINUID=0 SC_KEY=none SC_HIDE_DOCKER=0
+    SC_FW=hostinger SC_V6=hostinger "SC_DPKG=$dpkg" SC_SS=hostinger)
+  HA=("${H[@]}" "SC_ADMIN_USER=$H_ADMIN" "SC_ADMIN_PUBKEY=$ed")
+  # PROFIL
+  scenario profil_unknown SC_PROFIL=hetzner
+  scenario profil_case "${HA[@]}" SC_PROFIL=Hostinger
+  scenario oracle_explicit SC_PROFIL=oracle
+  scenario oracle_pubkey "SC_ADMIN_PUBKEY=$ed"
+  # Fresh Hostinger VPS, run twice; dry runs
+  scenario h_fresh "${HA[@]}" SC_RUNS=2
+  scenario h_dry "${HA[@]}" SC_DRY_RUN=1
+  scenario h_dry_nobody "${HA[@]}" SC_DRY_RUN=1 SC_AS=nobody
+  scenario h_dry_badkey "${HA[@]}" SC_DRY_RUN=1 "SC_ADMIN_PUBKEY=restrict $ed"
+  scenario h_ss_other "${HA[@]}" SC_DRY_RUN=1 SC_SS=other
+  # Between the runs fail2ban's chain and the CI key arrive
+  scenario h_rerun_real "${HA[@]}" SC_RUNS=2 SC_H_BETWEEN=1
+  # Admin user exists already
+  scenario h_existing "${HA[@]}" SC_RUNS=2 SC_H_EXISTING=1 \
+    "SC_H_OLDKEYS=# keys from before (test fixture)\nfrom=\"192.0.2.0/24\" $other\n"
+  scenario h_existing_samekey "${HA[@]}" SC_H_EXISTING=1 SC_H_SSH_MODE=700 SC_H_KEYS_MODE=600 \
+    "SC_H_OLDKEYS=$(awk '{ print $1, $2 }' <<<"$ed") same key, other comment\n"
+  # Rules saved before (netfilter-persistent save: all tables)
+  scenario h_rules_old "${HA[@]}" SC_RUNS=2 SC_RULES_SAVED=1
+  # daemon.json from before
+  scenario h_dj_merge "${HA[@]}" SC_RUNS=2 \
+    'SC_DAEMON_JSON={\n  "dns": ["192.0.2.53"],\n  "log-driver": "json-file",\n  "log-opts": {"max-size": "50m"},\n  "features": {"buildkit": true}\n}'
+  scenario h_dj_keep "${HA[@]}" 'SC_DAEMON_JSON={"live-restore": false, "log-driver": "syslog"}'
+  scenario h_dj_invalid "${HA[@]}" 'SC_DAEMON_JSON={"log-driver": "local",'
+  scenario h_dj_array "${HA[@]}" 'SC_DAEMON_JSON=["live-restore"]'
+  # ufw active
+  scenario h_ufw_active "${HA[@]}" SC_UFW=active
+  # Other allowed key types (real run each)
+  scenario h_key_ecdsa256 "${H[@]}" "SC_ADMIN_USER=$H_ADMIN" "SC_ADMIN_PUBKEY=$(<"$k/ecdsa256.pub")"
+  scenario h_key_ecdsa384 "${H[@]}" "SC_ADMIN_USER=$H_ADMIN" "SC_ADMIN_PUBKEY=$(<"$k/ecdsa384.pub")"
+  scenario h_key_ecdsa521 "${H[@]}" "SC_ADMIN_USER=$H_ADMIN" "SC_ADMIN_PUBKEY=$(<"$k/ecdsa521.pub")"
+  scenario h_key_rsa2048 "${H[@]}" "SC_ADMIN_USER=$H_ADMIN" "SC_ADMIN_PUBKEY=$(<"$k/rsa2048.pub")"
+  # ADMIN_USER
+  scenario h_pre_noadmin "${H[@]}" "SC_ADMIN_PUBKEY=$ed"
+  scenario h_pre_admin_bad "${H[@]}" "SC_ADMIN_PUBKEY=$ed" "SC_ADMIN_USER=Bad.User"
+  scenario h_pre_admin_long "${H[@]}" "SC_ADMIN_PUBKEY=$ed" "SC_ADMIN_USER=$(printf 'a%.0s' {1..33})"
+  scenario h_pre_admin_root "${H[@]}" "SC_ADMIN_PUBKEY=$ed" SC_ADMIN_USER=root
+  scenario h_pre_admin_deploy "${H[@]}" "SC_ADMIN_PUBKEY=$ed" SC_ADMIN_USER=deploy
+  scenario h_pre_admin_sys "${H[@]}" "SC_ADMIN_PUBKEY=$ed" "SC_ADMIN_USER=$H_SYSUSER"
+  scenario h_pre_admin_nologin "${H[@]}" "SC_ADMIN_PUBKEY=$ed" "SC_ADMIN_USER=$H_NOLOGIN"
+  scenario h_pre_admin_group "${H[@]}" "SC_ADMIN_PUBKEY=$ed" "SC_ADMIN_USER=$H_GROUP"
+  # ADMIN_PUBKEY
+  scenario h_pre_nokey "${H[@]}" "SC_ADMIN_USER=$H_ADMIN"
+  scenario h_pre_key_blank "${H[@]}" "SC_ADMIN_USER=$H_ADMIN" "SC_ADMIN_PUBKEY=   "
+  scenario h_pre_key_private "${H[@]}" "SC_ADMIN_USER=$H_ADMIN" "SC_ADMIN_PUBKEY=$(<"$k/ed25519")"
+  scenario h_pre_key_twolines "${H[@]}" "SC_ADMIN_USER=$H_ADMIN" "SC_ADMIN_PUBKEY=$ed"$'\n'"$other"
+  scenario h_pre_key_restrict "${H[@]}" "SC_ADMIN_USER=$H_ADMIN" "SC_ADMIN_PUBKEY=restrict $ed"
+  scenario h_pre_key_command "${H[@]}" "SC_ADMIN_USER=$H_ADMIN" "SC_ADMIN_PUBKEY=command=\"/usr/bin/id\" $ed"
+  scenario h_pre_key_from "${H[@]}" "SC_ADMIN_USER=$H_ADMIN" "SC_ADMIN_PUBKEY=from=\"192.0.2.0/24\" $ed"
+  scenario h_pre_key_b64 "${H[@]}" "SC_ADMIN_USER=$H_ADMIN" "SC_ADMIN_PUBKEY=ssh-ed25519 AAAA!!!!not*base64 x@example.invalid"
+  b64=$(printf 'not a key at all, only base64 text' | base64 -w0)
+  scenario h_pre_key_notkey "${H[@]}" "SC_ADMIN_USER=$H_ADMIN" "SC_ADMIN_PUBKEY=ssh-ed25519 $b64 x@example.invalid"
+  scenario h_pre_key_typemix "${H[@]}" "SC_ADMIN_USER=$H_ADMIN" "SC_ADMIN_PUBKEY=ssh-rsa $(awk '{ print $2 }' <<<"$ed") x@example.invalid"
+  scenario h_pre_key_curve "${H[@]}" "SC_ADMIN_USER=$H_ADMIN" \
+    "SC_ADMIN_PUBKEY=ecdsa-sha2-nistp256 $(awk '{ print $2 }' "$k/ecdsa384.pub") x@example.invalid"
+  scenario h_pre_key_rsa1024 "${H[@]}" "SC_ADMIN_USER=$H_ADMIN" "SC_ADMIN_PUBKEY=$(<"$k/rsa1024.pub")"
+  b64=$(printf '\x00\x00\x00\x07ssh-dss' | base64 -w0)
+  scenario h_pre_key_dss "${H[@]}" "SC_ADMIN_USER=$H_ADMIN" "SC_ADMIN_PUBKEY=ssh-dss $b64 x@example.invalid"
+  b64=$(printf '\x00\x00\x00\x1ask-ssh-ed25519@openssh.com' | base64 -w0)
+  scenario h_pre_key_sk "${H[@]}" "SC_ADMIN_USER=$H_ADMIN" "SC_ADMIN_PUBKEY=sk-ssh-ed25519@openssh.com $b64 x@example.invalid"
+  # Who runs it
+  scenario h_pre_nonroot "${HA[@]}" SC_AS=nobody
+  scenario h_pre_sudo_other "${HA[@]}" SC_SUDO_USER=ubuntu
+  # sshd settings from before that conflict with the profile
+  scenario h_ssh_early_root "${HA[@]}" "SC_SSHD_EARLY=PermitRootLogin yes"
+  scenario h_ssh_match_addr "${HA[@]}" "SC_SSHD_EARLY=Match Address $H_CONSOLE\n    PasswordAuthentication yes"
+  scenario h_ssh_match_root "${HA[@]}" "SC_SSHD_EARLY=Match User root Address $H_CONSOLE\n    PasswordAuthentication no"
+  scenario h_ssh_usepam "${HA[@]}" "SC_SSHD_EARLY=UsePAM no"
+  scenario h_ssh_late_allowroot "${HA[@]}" "SC_SSHD_LATE=AllowUsers root"
+  # fail2ban: a foreign file exempts more addresses
+  scenario h_f2b_ignoreip "${HA[@]}" "SC_F2B_JAIL_D=[sshd]\nignoreip = $H_IGNOREIP 0.0.0.0/0"
+}
+
+hostinger_checks() {
+  local k=$WORK/sshkeys s ed fresh_want merge_want
+  local -a parts ed_parts other_parts rsa1024_parts
+  ed=$(<"$k/ed25519.pub")
+  mapfile -t ed_parts < <(h_key_parts "$k/ed25519.pub")
+  mapfile -t other_parts < <(h_key_parts "$k/other.pub")
+  mapfile -t rsa1024_parts < <(h_key_parts "$k/rsa1024.pub")
+  fresh_want='{"log-driver": "local", "log-opts": {"max-size": "10m", "max-file": "3"}, "live-restore": true}'
+  merge_want='{"dns": ["192.0.2.53"], "log-driver": "json-file", "log-opts": {"max-size": "50m", "max-file": "3"}, "features": {"buildkit": true}, "live-restore": true}'
+
+  check "PROFIL=hetzner (unknown): abort before any change, naming PROFIL" t_aborts_because profil_unknown 'PROFIL'
+  check "PROFIL=Hostinger (wrong case, unknown): abort before any change" t_aborts_because profil_case 'PROFIL'
+  check "PROFIL=oracle explicit: as the default (AllowUsers ubuntu deploy, sshd -T)" t_sshd_effective oracle_explicit ubuntu
+  check "profile oracle (PROFIL=oracle): no console exception, no ignoreip, daemon.json as before, Docker from the repository" \
+    t_oracle_profile oracle_explicit
+  check "profile oracle (default): no console exception, no ignoreip, daemon.json as before, Docker from the repository" \
+    t_oracle_profile fresh
+  check "profile oracle with ADMIN_PUBKEY set: warning, key not installed, ubuntu's authorized_keys unchanged" \
+    t_oracle_pubkey_ignored oracle_pubkey "$k/ed25519.pub"
+
+  check "hostinger: run 2 exits 0, 0 changes, no file or firewall rule changed, no modifying command" t_h_rerun h_fresh
+  check "hostinger: admin user created (home /home/$H_ADMIN, bash, group sudo), ~/.ssh 700 and authorized_keys 600 owned by it, key once, no NOPASSWD, created before ssh reload" \
+    t_h_admin_created h_fresh "$ed"
+  check "hostinger: SSH from the internet: admin and deploy only with key, root denied; from $H_CONSOLE: root with password, admin and deploy still only key; AllowUsers $H_ADMIN deploy root@$H_CONSOLE; overrides 50-cloud-init and 60-cloudimg-settings" \
+    t_h_sshd h_fresh
+  check "hostinger: fail2ban values as in profile oracle (fail2ban-client -d)" t_f2b_effective h_fresh 2
+  check "hostinger: fail2ban ignoreip exactly $H_IGNOREIP" t_h_f2b_ignoreip h_fresh
+  check "hostinger firewall IPv4 on empty INPUT: lo, RELATED/ESTABLISHED, ICMP, DHCP client, tcp 22/80/443 in this order, REJECT last, policy ACCEPT" \
+    t_h_fw_input h_fresh v4 1
+  check "hostinger firewall IPv6 on empty INPUT: lo, RELATED/ESTABLISHED, ICMPv6, DHCPv6 client (link-local), tcp 22/80/443 in this order, REJECT last, policy ACCEPT" \
+    t_h_fw_input h_fresh v6 1
+  check "hostinger firewall IPv4 after run 2: no duplicates, same order" t_h_fw_input h_fresh v4 2
+  check "hostinger firewall IPv6 after run 2: no duplicates, same order" t_h_fw_input h_fresh v6 2
+  check "hostinger firewall: nat (DNAT 32768) byte for byte, FORWARD and DOCKER* chains untouched after two runs (IPv4 and IPv6)" \
+    t_h_fw_others_untouched h_fresh 2
+  check "hostinger firewall: rules.v4/v6 only table filter with the INPUT rules in effect, 640, restore --test passes; restore only with --test" \
+    t_h_rules_files h_fresh 1
+  check "hostinger firewall: no rules file before: no backup" t_h_no_backup h_fresh /etc/iptables/rules.v4
+  check "hostinger: daemon.json created with live-restore true and log-driver local 10m x 3, dockerd --validate passes" \
+    t_h_daemon_json h_fresh "$fresh_want"
+  check "hostinger: no daemon.json before: no backup" t_h_no_backup h_fresh /etc/docker/daemon.json
+  check "hostinger: Docker reloaded once before apt-get full-upgrade, never restarted, not reinstalled; not reloaded in run 2" \
+    t_h_docker_calls h_fresh 1
+  check "hostinger: ufw inactive: clear note that it goes and the iptables rules take over, run goes on" t_h_ufw_note h_fresh
+  check "hostinger: listening Traefik (80/443) and docker-proxy (32768): no warning about them" t_h_ss h_fresh none
+  check "hostinger: service on 0.0.0.0:8080: warning that names it" t_h_ss h_ss_other 8080
+  check "hostinger: ADMIN_PUBKEY not printed in runs 1 and 2" t_h_key_hidden h_fresh "${ed_parts[@]}"
+  check "hostinger: fingerprint of ADMIN_PUBKEY shown" t_h_key_fpr_shown h_fresh "$k/ed25519.pub"
+
+  check "hostinger dry run: exit 0, nothing changed, shows admin user, sudo, REJECT for IPv4 and IPv6, console exception, ignoreip, live-restore, reload of docker" \
+    t_h_dry h_dry "useradd .*$H_ADMIN" "usermod .*sudo.* $H_ADMIN" 'iptables -A INPUT .*-j REJECT' 'ip6tables -A INPUT .*-j REJECT' \
+    "Match User root Address 169\.254\.0\.1" "AllowUsers $H_ADMIN deploy root@169\.254\.0\.1" \
+    'ignoreip = 127\.0\.0\.1/8 ::1 169\.254\.0\.1' '"live-restore": true' 'systemctl reload docker'
+  check "hostinger dry run: ADMIN_PUBKEY not printed" t_h_key_hidden h_dry "${ed_parts[@]}"
+  check "hostinger dry run as non-root: nothing changed, says a real run would abort" t_dry_would_abort h_dry_nobody 'root'
+  check "hostinger dry run with option in front of the key: nothing changed, says a real run would abort naming ADMIN_PUBKEY" \
+    t_dry_would_abort h_dry_badkey 'ADMIN_PUBKEY'
+
+  check "hostinger, second run on a used server (fail2ban chain at the top of INPUT, CI key): 0 changes, nothing changed" \
+    t_h_rerun h_rerun_real
+  check "hostinger, second run on a used server: IPv4 INPUT keeps fail2ban's jump on top, no duplicates" t_h_fw_input h_rerun_real v4 2 f2b
+  check "hostinger, second run on a used server: IPv6 INPUT keeps fail2ban's jump on top, no duplicates" t_h_fw_input h_rerun_real v6 2 f2b
+  check "hostinger, second run on a used server: rules files without fail2ban's jump" t_h_rules_files h_rerun_real 2
+
+  check "hostinger: existing admin user with other keys: not recreated, put in sudo, 700/600 fixed, old keys kept, key added once, no NOPASSWD" \
+    t_h_admin_existing h_existing "$ed"
+  check "hostinger: existing admin user: run 2 changes nothing" t_h_rerun h_existing
+  check "hostinger: key already there with another comment: authorized_keys untouched" t_h_key_kept h_existing_samekey
+
+  check "hostinger: earlier rules.v4 (all tables) replaced, timestamped backup with the old content" \
+    t_h_backup h_rules_old /etc/iptables/rules.v4 "$WORK/h_rules_old/rules.v4.orig"
+  check "hostinger: earlier rules.v6 (all tables) replaced, timestamped backup with the old content" \
+    t_h_backup h_rules_old /etc/iptables/rules.v6 "$WORK/h_rules_old/rules.v6.orig"
+  check "hostinger: earlier rules files: new ones only table filter with the INPUT rules" t_h_rules_files h_rules_old 1
+  check "hostinger: earlier rules files: run 2 changes nothing (no second backup)" t_h_rerun h_rules_old
+
+  check "hostinger: daemon.json with other keys merged (dns, json-file, max-size 50m, features kept; max-file 3, live-restore true added), dockerd --validate passes" \
+    t_h_daemon_json h_dj_merge "$merge_want"
+  check "hostinger: daemon.json merged: timestamped backup with the old content" \
+    t_h_backup h_dj_merge /etc/docker/daemon.json "$WORK/h_dj_merge/daemon.json.orig"
+  check "hostinger: daemon.json merged: reloaded once in run 1, never restarted; run 2 changes nothing" t_h_docker_calls h_dj_merge 1
+  check "hostinger: daemon.json merged: run 2 changes nothing" t_h_rerun h_dj_merge
+  check "hostinger: live-restore false and log-driver syslog kept with warnings, file untouched, no reload, no backup" t_h_dj_keep h_dj_keep
+  check "hostinger: invalid daemon.json: abort before any change, naming daemon.json" t_aborts_because h_dj_invalid 'daemon\.json'
+  check "hostinger: daemon.json not an object: abort before any change, naming daemon.json" t_aborts_because h_dj_array 'daemon\.json'
+  check "hostinger: Docker never restarted, stopped or started in any scenario of the profile" t_h_docker_never_restarted
+
+  check "hostinger: UFW active: abort before any change" t_aborts_because h_ufw_active '^Abbruch.*(UFW|ufw)'
+
+  for s in ecdsa256 ecdsa384 ecdsa521 rsa2048; do
+    check "hostinger: ADMIN_PUBKEY of type $s accepted and installed" t_h_admin_created "h_key_$s" "$(<"$k/$s.pub")"
+  done
+
+  check "hostinger: ADMIN_USER missing (no default): abort before any change, naming ADMIN_USER" t_aborts_because h_pre_noadmin 'ADMIN_USER'
+  check "hostinger: ADMIN_USER Bad.User (invalid name): abort before any change" t_aborts_because h_pre_admin_bad 'ADMIN_USER'
+  check "hostinger: ADMIN_USER with 33 characters: abort before any change" t_aborts_because h_pre_admin_long 'ADMIN_USER'
+  check "hostinger: ADMIN_USER=root: abort before any change" t_aborts_because h_pre_admin_root 'root'
+  check "hostinger: ADMIN_USER=deploy: abort before any change" t_aborts_because h_pre_admin_deploy 'deploy'
+  check "hostinger: ADMIN_USER is a system user: abort before any change, naming it" t_aborts_because h_pre_admin_sys "$H_SYSUSER"
+  check "hostinger: ADMIN_USER exists with shell nologin: abort before any change, naming it" t_aborts_because h_pre_admin_nologin "$H_NOLOGIN"
+  check "hostinger: only a group of that name exists: abort before any change, naming it" t_aborts_because h_pre_admin_group "$H_GROUP"
+
+  check "hostinger: ADMIN_PUBKEY missing: abort before any change, naming ADMIN_PUBKEY" t_aborts_because h_pre_nokey 'ADMIN_PUBKEY'
+  check "hostinger: ADMIN_PUBKEY only blanks: abort before any change" t_aborts_because h_pre_key_blank 'ADMIN_PUBKEY'
+  for s in private twolines restrict command from b64 notkey typemix curve rsa1024 dss sk; do
+    check "hostinger: ADMIN_PUBKEY rejected ($s): abort before any change, naming ADMIN_PUBKEY" t_aborts_because "h_pre_key_$s" 'ADMIN_PUBKEY'
+  done
+  mapfile -t parts < <(h_key_parts "$k/ed25519")
+  check "hostinger: private key passed: not printed" t_h_key_hidden h_pre_key_private "${parts[@]}"
+  for s in twolines restrict command from typemix; do
+    check "hostinger: rejected ADMIN_PUBKEY ($s) not printed" t_h_key_hidden "h_pre_key_$s" "${ed_parts[@]}"
+  done
+  check "hostinger: rejected ADMIN_PUBKEY (second line of twolines) not printed" t_h_key_hidden h_pre_key_twolines "${other_parts[@]}"
+  check "hostinger: rejected RSA-1024 key not printed" t_h_key_hidden h_pre_key_rsa1024 "${rsa1024_parts[@]}"
+
+  check "hostinger: not root: abort before any change" t_aborts_because h_pre_nonroot 'root'
+  check "hostinger: run with sudo by ubuntu (not ADMIN_USER): abort before any change, naming ubuntu" t_aborts_because h_pre_sudo_other "'ubuntu'"
+
+  check "hostinger SSH: earlier PermitRootLogin yes: abort, drop-in rolled back, no reload, sshd valid" \
+    t_h_sshd_rollback h_ssh_early_root 'permitrootlogin' sshd_T 'permitrootlogin yes'
+  check "hostinger SSH: earlier Match Address $H_CONSOLE with PasswordAuthentication yes: abort, drop-in rolled back" \
+    t_h_sshd_rollback h_ssh_match_addr 'passwordauthentication' sshdT_admin_con 'passwordauthentication yes'
+  check "hostinger SSH: earlier Match User root Address $H_CONSOLE with PasswordAuthentication no: abort, drop-in rolled back" \
+    t_h_sshd_rollback h_ssh_match_root 'passwordauthentication' sshdT_root_con 'passwordauthentication no'
+  check "hostinger SSH: UsePAM no: abort, drop-in rolled back" t_h_sshd_rollback h_ssh_usepam 'usepam' sshd_T 'usepam no'
+  check "hostinger SSH: AllowUsers root in a later drop-in: abort, drop-in rolled back" \
+    t_h_sshd_rollback h_ssh_late_allowroot 'allowusers' sshd_T 'allowusers root'
+
+  check "hostinger fail2ban: foreign jail.d/zz.local adds 0.0.0.0/0 to ignoreip: abort naming the file, fail2ban not restarted" \
+    t_f2b_foreign_abort h_f2b_ignoreip 1 /etc/fail2ban/jail.d/zz.local \
+    "['set', 'sshd', 'addignoreip', '127.0.0.1/8', '::1', '169.254.0.1', '0.0.0.0/0']"
+}
+
 main() {
   local missing=() c
   if [[ $EUID -ne 0 ]]; then
@@ -3374,7 +4526,7 @@ main() {
   fi
   for c in unshare setpriv iptables ip6tables iptables-save ip6tables-save iptables-restore \
     ip6tables-restore /usr/sbin/sshd fail2ban-client apt-config shellcheck python3 diff \
-    gpg gpgconf /usr/sbin/useradd /usr/sbin/groupadd /usr/sbin/groupdel mount readlink cmp; do
+    gpg gpgconf /usr/sbin/useradd /usr/sbin/groupadd /usr/sbin/groupdel mount readlink cmp ssh-keygen; do
     command -v "$c" >/dev/null 2>&1 || missing+=("$c")
   done
   if ((${#missing[@]})); then
@@ -3397,6 +4549,12 @@ main() {
     echo "CANNOT RUN: user srvadmin exists on this host (the fixtures create it)"
     exit 2
   fi
+  for c in "$H_ADMIN" "$H_SYSUSER" "$H_NOLOGIN" "$H_GROUP"; do
+    if getent passwd "$c" >/dev/null || getent group "$c" >/dev/null; then
+      echo "CANNOT RUN: user or group $c exists on this host (the fixtures of the profile hostinger create it)"
+      exit 2
+    fi
+  done
   for c in sshlogin sshdeny; do
     if getent group "$c" >/dev/null; then
       echo "CANNOT RUN: group $c exists on this host (the fixtures create it)"
@@ -3447,6 +4605,10 @@ main() {
   cp -a "$WORK/stubs" "$WORK/stubs-noufw" && rm -f "$WORK/stubs-noufw/ufw"
   if ! prepare_keys "$WORK/keys"; then
     echo "CANNOT RUN: test keys could not be prepared (gpg)"
+    exit 2
+  fi
+  if ! prepare_ssh_keys "$WORK/sshkeys"; then
+    echo "CANNOT RUN: SSH test keys could not be made (ssh-keygen)"
     exit 2
   fi
   host_state >"$WORK/host_before"
@@ -3624,6 +4786,7 @@ PermitRootLogin yes"
   scenario deploy_home SC_DEPLOY_HOME=/srv/deployhome SC_RUNS=2
   scenario dry_deploy_home SC_DRY_RUN=1 SC_DEPLOY_HOME=/srv/deployhome
   # The sandbox itself
+  hostinger_scenarios
   guard_case guard_no_markers no_markers
   guard_case guard_caller_ns caller_ns
   guard_case guard_pid1 pid1
@@ -3972,6 +5135,8 @@ PermitRootLogin yes"
     t_deploy_home deploy_home /srv/deployhome
   check "dry run, deploy with home /srv/deployhome: shows authorized_keys there, not /home/deploy" \
     t_dry_deploy_home dry_deploy_home /srv/deployhome
+
+  hostinger_checks
 
   check "sandbox: inner entry point without caller markers refuses, mounts nothing" t_guard_refuses guard_no_markers
   check "sandbox: inner entry point in its caller's namespaces refuses, mounts nothing" t_guard_refuses guard_caller_ns
