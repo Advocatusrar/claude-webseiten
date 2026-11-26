@@ -178,9 +178,8 @@ Repository privat, bleibt das Image privat, und der Server braucht einmal
 ## Rollback
 
 - **Automatisch:** `deploy.sh` startet das vorige Image, wenn das neue nicht gesund wird.
-- **Von Hand:** auf dem Server `sudo -u deploy /opt/website/deploy.sh
-  ghcr.io/<owner>/<repo>/website:sha-<älterer-commit>`. Achtung: `setup-server.sh`
-  richtet `/opt/website` nicht mehr ein. Pfad und Befehl werden mit dem Aufbau von Live
-  und Staging neu festgelegt; bis dahin gilt dieser Befehl nicht.
-- **Sauber über Git:** den fehlerhaften Commit mit `git revert` rückgängig machen und als
-  Pull Request durch die Pipeline schicken.
+- **Über die Pipeline (der Weg):** den fehlerhaften Commit mit `git revert` rückgängig
+  machen (oder im gemergten Pull Request auf „Revert“ klicken) und als Pull Request
+  nach `main` schicken. Nach dem Merge läuft der normale Ablauf: Prüfungen, Image,
+  Veröffentlichen, Deploy mit Freigabe von `production`. Es gibt keinen Rollback von
+  Hand auf dem Server.
