@@ -452,21 +452,27 @@ Deploy-Schlüssel.
    sudo install -d -m 750 -o deploy -g deploy /opt/website
    ```
 
-5. **Dateien übertragen**, auf eurem Rechner im Repository. Die Dateien landen zuerst im
-   Home-Verzeichnis eures Admin-Benutzers (nicht in `/tmp`, das alle Benutzer sehen):
+5. **Dateien übertragen**, auf eurem Rechner im Repository. Die Dateien landen zuerst in
+   einem eigenen Ordner `~/website-upload/` eures Admin-Benutzers (nicht in `/tmp`, das
+   alle Benutzer sehen, und nicht direkt im Home-Verzeichnis, damit gleichnamige Dateien
+   dort weder überschrieben noch gelöscht werden):
 
    ```sh
-   scp deploy/compose.hostinger.yml deploy/deploy.sh deploy/.env.example <admin>@SERVER:
+   ssh <admin>@SERVER 'mkdir -p -m 700 ~/website-upload'
+   scp deploy/compose.hostinger.yml deploy/deploy.sh deploy/.env.example <admin>@SERVER:website-upload/
    ```
 
-   Dann auf dem Server. Die letzte Zeile legt `.env` nur an, wenn es noch keine gibt;
-   eine vorhandene `.env` (mit dem aktuellen `WEBSITE_IMAGE`) bleibt unverändert:
+   Dann auf dem Server. Der dritte Befehl legt `.env` nur an, wenn es noch keine gibt;
+   eine vorhandene `.env` (mit dem aktuellen `WEBSITE_IMAGE`) bleibt unverändert. Prüfung
+   und Anlegen laufen in einem einzigen `sudo`, damit eine fehlgeschlagene Anmeldung bei
+   `sudo` nie zum Überschreiben führt:
 
    ```sh
-   sudo install -m 644 -o deploy -g deploy ~/compose.hostinger.yml /opt/website/
-   sudo install -m 755 -o deploy -g deploy ~/deploy.sh /opt/website/
-   sudo test -e /opt/website/.env || sudo install -m 600 -o deploy -g deploy ~/.env.example /opt/website/.env
-   rm ~/compose.hostinger.yml ~/deploy.sh ~/.env.example
+   sudo install -m 644 -o deploy -g deploy ~/website-upload/compose.hostinger.yml /opt/website/
+   sudo install -m 755 -o deploy -g deploy ~/website-upload/deploy.sh /opt/website/
+   sudo sh -c "test -e /opt/website/.env || install -m 600 -o deploy -g deploy $HOME/website-upload/.env.example /opt/website/.env"
+   rm ~/website-upload/compose.hostinger.yml ~/website-upload/deploy.sh ~/website-upload/.env.example
+   rmdir ~/website-upload
    ```
 
 6. **`.env` ausfüllen:** `sudo -u deploy nano /opt/website/.env`, Inhalt:
