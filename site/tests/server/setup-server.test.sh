@@ -5556,7 +5556,8 @@ main() {
   fi
   for c in unshare setpriv iptables ip6tables iptables-save ip6tables-save iptables-restore \
     ip6tables-restore /usr/sbin/sshd fail2ban-client apt-config shellcheck python3 diff \
-    gpg gpgconf /usr/sbin/useradd /usr/sbin/groupadd /usr/sbin/groupdel mount readlink cmp ssh-keygen; do
+    gpg gpgconf /usr/sbin/useradd /usr/sbin/groupadd /usr/sbin/groupdel mount readlink cmp ssh-keygen \
+    script perl; do
     command -v "$c" >/dev/null 2>&1 || missing+=("$c")
   done
   if ((${#missing[@]})); then
