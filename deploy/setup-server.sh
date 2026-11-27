@@ -335,12 +335,13 @@ hostinger_ports() {
   done
 }
 # hostinger_missing TOOL: names of the needed ACCEPT rules (hostinger_rules and
-# hostinger_ports) that are not in INPUT before the first REJECT; nothing if all are.
-# Without a REJECT rule a rule anywhere in INPUT counts.
+# hostinger_ports) that are not in INPUT before the final unconditional REJECT or DROP
+# (accept_limit); nothing if all are. Without such a final rule a rule anywhere in
+# INPUT counts.
 hostinger_missing() {
   local tool=$1 desc spec pos n found missing=""
   local -a rule
-  pos=$(reject_pos "$tool")
+  pos=$(accept_limit "$tool")
   while IFS='|' read -r desc spec; do
     [[ -n $desc ]] || continue
     read -r -a rule <<<"$spec"
@@ -365,6 +366,15 @@ hostinger_final_pos() {
       gsub(/ -m comment --comment ("([^"\\]|\\.)*"|[^ "]+)/, "", r)
       last = (r ~ /^-A INPUT -j REJECT( --reject-with [^ ]+)?$/ || r == "-A INPUT -j DROP") ? n : "" }
     END { if (last != "") print last }'
+}
+# accept_limit TOOL: the rule number new ACCEPT rules are inserted at (ensure_accept),
+# and before which an ACCEPT rule counts; empty means "append". Profile oracle: the
+# first REJECT or unconditional DROP (reject_pos), as in the Oracle image. Profile
+# hostinger: only the final unconditional REJECT or DROP (hostinger_final_pos), so
+# the ACCEPT rules land right before it and never above a REJECT or DROP with a
+# condition (e.g. one that blocks a single address), which keeps working.
+accept_limit() {
+  if hostinger; then hostinger_final_pos "$1"; else reject_pos "$1"; fi
 }
 
 # save_filter_input TOOL (profile hostinger): prints the rules file for TOOL: the table
@@ -1513,9 +1523,11 @@ DRY_SHIFT=0
 
 # ensure_accept TOOL DESC RULE...: make sure the ACCEPT rule RULE (as iptables -S
 # prints it, without "-A INPUT") sits in INPUT before the REJECT rule (or the
-# unconditional DROP rule, see reject_pos; "REJECT" below stands for both). DESC names
-# the rule in messages, e.g. "Port 22". allow_port uses it for the ports.
-# A rule only counts if it sits before the first REJECT; one behind it has no effect.
+# unconditional DROP rule; "REJECT" below stands for both). Which one: accept_limit
+# (profile oracle: the first, reject_pos; profile hostinger: the final unconditional
+# one, hostinger_final_pos). DESC names the rule in messages, e.g. "Port 22".
+# allow_port uses it for the ports.
+# A rule only counts if it sits before that REJECT; one behind it has no effect.
 #
 # The script never deletes or replaces firewall rules (no -D, no -R), it only inserts.
 # iptables deletes and replaces by rule number, and other programs (fail2ban, Docker)
@@ -1526,7 +1538,7 @@ ensure_accept() {
   local tool=$1 desc=$2 pos n before=0 after=0 open_note
   shift 2
   local rule=("$@")
-  pos=$(reject_pos "$tool")
+  pos=$(accept_limit "$tool")
   if "$tool" -C INPUT "${rule[@]}" 2>/dev/null; then
     if [[ -z $pos ]]; then
       info "$tool: $desc ist schon offen"

@@ -475,7 +475,9 @@ Discovery und Router Advertisements; ohne sie funktioniert IPv6 nicht), den DHCP
 link-lokalen Adressen), TCP für die SSH-Ports laut `sshd -T`, 80 und 443, die Ports, auf
 denen docker-proxy lauscht, und erst wenn alle diese Regeln da sind, als letzte Regel
 `REJECT`. Als Ende von `INPUT` zählt nur ein `REJECT` oder `DROP` ohne Bedingung an
-letzter Stelle. Die Policy bleibt `ACCEPT`. Es fügt nur ein und hängt an, es löscht
+letzter Stelle. Neue ACCEPT-Regeln kommen direkt davor, nie über eine vorhandene
+`REJECT`- oder `DROP`-Regel mit Bedingung (etwa eine Sperre für eine Adresse), damit
+die weiter wirkt. Die Policy bleibt `ACCEPT`. Es fügt nur ein und hängt an, es löscht
 keine Regel; ein zweiter Lauf erzeugt keine Kopien. `FORWARD`, die Ketten `DOCKER*` und
 die Tabelle `nat` bleiben unberührt. Verändert die Paketinstallation die Struktur, die
 Docker in der Tabelle `filter` anlegt (Policy von `FORWARD`, die Sprünge von `FORWARD` in
