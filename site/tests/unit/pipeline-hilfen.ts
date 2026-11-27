@@ -449,3 +449,152 @@ export function runs(expression: string | undefined, ctx: ExprContext): boolean 
   }
   return condition(effective, ctx);
 }
+
+// ---------------------------------------------------------------------------------------
+// Shell guards
+//
+// The guard steps are never executed: a changed first step could run anything (docker push,
+// writing ~/.ssh). Instead this reads exactly the form
+//
+//   if <list>; then
+//     echo "..."
+//     exit <n>
+//   fi
+//
+// where <list> joins commands with || and && (equal precedence, left to right, as in bash),
+// a command is [ WORD = WORD ], [ WORD == WORD ], [ WORD != WORD ] (exact string comparison,
+// as test(1) does), true or false, optionally with a leading !. A WORD is "..." (with $VAR,
+// ${VAR}, ${VAR,,} and ${VAR^^}), '...' or a plain word without $. Anything else throws.
+
+type ShellToken = { kind: 'word'; value: string; raw: string } | { kind: 'op'; value: string };
+
+const EXPANSION = /\$\{([A-Za-z_][A-Za-z0-9_]*)(,,|\^\^)?\}|\$([A-Za-z_][A-Za-z0-9_]*)/g;
+
+function expandDoubleQuoted(text: string, env: Record<string, string>): string {
+  if (/[`\\]/.test(text) || text.replace(EXPANSION, '').includes('$')) {
+    throw new Error(`unsupported shell syntax in "${text}"`);
+  }
+  return text.replace(
+    EXPANSION,
+    (_, braced: string | undefined, modifier: string | undefined, bare: string | undefined) => {
+      const value = env[(braced ?? bare) as string] ?? '';
+      if (modifier === ',,') return value.toLowerCase();
+      if (modifier === '^^') return value.toUpperCase();
+      return value;
+    },
+  );
+}
+
+function shellTokens(source: string, env: Record<string, string>): ShellToken[] {
+  const tokens: ShellToken[] = [];
+  let i = 0;
+  while (i < source.length) {
+    const c = source[i];
+    if (/\s/.test(c)) {
+      i++;
+      continue;
+    }
+    const two = source.slice(i, i + 2);
+    if (two === '||' || two === '&&') {
+      tokens.push({ kind: 'op', value: two });
+      i += 2;
+      continue;
+    }
+    if (c === '|' || c === '&' || c === ';' || c === '(' || c === ')' || c === '<' || c === '>' || c === '`') {
+      throw new Error(`unsupported shell operator "${c}" in: ${source}`);
+    }
+    let value = '';
+    let glob = false;
+    const start = i;
+    while (i < source.length && !/\s/.test(source[i]) && !'|&;()<>'.includes(source[i])) {
+      const ch = source[i];
+      if (ch === '"') {
+        const end = source.indexOf('"', i + 1);
+        if (end === -1) throw new Error(`unterminated "..." in: ${source}`);
+        value += expandDoubleQuoted(source.slice(i + 1, end), env);
+        i = end + 1;
+      } else if (ch === "'") {
+        const end = source.indexOf("'", i + 1);
+        if (end === -1) throw new Error(`unterminated '...' in: ${source}`);
+        value += source.slice(i + 1, end);
+        i = end + 1;
+      } else if (ch === '$' || ch === '\\' || ch === '*' || ch === '?') {
+        throw new Error(`unquoted "${ch}" is not supported in: ${source}`);
+      } else {
+        if (ch === '[' || ch === ']') glob = true;
+        value += ch;
+        i++;
+      }
+    }
+    const raw = source.slice(start, i);
+    if (glob && raw !== '[' && raw !== ']') throw new Error(`unquoted glob characters in ${raw}: ${source}`);
+    tokens.push({ kind: 'word', value, raw });
+  }
+  return tokens;
+}
+
+/** Exit status (0 = success) of the command list of an if. */
+function shellList(source: string, env: Record<string, string>): number {
+  const tokens = shellTokens(source, env);
+  let pos = 0;
+  const word = (): ShellToken & { kind: 'word' } => {
+    const token = tokens[pos++];
+    if (!token || token.kind !== 'word') throw new Error(`expected a word in: ${source}`);
+    return token;
+  };
+  const command = (): number => {
+    let negate = false;
+    if (tokens[pos]?.kind === 'word' && (tokens[pos] as { raw: string }).raw === '!') {
+      negate = true;
+      pos++;
+    }
+    const first = word();
+    let status: number;
+    if (first.raw === 'true' || first.raw === 'false') {
+      status = first.raw === 'true' ? 0 : 1;
+    } else if (first.raw === '[') {
+      const left = word();
+      const op = word();
+      const right = word();
+      if (word().raw !== ']') throw new Error(`expected "]" in: ${source}`);
+      if (op.raw === '=' || op.raw === '==') status = left.value === right.value ? 0 : 1;
+      else if (op.raw === '!=') status = left.value !== right.value ? 0 : 1;
+      else throw new Error(`unsupported test operator ${op.raw} in: ${source}`);
+    } else {
+      throw new Error(`unsupported command ${first.raw} in: ${source}`);
+    }
+    return negate ? (status === 0 ? 1 : 0) : status;
+  };
+  let status = command();
+  while (pos < tokens.length) {
+    const op = tokens[pos++];
+    if (op.kind !== 'op') throw new Error(`expected || or && in: ${source}`);
+    const next = command();
+    if (op.value === '||' && status !== 0) status = next;
+    else if (op.value === '&&' && status === 0) status = next;
+  }
+  return status;
+}
+
+/** Exit code of a guard script (see above) for the given environment variables. */
+export function guardExitCode(script: string, env: Record<string, string>): number {
+  const lines = script
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '' && !line.startsWith('#'));
+  const head = /^if\s+(.+?);\s*then$/.exec(lines[0] ?? '');
+  if (!head || lines[lines.length - 1] !== 'fi' || lines.length < 3) {
+    throw new Error(`guard is not of the form "if ...; then ... exit N; fi":\n${script}`);
+  }
+  let code: number | undefined;
+  for (const line of lines.slice(1, -1)) {
+    const exit = /^exit\s+(\d+)$/.exec(line);
+    if (exit) {
+      code ??= Number(exit[1]);
+    } else if (!/^echo\s/.test(line) || /`|\$\(/.test(line)) {
+      throw new Error(`unsupported command in guard body: ${line}`);
+    }
+  }
+  if (code === undefined) throw new Error(`guard body has no exit:\n${script}`);
+  return shellList(head[1], env) === 0 ? code : 0;
+}

@@ -10,6 +10,7 @@ import { describe, expect, it } from 'vitest';
 import {
   calledFunctions,
   evaluate,
+  guardExitCode,
   interpolate,
   parseYaml,
   runs,
@@ -249,6 +250,32 @@ describe('test helpers', () => {
     expect(calledFunctions("always() && !cancelled() && vars.X == 'y'")).toEqual(['always', 'cancelled']);
   });
 
+  it('read guard scripts like bash: exact string comparison, || and && from left to right', () => {
+    const guard = (condition: string): string => `if ${condition}; then\n  echo "stop $X"\n  exit 3\nfi\n`;
+    const env = { X: 'Main', Y: 'b' };
+    expect(guardExitCode(guard('[ "$X" != "main" ]'), env)).toBe(3);
+    expect(guardExitCode(guard('[ "$X" = "Main" ]'), env)).toBe(3);
+    expect(guardExitCode(guard('[ "$X" = "main" ]'), env)).toBe(0);
+    expect(guardExitCode(guard('[ "$X" != "Main" ]'), env)).toBe(0);
+    expect(guardExitCode(guard('[ "${X,,}" != "main" ]'), env)).toBe(0);
+    expect(guardExitCode(guard('[ "${X^^}" == \'MAIN\' ]'), env)).toBe(3);
+    expect(guardExitCode(guard('[ "$X" = "main" ] || [ "$Y" = "b" ]'), env)).toBe(3);
+    expect(guardExitCode(guard('[ "$X" = "Main" ] && [ "$Y" = "c" ]'), env)).toBe(0);
+    expect(guardExitCode(guard('false || true'), env)).toBe(3);
+    expect(guardExitCode(guard('! [ "$UNSET" = "" ]'), env)).toBe(0);
+  });
+
+  it('refuse guard scripts outside the supported form instead of running them', () => {
+    const guard = (condition: string, body = 'exit 1'): string => `if ${condition}; then\n  ${body}\nfi\n`;
+    expect(() => guardExitCode(guard('[[ $X == main ]]'), {})).toThrow(/unquoted|unsupported/);
+    expect(() => guardExitCode(guard('[ $X = main ]'), {})).toThrow(/unquoted/);
+    expect(() => guardExitCode(guard('[ "$(id -u)" = 0 ]'), {})).toThrow(/unsupported/);
+    expect(() => guardExitCode(guard('[ "$X" = dependabot[bot] ]'), {})).toThrow(/glob/);
+    expect(() => guardExitCode(guard('true', 'docker push x'), {})).toThrow(/unsupported command/);
+    expect(() => guardExitCode(guard('true', 'echo no exit'), {})).toThrow(/no exit/);
+    expect(() => guardExitCode('docker push x\n', {})).toThrow(/form/);
+  });
+
   it('add the implicit success() to conditions without a status function', () => {
     const ctx = (status: typeof SUCCEEDED): ExprContext => ({ github: {}, vars: {}, status });
     expect(runs("'x' == 'x'", ctx(SUCCEEDED))).toBe(true);
@@ -310,17 +337,6 @@ describe('release condition: only push or manual start on main, never Dependabot
   });
 });
 
-describe('release condition with branch names that differ from main only in case', () => {
-  // GitHub compares strings ignoring case (docs: Actions -> Expressions, "GitHub ignores case
-  // when comparing strings"), so github.ref == 'refs/heads/main' also holds for a branch
-  // named "Main". A manual start runs on any branch, so such a branch must not release.
-  it.each(['refs/heads/Main', 'refs/heads/MAIN'])('manual start on %s does not release', (ref) => {
-    const scenario = { ...BASE, event: 'workflow_dispatch', ref };
-    expect(releaseEnv(scenario)).toBe('false');
-    expect(publishRuns(scenario)).toBe(false);
-  });
-});
-
 describe('RELEASE and the condition of the publish job stay equivalent', () => {
   const variants: Scenario[] = [
     { ...BASE, actor: 'Dependabot[bot]' },
@@ -379,6 +395,109 @@ describe('deploy job', () => {
 
   it('does not run when publish failed', () => {
     expect(runs(jobIf('deploy'), jobContext(BASE, FAILED))).toBe(false);
+  });
+});
+
+describe('case-sensitive guard in publish and deploy', () => {
+  // GitHub compares strings in expressions ignoring case (docs: Actions -> Expressions,
+  // "GitHub ignores case when comparing strings"), so the if: of publish also lets a manual
+  // start on a branch "Main" through. A shell step compares exactly and stops such runs.
+  const JOBS = ['publish', 'deploy'];
+  const CASE_VARIANTS = ['refs/heads/Main', 'refs/heads/MAIN'];
+
+  const isGuard = (step: YamlMap): boolean => typeof step.run === 'string' && /\$\{?GITHUB_REF\b/.test(step.run);
+
+  function guardOf(jobName: string): { step: YamlMap; index: number } {
+    const all = steps(jobName);
+    const index = all.findIndex(isGuard);
+    if (index === -1) throw new Error(`jobs.${jobName} has no step that checks GITHUB_REF`);
+    return { step: all[index], index };
+  }
+
+  /** Whether the guard of the job fails the step. GITHUB_* cannot be overridden by env. */
+  function guardRejects(jobName: string, s: Scenario): boolean {
+    const { step } = guardOf(jobName);
+    const env = {
+      ...stepContext(s, jobName, step).env,
+      GITHUB_REF: s.ref,
+      GITHUB_ACTOR: s.actor,
+      GITHUB_EVENT_NAME: s.event,
+    };
+    return guardExitCode(text(step.run, `jobs.${jobName} guard run`), env) !== 0;
+  }
+
+  it.each(JOBS)('%s starts with the guard, which is neither skipped nor continued on error', (name) => {
+    const { step, index } = guardOf(name);
+    expect(index).toBe(0);
+    expect(step.uses).toBeUndefined();
+    expect(step['continue-on-error'] ?? 'false').toBe('false');
+    expect(step.shell ?? 'bash').toMatch(/^bash\b/);
+    for (const scenario of [BASE, ...CASE_VARIANTS.map((ref) => ({ ...BASE, event: 'workflow_dispatch', ref }))]) {
+      const ctx = { ...stepContext(scenario, name, step), status: SUCCEEDED };
+      expect(runs(optionalText(step.if, 'guard.if'), ctx)).toBe(true);
+    }
+  });
+
+  it.each(JOBS.flatMap((name) => CASE_VARIANTS.map((ref) => [name, ref])))(
+    '%s: the guard stops a manual start on %s',
+    (name, ref) => {
+      expect(guardRejects(name, { ...BASE, event: 'workflow_dispatch', ref })).toBe(true);
+      expect(guardRejects(name, { ...BASE, ref })).toBe(true);
+    },
+  );
+
+  it.each(JOBS)('%s: the guard lets push and manual start on refs/heads/main by a person pass', (name) => {
+    expect(guardRejects(name, BASE)).toBe(false);
+    expect(guardRejects(name, { ...BASE, event: 'workflow_dispatch' })).toBe(false);
+  });
+
+  it.each(JOBS)('%s: the guard stops dependabot[bot] on refs/heads/main', (name) => {
+    expect(guardRejects(name, { ...BASE, actor: 'dependabot[bot]' })).toBe(true);
+    expect(guardRejects(name, { ...BASE, event: 'workflow_dispatch', actor: 'dependabot[bot]' })).toBe(true);
+  });
+
+  it.each(JOBS)('%s: the guard stops every other ref', (name) => {
+    const refs = ['refs/heads/main-alt', 'refs/heads/main/', 'refs/heads/feature/neuer-artikel', 'refs/pull/7/merge'];
+    for (const ref of [...refs, 'refs/tags/v1.0.0', 'main', '']) {
+      expect(guardRejects(name, { ...BASE, ref }), ref).toBe(true);
+    }
+  });
+
+  it('publish: the guard comes before the GHCR login and the push', () => {
+    const all = steps('publish');
+    const guard = guardOf('publish').index;
+    const login = all.findIndex((s) => String(s.uses ?? '').startsWith('docker/login-action@'));
+    const push = all.findIndex((s) => /\bdocker push\b/.test(String(s.run ?? '')));
+    expect(login).toBeGreaterThan(guard);
+    expect(push).toBeGreaterThan(guard);
+  });
+
+  it('deploy: the guard comes before the SSH step', () => {
+    const all = steps('deploy');
+    const ssh = all.findIndex((s) => /(^|\s)ssh\s/m.test(String(s.run ?? '')));
+    expect(ssh).toBeGreaterThan(guardOf('deploy').index);
+  });
+
+  it('if: and guard together let publish and deploy through exactly as decided, also for case variants', () => {
+    const variants: Scenario[] = [];
+    for (const event of ['push', 'workflow_dispatch'])
+      for (const ref of [...CASE_VARIANTS, 'refs/heads/main'])
+        for (const actor of ['maintainer-example', 'dependabot[bot]'])
+          for (const [publish, deploy] of [
+            ['true', undefined],
+            [undefined, 'true'],
+            ['true', 'true'],
+          ])
+            variants.push({ event, ref, actor, publish, deploy });
+    const all = [...MATRIX, ...variants];
+    const publishes = (s: Scenario): boolean => publishRuns(s) && !guardRejects('publish', s);
+    const deploys = (s: Scenario): boolean => {
+      const publishResult = publishes(s) ? SUCCEEDED : publishRuns(s) ? FAILED : SKIPPED;
+      return runs(jobIf('deploy'), jobContext(s, publishResult)) && !guardRejects('deploy', s);
+    };
+    expect(mismatches(all, publishes, shouldRelease)).toEqual(NONE);
+    expect(mismatches(all, deploys, shouldDeploy)).toEqual(NONE);
+    expect(variants.some(shouldDeploy)).toBe(true);
   });
 });
 
