@@ -305,15 +305,19 @@ Alles andere (Updates mit Neustart um 04:00, Aufbewahrung der Protokolle, Benutz
 - `ONLY_SAVE_FIREWALL=1` (optional, später): speichert nur die Regeln von `INPUT`
   (siehe „Firewall-Regeln ändern“) und tut sonst nichts.
 
-**sudo mit Passwort, Pflicht vor dem Neuladen von SSH.** Das Skript legt `ADMIN_USER`
-ohne Passwort an und trägt kein `NOPASSWD` ein. Bevor es sshd neu lädt (danach kommt
-root nur noch über die Web-Konsole herein), verlangt es ein Passwort für `ADMIN_USER`
-(`passwd -S` zeigt `P`), damit `sudo` ein zweiter Weg zu root ist. Läuft das Skript in
-einem Terminal (Web-Konsole), fragt es mit `passwd` danach. Ohne Terminal bricht es ab,
-setzt die SSH-Datei zurück und lässt SSH unverändert; dann als root `passwd ADMIN_USER`
-und das Skript erneut starten (Benutzer und Schlüssel bleiben). Die Anmeldung mit dem
-Schlüssel klappt auch ohne Passwort (das Skript prüft `UsePAM yes`). Ein gestohlener
-Schlüssel allein gibt so noch keine Root-Rechte.
+**sudo mit Passwort, Pflicht vor jeder Änderung an SSH.** Das Skript legt `ADMIN_USER`
+ohne Passwort an und trägt kein `NOPASSWD` ein. Bei jedem Lauf, nach dem Eintragen des
+Schlüssels und bevor es die SSH-Datei schreibt, verlangt es ein Passwort für
+`ADMIN_USER` (`passwd -S` zeigt `P`), damit `sudo` ein zweiter Weg zu root ist (nach dem
+Lauf kommt root nur noch über die Web-Konsole herein). Läuft das Skript in einem
+Terminal (Web-Konsole), fragt es mit `passwd` danach. Ohne Terminal bricht es ab, SSH
+bleibt unverändert; dann als root `passwd ADMIN_USER` und das Skript erneut starten
+(Benutzer und Schlüssel bleiben). Wird der Lauf unterbrochen (Strg-C, Tab der
+Web-Konsole geschlossen, SIGTERM), nachdem die SSH-Datei geschrieben, aber bevor SSH neu
+geladen wurde, setzt das Skript die Datei zurück. Nach bestandenen Prüfungen lädt es SSH
+bei jedem Lauf neu, auch wenn die Datei unverändert ist. Die Anmeldung mit dem Schlüssel
+klappt auch ohne Passwort (das Skript prüft `UsePAM yes`). Ein gestohlener Schlüssel
+allein gibt so noch keine Root-Rechte.
 
 ### Ablauf (für den Betreiber)
 
@@ -364,7 +368,7 @@ Schlüssel allein gibt so noch keine Root-Rechte.
      der Compose-Datei `restart: unless-stopped`).
    - „Journal: Keine Anmeldung von root … gefunden“: Erst prüfen, dass die Web-Konsole
      wirklich funktioniert.
-7. **Echter Lauf:** derselbe Befehl ohne `DRY_RUN=1`. Vor dem Neuladen von SSH fragt er
+7. **Echter Lauf:** derselbe Befehl ohne `DRY_RUN=1`. Bevor er SSH ändert, fragt er
    nach dem Passwort für `ADMIN_USER` (für sudo). Er endet mit „Änderungen in diesem
    Lauf: …“ und der Abnahmeliste.
 8. **Zweite Anmeldung testen, bevor ihr irgendetwas schließt.** Auf eurem Rechner in
@@ -412,7 +416,13 @@ nur auf den Ports, die `sshd -T` nennt (geprüft an `ssh.socket` und am laufende
 laut `ss`), denn genau diese öffnet die Firewall. UFW aktiv bricht ab wie bei Oracle;
 ein installiertes, inaktives UFW (Normalfall bei Hostinger) entfernt apt mit
 `iptables-persistent`, das Skript sagt das deutlich und prüft am Ende, ob es geschehen
-ist. UFW danach nicht wieder installieren. Nur Hinweise, kein Abbruch: Start über SSH
+ist. UFW danach nicht wieder installieren. Abbruch auch, wenn `/etc/iptables/rules.v4`
+oder `rules.v6` schon existiert, `iptables-persistent` aber noch nicht installiert ist
+(netfilter-persistent würde die Datei bei seiner Installation laden und dabei die
+Ketten von Docker löschen; die Datei erst beiseitelegen; eigene Dateien des Skripts
+zusammen mit seinem Drop-in, siehe unten, sind ausgenommen), und wenn das Laden mit
+`--noflush` nicht greifen würde (siehe „Laden ohne Docker zu stören“). Nur Hinweise,
+kein Abbruch: Start über SSH
 statt über die Web-Konsole, keine Anmeldung der Web-Konsole im Journal, Container ohne
 Neustart-Regel `always` oder `unless-stopped`, weitere lauschende Dienste.
 
@@ -467,9 +477,14 @@ denen docker-proxy lauscht, und erst wenn alle diese Regeln da sind, als letzte 
 `REJECT`. Als Ende von `INPUT` zählt nur ein `REJECT` oder `DROP` ohne Bedingung an
 letzter Stelle. Die Policy bleibt `ACCEPT`. Es fügt nur ein und hängt an, es löscht
 keine Regel; ein zweiter Lauf erzeugt keine Kopien. `FORWARD`, die Ketten `DOCKER*` und
-die Tabelle `nat` bleiben unberührt; verändert die Paketinstallation sie (etwa
-`ufw-init stop`, das `FORWARD` auf `ACCEPT` setzen kann), spielt das Skript die Tabelle
-`filter` von vor der Installation zurück und bricht ab, wenn das nicht hilft.
+die Tabelle `nat` bleiben unberührt. Verändert die Paketinstallation die Struktur, die
+Docker in der Tabelle `filter` anlegt (Policy von `FORWARD`, die Sprünge von `FORWARD` in
+`DOCKER-USER`, `DOCKER-FORWARD` und Co., welche Ketten `DOCKER*` es gibt; etwa durch
+`ufw-init stop`, das `FORWARD` auf `ACCEPT` setzen kann), bricht das Skript ab und
+nennt Vorher und Nachher. Es spielt dann nichts zurück: Die Regeln in den Ketten von Docker
+ändern sich mit jedem Start eines Containers, eine alte Kopie könnte einem inzwischen
+neu gestarteten Container die Ports nehmen. Die Regeln einzelner Container vergleicht
+es deshalb nicht.
 
 - **Port 32768 und andere Docker-Ports:** Über IPv4 von außen leitet Docker sie mit DNAT
   in der Tabelle `nat` über die Kette `FORWARD` an den Container, an `INPUT` vorbei.
@@ -478,7 +493,8 @@ die Tabelle `nat` bleiben unberührt; verändert die Paketinstallation sie (etwa
   der Container hat kein IPv6) und von Containern zur eigenen Adresse des Servers
   (Hairpin) nimmt dagegen docker-proxy die Verbindung an, und die läuft durch `INPUT`.
   Deshalb erlaubt das Skript jeden Port, auf dem beim Lauf docker-proxy lauscht, in
-  `INPUT` (IPv4 und IPv6) und nennt ihn in der Ausgabe. **Später veröffentlichte Ports**
+  `INPUT` und nennt ihn in der Ausgabe: bei `0.0.0.0`, `::` oder `*` in IPv4 und IPv6,
+  bei einer bestimmten Adresse nur in deren Familie und mit `-d ADRESSE`. **Später veröffentlichte Ports**
   brauchen dasselbe: das Skript erneut starten (oder die Regel von Hand einfügen und
   speichern, siehe unten).
 - **Traefik von Hostinger** (Host-Netz, 80 und 443) läuft durch `INPUT` und ist durch
@@ -495,7 +511,8 @@ die Tabelle `nat` bleiben unberührt; verändert die Paketinstallation sie (etwa
   deren Ziel eingebaut ist (`ACCEPT`, `DROP`, `REJECT`, `RETURN`, `LOG`), vorher geprüft
   mit `iptables-restore --test`. Eine vorhandene Datei mit anderem Inhalt sichert das
   Skript vorher als `rules.v4.bak-DATUM` bzw. `rules.v6.bak-DATUM`. Die Sprungregel von
-  fail2ban fehlt, fail2ban legt sie beim Start selbst an.
+  fail2ban fehlt; fail2ban legt Kette und Sprungregel selbst an, bei der ersten Sperre
+  nach seinem Start.
 - **Laden ohne Docker zu stören:** netfilter-persistent lädt die Dateien beim Start
   (vor Docker), aber auch bei jedem `start`, `restart` oder `reload` des Dienstes, und
   das Paket `netfilter-persistent` startet den Dienst bei jedem Paket-Update neu
@@ -505,9 +522,26 @@ die Tabelle `nat` bleiben unberührt; verändert die Paketinstallation sie (etwa
   `/etc/systemd/system/netfilter-persistent.service.d/10-noflush.conf` an
   (`IPTABLES_RESTORE_NOFLUSH=yes`, `IP6TABLES_RESTORE_NOFLUSH=yes`): Geladen wird mit
   `--noflush`, und `-F INPUT` ersetzt nur `INPUT`. Das gilt nur für den Dienst über
-  systemd (Boot, `systemctl restart netfilter-persistent`, Paket-Updates); danach
-  fail2ban neu starten (`sudo systemctl restart fail2ban`), weil `-F INPUT` seine
-  Sprungregel entfernt.
+  systemd (Boot, `systemctl restart netfilter-persistent`, Paket-Updates). Vor dem
+  ersten Speichern prüft das Skript, dass die Plugins `15-ip4tables` und `25-ip6tables`
+  von iptables-persistent diese Variablen auswerten (in Version 1.0.20 von Ubuntu 24.04
+  der Fall) und `/etc/default/netfilter-persistent` sie nicht auf etwas anderes als
+  `yes` setzt (dort sind sie in der Grundeinstellung auskommentiert; die Datei ändert
+  das Skript nicht); sonst bricht es ab.
+- **fail2ban nach einem Neuladen der Regeln:** Beim Start des Servers lädt
+  netfilter-persistent die Regeln vor fail2ban; fail2ban legt seine Kette und die
+  Sprungregel in `INPUT` danach selbst an, bei der ersten Sperre (bei den
+  iptables-Aktionen von fail2ban 1.0.2 startet die Aktion erst bei Bedarf). Wird netfilter-persistent dagegen im laufenden Betrieb neu
+  gestartet (`systemctl restart netfilter-persistent`, Paket-Update), entfernt
+  `-F INPUT` die Sprungregel von fail2ban (`-p tcp -m multiport --dports 22 -j f2b-sshd`).
+  fail2ban stellt sie nicht von selbst wieder her: In fail2ban 1.0.2 läuft die Prüfung
+  `actioncheck` (und damit die Reparatur) nur, nachdem ein Befehl gescheitert ist, und
+  eine neue Sperre in seine eigene Kette `f2b-sshd` einzutragen scheitert nicht
+  (nachgelesen in `fail2ban/server/action.py` und `action.d/iptables.conf`). Die Sperren
+  wirken dann nicht, bis fail2ban neu startet. Deshalb danach
+  `sudo systemctl restart fail2ban`; die Sprungregel steht dann ab der nächsten Sperre
+  wieder oben in `INPUT` (prüfen mit `sudo iptables -S INPUT`, solange
+  `sudo fail2ban-client status sshd` eine Sperre zeigt).
 
 **Firewall-Regeln ändern:** Auf diesem Server **nie** `netfilter-persistent save`,
 `netfilter-persistent reload` oder `netfilter-persistent restart` von Hand aufrufen.
@@ -523,8 +557,10 @@ speichern:
 sudo PROFIL=hostinger ONLY_SAVE_FIREWALL=1 bash setup-server.sh
 ```
 
-Das prüft, dass `INPUT` noch mit `REJECT` endet und davor die nötigen Regeln stehen,
-und schreibt die beiden Dateien wie oben (mit Sicherung); sonst ändert es nichts.
+Das prüft, dass `INPUT` noch mit `REJECT` endet, davor die nötigen Regeln stehen und
+das Laden mit `--noflush` greift, und schreibt die beiden Dateien wie oben (mit
+Sicherung); sonst ändert es nichts. Ports, die Docker inzwischen neu veröffentlicht,
+erlaubt dieser Modus nicht von selbst; dafür das ganze Skript erneut starten.
 
 **SSH:** `/etc/ssh/sshd_config.d/10-haertung.conf` mit `PasswordAuthentication no`,
 `KbdInteractiveAuthentication no`, `PermitRootLogin no`, `GSSAPIAuthentication no`,
