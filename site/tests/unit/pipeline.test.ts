@@ -86,25 +86,44 @@ function jobContext(s: Scenario, status = SUCCEEDED): ExprContext {
   return { github: { event_name: s.event, ref: s.ref, actor: s.actor }, vars: vars(s), status };
 }
 
-/** The workflow env as GitHub computes it for a scenario (values are text). */
+/**
+ * Adds an env entry that is computed on first access. Entries no condition reads are never
+ * evaluated, so a new env value with contexts the scenarios do not model (github.sha,
+ * secrets.X, needs.*) does not break the tests; a condition that reads it still fails loudly.
+ * Never spread or list these objects (that would compute every entry).
+ */
+function defineLazy(target: Record<string, string>, name: string, compute: () => string): void {
+  let cached: string | undefined;
+  Object.defineProperty(target, name, {
+    enumerable: true,
+    configurable: true,
+    get: () => (cached ??= compute()),
+  });
+}
+
+/** The workflow env as GitHub computes it for a scenario (values are text, computed lazily). */
 function workflowEnv(s: Scenario): Record<string, string> {
   const ctx = jobContext(s);
   const result: Record<string, string> = {};
   for (const [name, value] of Object.entries(map(workflow.env, 'env'))) {
-    result[name] = interpolate(text(value, `env.${name}`), ctx);
+    defineLazy(result, name, () => interpolate(text(value, `env.${name}`), ctx));
   }
   return result;
 }
 
-/** Context of a step: workflow env, job env and step env. */
+/** Context of a step: workflow env, then job env, then step env (each layer lazy). */
 function stepContext(s: Scenario, jobName: string, step?: YamlMap): ExprContext {
   const ctx = jobContext(s);
-  const env = workflowEnv(s);
+  let env = workflowEnv(s);
   for (const extra of [job(jobName).env, step?.env]) {
     if (extra === undefined || extra === null) continue;
+    const previous = env;
+    const layer: Record<string, string> = {};
+    for (const name of Object.keys(previous)) defineLazy(layer, name, () => previous[name]);
     for (const [name, value] of Object.entries(map(extra, 'env'))) {
-      env[name] = interpolate(text(value, `env.${name}`), { ...ctx, env });
+      defineLazy(layer, name, () => interpolate(text(value, `env.${name}`), { ...ctx, env: previous }));
     }
+    env = layer;
   }
   return { ...ctx, env };
 }
@@ -417,13 +436,35 @@ describe('case-sensitive guard in publish and deploy', () => {
   /** Whether the guard of the job fails the step. GITHUB_* cannot be overridden by env. */
   function guardRejects(jobName: string, s: Scenario): boolean {
     const { step } = guardOf(jobName);
-    const env = {
-      ...stepContext(s, jobName, step).env,
-      GITHUB_REF: s.ref,
-      GITHUB_ACTOR: s.actor,
-      GITHUB_EVENT_NAME: s.event,
-    };
+    const env = stepContext(s, jobName, step).env as Record<string, string>;
+    const defaults = { GITHUB_REF: s.ref, GITHUB_ACTOR: s.actor, GITHUB_EVENT_NAME: s.event };
+    for (const [name, value] of Object.entries(defaults)) {
+      Object.defineProperty(env, name, { value, enumerable: true, configurable: true });
+    }
     return guardExitCode(text(step.run, `jobs.${jobName} guard run`), env) !== 0;
+  }
+
+  /** Variables the condition of the guard reads, e.g. GITHUB_REF and GITHUB_ACTOR. */
+  function guardVariables(jobName: string): string[] {
+    const script = text(guardOf(jobName).step.run, `jobs.${jobName} guard run`);
+    const head = script.split('\n').find((line) => line.trim().startsWith('if ')) ?? '';
+    return [...head.matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)/g)].map((m) => m[1]);
+  }
+
+  /** Shell of a step: step shell, else defaults.run.shell of the job, else of the workflow. */
+  function effectiveShell(jobName: string, step: YamlMap): string {
+    const fromDefaults = (owner: YamlMap, where: string): string | undefined => {
+      if (owner.defaults === undefined || owner.defaults === null) return undefined;
+      const run = map(owner.defaults, `${where}.defaults`).run;
+      if (run === undefined || run === null) return undefined;
+      return optionalText(map(run, `${where}.defaults.run`).shell, `${where}.defaults.run.shell`);
+    };
+    return (
+      optionalText(step.shell, 'step.shell') ??
+      fromDefaults(job(jobName), `jobs.${jobName}`) ??
+      fromDefaults(workflow, 'workflow') ??
+      'bash'
+    );
   }
 
   it.each(JOBS)('%s starts with the guard, which is neither skipped nor continued on error', (name) => {
@@ -431,11 +472,22 @@ describe('case-sensitive guard in publish and deploy', () => {
     expect(index).toBe(0);
     expect(step.uses).toBeUndefined();
     expect(step['continue-on-error'] ?? 'false').toBe('false');
-    expect(step.shell ?? 'bash').toMatch(/^bash\b/);
+    expect(effectiveShell(name, step)).toMatch(/^bash\b/);
     for (const scenario of [BASE, ...CASE_VARIANTS.map((ref) => ({ ...BASE, event: 'workflow_dispatch', ref }))]) {
       const ctx = { ...stepContext(scenario, name, step), status: SUCCEEDED };
       expect(runs(optionalText(step.if, 'guard.if'), ctx)).toBe(true);
     }
+  });
+
+  it.each(JOBS)('%s: no env sets GITHUB_* for the guard or the variables its condition reads', (name) => {
+    const step = guardOf(name).step;
+    const keys = (value: YamlValue | undefined, where: string): string[] =>
+      value === undefined || value === null ? [] : Object.keys(map(value, where));
+    expect(keys(step.env, 'guard env').filter((key) => key.startsWith('GITHUB_'))).toEqual([]);
+    const guardReads = guardVariables(name);
+    expect(guardReads).toEqual(expect.arrayContaining(['GITHUB_REF', 'GITHUB_ACTOR']));
+    const outer = [...keys(workflow.env, 'env'), ...keys(job(name).env, `jobs.${name}.env`)];
+    expect(outer.filter((key) => guardReads.includes(key))).toEqual([]);
   });
 
   it.each(JOBS.flatMap((name) => CASE_VARIANTS.map((ref) => [name, ref])))(
