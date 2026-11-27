@@ -81,13 +81,16 @@ Zielgruppen-Seiten, im Basecamp unter seinen Themen, in der Sitemap, in
 
 Siehe [`../docs/ci-cd.md`](../docs/ci-cd.md). Kurz: Jeder Pull Request durchläuft
 Qualitätsprüfung, Image-Build, Browsertests gegen das Image und Sicherheitsscan. Nach
-dem Merge in `main` wird genau dieses Image veröffentlicht und auf den Server deployt,
-sobald die Repository-Variable `DEPLOY_ENABLED` auf `true` steht. Dann gilt
-`CHECK_LIVE=1`: Solange Platzhalter (Impressum, Datenschutz, `src/site.ts`,
-`example.org`) übrig sind, bricht der Build ab und nichts geht online.
+dem Merge in `main` wird genau dieses Image veröffentlicht, sobald die
+Repository-Variable `PUBLISH_ENABLED` auf `true` steht (nur veröffentlichen, kein
+Deploy), und zusätzlich auf den Server deployt, sobald `DEPLOY_ENABLED` auf `true`
+steht (das schließt das Veröffentlichen ein). Dann gilt `CHECK_LIVE=1`: Solange
+Platzhalter (Impressum, Datenschutz, `src/site.ts`, `example.org`) übrig sind, bricht
+der Build ab und nichts geht online.
 
 Die Adresse der Seite kommt aus `SITE_URL` (Repository-Variable, im Image als
-Build-Argument). `BASE_PATH` braucht es nur, wenn die Seite nicht an der Wurzel der
+Build-Argument) und muss gesetzt sein, sobald eine der beiden Variablen `true` ist.
+`BASE_PATH` braucht es nur, wenn die Seite nicht an der Wurzel der
 Domain liegt. `robots.txt` und `llms.txt` werden mit dieser Adresse erzeugt.
 
 ## Offene Platzhalter

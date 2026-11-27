@@ -267,6 +267,16 @@ Dieser Teil wird mit der neuen Struktur neu geschrieben.
 > Live und Staging aufgebaut sind. `setup-server.sh` legt weder `deploy.sh` noch die
 > Verzeichnisse der Website an. Mit `DEPLOY_ENABLED=true` würde jeder Merge nach `main`
 > den Deploy-Job starten, und der schlägt dann fehl (siehe [`ci-cd.md`](ci-cd.md)).
+> Den ersten Start gibt es nur über die Pipeline: `DEPLOY_ENABLED=true` und die Freigabe
+> des Environments `production` in GitHub, nicht von Hand auf dem Server. Wer vorher
+> einen grünen Lauf mit veröffentlichtem Image sehen will, setzt zuerst nur
+> `PUBLISH_ENABLED=true` (Abschnitt 3 in [`ci-cd.md`](ci-cd.md)).
+>
+> `SITE_URL` in GitHub ist genau `https://` plus `DOMAIN` aus der `.env` auf dem
+> Server (beim Hostinger-Aufbau `DOMAIN=funkenundstahl.de`, also
+> `https://funkenundstahl.de`; die Vorlage `deploy/.env.example` nutzt `www.`).
+> `WEBSITE_IMAGE` in der `.env` setzt `deploy.sh` mit dem Digest; nie von Hand auf
+> `:latest` stellen, das würde die Freigabe umgehen.
 
 Erhalten bleibt:
 
@@ -276,7 +286,8 @@ Erhalten bleibt:
   (`command="…",restrict`). Den privaten Teil als Secret `DEPLOY_SSH_KEY` in GitHub
   eintragen, `ssh-keyscan SERVER` als Secret `DEPLOY_KNOWN_HOSTS`, danach die lokale
   Datei löschen. `DEPLOY_ENABLED=true` erst danach und erst nach dem Aufbau von Live
-  und Staging setzen (siehe oben und [`ci-cd.md`](ci-cd.md)).
+  und Staging setzen (siehe oben und [`ci-cd.md`](ci-cd.md)); `PUBLISH_ENABLED=true`
+  braucht weder den Schlüssel noch den Server und deployt nichts.
 - **Tipp für den ersten Start:** In `.env` die Zeile `ACME_CA_SERVER=...staging...`
   aktivieren. Let's Encrypt begrenzt fehlgeschlagene Versuche; mit der Staging-CA lässt
   sich gefahrlos testen. Wenn alles läuft, die Zeile entfernen, das Zertifikats-Volume

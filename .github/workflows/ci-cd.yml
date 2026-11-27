@@ -3,10 +3,13 @@
 #   Pull request:  quality -> image (built once) -> browser tests against the image + security scan
 #   Push to main:  the same, then publish the tested image to GHCR and deploy it to the server
 #
-# Only main is deployed, and main only accepts pull requests with green checks
-# (branch ruleset, see docs/ci-cd.md). Publishing and deploying stay off until the
-# repository variable DEPLOY_ENABLED is "true"; then CHECK_LIVE=1 also turns placeholders
-# (Impressum, example.org) into build errors.
+# Only main is published or deployed, and main only accepts pull requests with green
+# checks (branch ruleset, see docs/ci-cd.md). Both stay off by default:
+#   PUBLISH_ENABLED = "true"  publish the tested image, do not deploy (optional pre-stage:
+#                             inspect a green publish run before deploy is switched on)
+#   DEPLOY_ENABLED  = "true"  publish and deploy (implies publishing)
+# With either one, the image is a release image: CHECK_LIVE=1 turns placeholders
+# (Impressum, example.org) into build errors, and SITE_URL must be set.
 #
 # Actions are pinned to commit SHAs (tags can be moved, see the trivy-action incident of
 # March 2026). Dependabot keeps the SHAs up to date.
@@ -27,7 +30,8 @@ concurrency:
 
 env:
   LEFTHOOK: '0'
-  RELEASE: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true' }}
+  # Keep in sync with the "if" of the publish job (the env context is not available there).
+  RELEASE: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && github.actor != 'dependabot[bot]' && (vars.PUBLISH_ENABLED == 'true' || vars.DEPLOY_ENABLED == 'true') }}
   SITE_URL: ${{ vars.SITE_URL || 'https://www.example.org' }}
   IMAGE_TAR: /tmp/website-image.tar
   IMAGE_LOCAL: website:ci
@@ -58,6 +62,14 @@ jobs:
     needs: quality
     runs-on: ubuntu-latest
     steps:
+      # A release image with the fallback address would carry wrong canonical URLs.
+      # CHECK_LIVE=1 (see check-site.mjs) rejects example.org in the build as well; this
+      # step only fails earlier with a clear message when the variable is not set.
+      - name: Require SITE_URL for a release image
+        if: env.RELEASE == 'true' && vars.SITE_URL == ''
+        run: |
+          echo "::error title=SITE_URL is not set::Publishing needs the repository variable SITE_URL (Settings -> Secrets and variables -> Actions -> Variables), otherwise the image is built with the placeholder https://www.example.org."
+          exit 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -139,7 +151,8 @@ jobs:
   publish:
     name: Publish image
     needs: [quality, e2e, scan]
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
+    # Same condition as RELEASE above (keep both in sync). Never on pull requests, never for Dependabot.
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && github.actor != 'dependabot[bot]' && (vars.PUBLISH_ENABLED == 'true' || vars.DEPLOY_ENABLED == 'true')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -147,6 +160,16 @@ jobs:
     outputs:
       image: ${{ steps.push.outputs.image }}
     steps:
+      # Expression comparisons in GitHub are case-insensitive, so a branch "Main" would pass
+      # the "if" above. This shell check is case-sensitive.
+      - name: Require the branch main and no Dependabot actor
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ] || [ "$GITHUB_ACTOR" = "dependabot[bot]" ]; then
+            echo "::error title=Release not allowed::Only refs/heads/main (exact case) and not dependabot[bot] may $JOB_ACTION (ref: $GITHUB_REF, actor: $GITHUB_ACTOR)."
+            exit 1
+          fi
+        env:
+          JOB_ACTION: publish
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: website-image
@@ -171,6 +194,8 @@ jobs:
   deploy:
     name: Deploy to production
     needs: publish
+    # Publishing alone (PUBLISH_ENABLED) never deploys. Skipped when publish is skipped.
+    if: vars.DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
     # Approval, secrets and URL of the environment are set in Settings -> Environments.
     environment:
@@ -180,6 +205,16 @@ jobs:
       group: deploy-production
       cancel-in-progress: false
     steps:
+      # Expression comparisons in GitHub are case-insensitive, so a branch "Main" would pass
+      # the "if" above. This shell check is case-sensitive.
+      - name: Require the branch main and no Dependabot actor
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ] || [ "$GITHUB_ACTOR" = "dependabot[bot]" ]; then
+            echo "::error title=Release not allowed::Only refs/heads/main (exact case) and not dependabot[bot] may $JOB_ACTION (ref: $GITHUB_REF, actor: $GITHUB_ACTOR)."
+            exit 1
+          fi
+        env:
+          JOB_ACTION: deploy
       # The deploy key may only run deploy.sh on the server (forced command in
       # authorized_keys), which gets the image reference as its only argument.
       - name: Deploy via SSH
