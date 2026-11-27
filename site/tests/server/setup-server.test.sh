@@ -327,6 +327,25 @@ h_nfp_plugins() { # ok|noflag|""
   done
 }
 
+# h_nfp_dropin ARTDIR: the drop-in of netfilter-persistent that the script under test
+# writes (path NFP_DROPIN, content NFP_DROPIN_CONTENT, read from ARTDIR/setup-server.sh),
+# as on a server where an earlier run of the script wrote it.
+h_nfp_dropin() { # ARTDIR
+  python3 -I - "$1/setup-server.sh" <<'PY'
+import os
+import re
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+path = re.search(r"^NFP_DROPIN=(\S+)$", text, re.M).group(1)
+content = re.search(r'^NFP_DROPIN_CONTENT="(.*?)"$', text, re.M | re.S).group(1)
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path, "w", encoding="utf-8") as f:
+    f.write(content + "\n")
+os.chmod(path, 0o644)
+PY
+}
+
 # hostinger_fixture ARTDIR: the rest of a Hostinger VPS (SC_HOSTINGER=1), see the
 # scenarios of the profile hostinger in main.
 # - sshd: root logs in with a password (PermitRootLogin yes in sshd_config and in
@@ -340,6 +359,8 @@ h_nfp_plugins() { # ok|noflag|""
 # - SC_H_EXISTING=1: H_ADMIN exists already (bash, not in sudo), with ~/.ssh mode
 #   SC_H_SSH_MODE (default 755) and authorized_keys (content SC_H_OLDKEYS, "\n" separates
 #   lines; mode SC_H_KEYS_MODE, default 644); ARTDIR/h_keys0 keeps the file.
+# - SC_NFP_DROPIN=1: the drop-in of netfilter-persistent of the script is there
+#   (h_nfp_dropin), as after an earlier run.
 # - SC_NFP=ok: the plugins of iptables-persistent are there (synthetic stand-ins that,
 #   like those of the package, read IPTABLES_RESTORE_NOFLUSH or IP6TABLES_RESTORE_NOFLUSH;
 #   the scenario lists iptables-persistent as installed in SC_DPKG).
@@ -446,6 +467,7 @@ EOF
   fi
 
   h_nfp_plugins "${SC_NFP:-}"
+  if [[ ${SC_NFP_DROPIN:-0} == 1 ]]; then h_nfp_dropin "$art"; fi
   useradd --system --shell /usr/sbin/nologin "$H_SYSUSER"
   useradd --create-home --shell /usr/sbin/nologin "$H_NOLOGIN"
   groupadd "$H_GROUP"
@@ -5069,6 +5091,19 @@ t_h_restart_policy() { # SCENARIO
   return $((1 - ok))
 }
 
+# Rules files not written by the script, iptables-persistent installed, the drop-in for
+# --noflush missing (SCENARIO): the checks stop the run before any change (no apt-get
+# full-upgrade either) and the message names /etc/iptables/rules.v4.
+t_h_rules_nodropin_abort() { # SCENARIO
+  local ok=1 a
+  t_aborts_because "$1" '/etc/iptables/rules\.v4' || ok=0
+  a=$(art "$1")
+  [[ -n $(snap_path "$1" 0 /etc/iptables/rules.v4) ]] || no "fixture: no rules.v4 before the run"
+  [[ -z $(snap_path "$1" 0 /etc/systemd/system/netfilter-persistent.service.d/10-noflush.conf) ]] || no "fixture: the drop-in is there"
+  ! grep -qE '^apt-get .* full-upgrade' "$a/log1" || no "apt-get full-upgrade ran before the abort"
+  return $((1 - ok))
+}
+
 # Run 1 of SCENARIO exits 0, run 2 stops naming REGEX (its checks, before any change):
 # no file and no firewall rule changed in run 2, no modifying command in run 2.
 t_h_rerun_abort_unchanged() { # SCENARIO REGEX
@@ -5313,7 +5348,10 @@ hostinger_scenarios() {
   scenario h_existing_samekey "${HA[@]}" SC_H_EXISTING=1 SC_H_SSH_MODE=700 SC_H_KEYS_MODE=600 \
     "SC_H_OLDKEYS=$(awk '{ print $1, $2 }' <<<"$ed") same key, other comment\n"
   # Rules saved before (netfilter-persistent save: all tables)
-  scenario h_rules_old "${HA[@]}" SC_RUNS=2 SC_RULES_SAVED=1 SC_NFP=ok \
+  scenario h_rules_old "${HA[@]}" SC_RUNS=2 SC_RULES_SAVED=1 SC_NFP=ok SC_NFP_DROPIN=1 \
+    "SC_DPKG=$dpkg"$'\n'"iptables-persistent=install ok installed"
+  # ... the same without the drop-in: netfilter-persistent would load them without --noflush
+  scenario h_rules_old_nodropin "${HA[@]}" SC_RULES_SAVED=1 SC_NFP=ok \
     "SC_DPKG=$dpkg"$'\n'"iptables-persistent=install ok installed"
   # daemon.json from before
   scenario h_dj_merge "${HA[@]}" SC_RUNS=2 \
@@ -5516,6 +5554,8 @@ hostinger_checks() {
     t_h_backup h_rules_old /etc/iptables/rules.v6 "$WORK/h_rules_old/rules.v6.orig"
   check "hostinger: earlier rules files: new ones only table filter with the INPUT rules" t_h_rules_files h_rules_old 1
   check "hostinger: earlier rules files: run 2 changes nothing (no second backup)" t_h_rerun h_rules_old
+  check "hostinger: earlier rules files, iptables-persistent installed, its noflush drop-in missing: abort before any change, naming rules.v4" \
+    t_h_rules_nodropin_abort h_rules_old_nodropin
 
   check "hostinger: daemon.json with other keys merged (dns, json-file, max-size 50m, features kept; max-file 3, live-restore true added), dockerd --validate passes" \
     t_h_daemon_json h_dj_merge "$merge_want"
