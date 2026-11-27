@@ -127,15 +127,30 @@ run() {
 
 # Temporary directory of this run, created on demand, removed on exit.
 TMP_DIR=""
-cleanup() { if [[ -n $TMP_DIR ]]; then rm -rf -- "$TMP_DIR"; fi; }
+# cleanup (EXIT): if the run ends (abort, error) after the SSH drop-in was written but
+# before ssh was reloaded (SSHD_PENDING), put the previous drop-in back first; then
+# remove the temporary directory (which holds the copy of the previous drop-in).
+cleanup() {
+  if [[ ${SSHD_PENDING:-0} == 1 ]]; then
+    if sshd_restore_dropin; then
+      echo "Abbruch vor dem Neuladen von SSH: $SSHD_CONF wurde zurückgesetzt, SSH nicht neu geladen." >&2
+    else
+      echo "Abbruch vor dem Neuladen von SSH: $SSHD_CONF ließ sich NICHT zurücksetzen. Vor dem nächsten Neustart von ssh von Hand prüfen!" >&2
+    fi
+  fi
+  if [[ -n $TMP_DIR ]]; then rm -rf -- "$TMP_DIR"; fi
+}
 trap cleanup EXIT
 # Interrupted (Ctrl-C, SIGHUP of a closed web console tab, SIGTERM): if this run has
 # written the SSH drop-in but not yet reloaded ssh (SSHD_PENDING), put the previous one
 # back first, so that no unchecked drop-in is left for the next start of ssh.
 SSHD_PENDING=0
+SSHD_RELOADING=0
 on_signal() {
   trap - INT HUP TERM
-  if [[ $SSHD_PENDING == 1 ]]; then
+  if [[ $SSHD_RELOADING == 1 ]]; then
+    echo "Abgebrochen (Signal) während systemctl reload ssh: $SSHD_CONF ist geprüft und bleibt. Ob ssh sie schon übernommen hat, zeigt: sudo systemctl status ssh; sonst: sudo systemctl reload ssh." >&2
+  elif [[ $SSHD_PENDING == 1 ]]; then
     if sshd_restore_dropin; then
       echo "Abgebrochen (Signal): $SSHD_CONF wurde zurückgesetzt, SSH nicht neu geladen." >&2
     else
@@ -1019,16 +1034,23 @@ if hostinger && command -v ss >/dev/null 2>&1; then
     warn "Diese Dienste lauschen auf weiteren Ports und sind nach Schritt 3 von außen nicht mehr erreichbar (INPUT endet mit REJECT, offen bleiben nur tcp ${SSH_PORTS[*]}, 80 und 443 sowie die oben genannten Ports, die Docker veröffentlicht): $blocked"
   fi
 fi
-# Profile hostinger: rules files from before, while iptables-persistent is not
-# installed yet. The postinst of netfilter-persistent starts the service on its first
-# installation and would load them, without --noflush unless the drop-in of this script
-# is there already, replacing the table filter and deleting Docker's chains. A file this
-# script wrote (its header and -F INPUT) together with its drop-in is safe to load.
-if hostinger && ! pkg_installed iptables-persistent; then
+# Profile hostinger: rules files the script did not write. netfilter-persistent loads
+# them, without --noflush unless the drop-in of this script (NFP_DROPIN) is in place,
+# replacing the whole table filter and deleting Docker's chains: on its first
+# installation in step 1 (postinst: start), and if it is installed already, on every
+# restart, e.g. by a package update in apt-get full-upgrade (postinst: restart). A file
+# this script wrote (its header and -F INPUT) together with its drop-in is safe to load.
+if hostinger; then
   for f in /etc/iptables/rules.v4 /etc/iptables/rules.v6; do
-    if [[ -e $f ]] && ! { [[ "$(head -n 1 "$f" 2>/dev/null)" == "# Managed by deploy/setup-server.sh (profile hostinger)"* ]] &&
-      grep -qx -- '-F INPUT' "$f" 2>/dev/null && [[ "$(cat "$NFP_DROPIN" 2>/dev/null)" == "$NFP_DROPIN_CONTENT" ]]; }; then
+    [[ -e $f ]] || continue
+    if [[ "$(head -n 1 "$f" 2>/dev/null)" == "# Managed by deploy/setup-server.sh (profile hostinger)"* ]] &&
+      grep -qx -- '-F INPUT' "$f" 2>/dev/null && [[ "$(cat "$NFP_DROPIN" 2>/dev/null)" == "$NFP_DROPIN_CONTENT" ]]; then
+      continue
+    fi
+    if ! pkg_installed iptables-persistent; then
       precondition_failed "$f existiert, iptables-persistent ist aber noch nicht installiert. Bei der Installation in Schritt 1 würde netfilter-persistent die Datei laden und dabei die ganze Tabelle filter ersetzen (die Ketten von Docker wären weg). Erst beiseitelegen, z. B. sudo mv $f $f.alt, dann das Skript erneut starten."
+    elif [[ "$(cat "$NFP_DROPIN" 2>/dev/null)" != "$NFP_DROPIN_CONTENT" ]]; then
+      precondition_failed "$f stammt nicht von diesem Skript, und netfilter-persistent lädt es ohne --noflush (der Drop-in $NFP_DROPIN fehlt). Ein Neustart des Dienstes, etwa durch ein Paket-Update in Schritt 1, würde die ganze Tabelle filter ersetzen (die Ketten von Docker wären weg). Erst beiseitelegen, z. B. sudo mv $f $f.alt, dann das Skript erneut starten; es schreibt die Datei dann selbst."
     fi
   done
 fi
@@ -1086,13 +1108,36 @@ if hostinger && [[ -n ${SSH_CONNECTION:-} && ${SSH_CONNECTION%% *} != "$CONSOLE_
   warn "Du bist per SSH von ${SSH_CONNECTION%% *} verbunden, nicht über die Web-Konsole des hPanels ($CONSOLE_ADDR). Nach dem Lauf kommt root von dort nicht mehr herein (diese Sitzung bleibt bestehen). Empfehlung: das Skript in der Web-Konsole starten und sie offen lassen, bis der Login als $ADMIN_USER und sudo -v geklappt haben."
   warn "################################################################"
 fi
+# Other logins in the journal (last 30 days): root from any address but CONSOLE_ADDR
+# (any method, e.g. a key of an hPanel feature such as the Docker manager) and users
+# other than root, ADMIN_USER and deploy. After the run AllowUsers and PermitRootLogin
+# turn them away. Only the count and the distinct source addresses are shown.
 if hostinger && command -v journalctl >/dev/null 2>&1; then
-  console_logins=$(timeout 20 journalctl -q --no-pager --since "-30 days" -t sshd -t sshd-session 2>/dev/null |
-    grep -c "Accepted password for root from $CONSOLE_ADDR " || true)
+  journal_logins=$(timeout 20 journalctl -q --no-pager --since "-30 days" -t sshd -t sshd-session 2>/dev/null |
+    awk -v con="$CONSOLE_ADDR" -v adm="$ADMIN_USER" -v dep="$DEPLOY_USER" '
+      { for (i = 1; i + 5 <= NF; i++) if ($i == "Accepted" && $(i + 2) == "for" && $(i + 4) == "from") {
+          m = $(i + 1); u = $(i + 3); a = $(i + 5)
+          if (u == "root" && a == con && m == "password") console++
+          else if (u == "root" && a != con) { root_n++; if (!(a in ra)) { ra[a] = 1; root_a = root_a (root_a == "" ? "" : " ") a } }
+          else if (u != "root" && u != adm && u != dep) { oth_n++; if (!(a in oa)) { oa[a] = 1; oth_a = oth_a (oth_a == "" ? "" : " ") a } }
+          break } }
+      END { printf "%d|%d|%s|%d|%s\n", console, root_n, root_a, oth_n, oth_a }') || journal_logins="0|0||0|"
+  IFS='|' read -r console_logins root_other root_other_addr other_logins other_addr <<<"$journal_logins"
   if [[ ${console_logins:-0} =~ ^[1-9][0-9]*$ ]]; then
     info "Journal: In den letzten 30 Tagen hat sich root ${console_logins}-mal mit Passwort von $CONSOLE_ADDR angemeldet (Web-Konsole)."
   else
     info "Journal: Keine Anmeldung von root mit Passwort von $CONSOLE_ADDR gefunden. Vor dem Lauf prüfen, dass die Web-Konsole im hPanel funktioniert; sie ist danach der einzige Weg für root."
+  fi
+  if [[ ${root_other:-0} =~ ^[1-9][0-9]*$ || ${other_logins:-0} =~ ^[1-9][0-9]*$ ]]; then
+    warn "################################################################"
+    if [[ ${root_other:-0} =~ ^[1-9][0-9]*$ ]]; then
+      warn "Journal: ${root_other} Anmeldungen als root NICHT von $CONSOLE_ADDR in den letzten 30 Tagen, von: $root_other_addr. Nach dem Lauf weist SSH root von dort ab (PermitRootLogin no, AllowUsers). Funktionen im hPanel, die sich so anmelden (z. B. der Docker-Manager), gehen dann nicht mehr."
+    fi
+    if [[ ${other_logins:-0} =~ ^[1-9][0-9]*$ ]]; then
+      warn "Journal: ${other_logins} Anmeldungen anderer Benutzer als root, $ADMIN_USER und $DEPLOY_USER in den letzten 30 Tagen, von: $other_addr. Nach dem Lauf lässt AllowUsers sie nicht mehr herein."
+    fi
+    warn "Erst klären, wer sich so anmeldet; nach dem Lauf prüfen, dass die Funktionen im hPanel noch gehen (docs/server.md)."
+    warn "################################################################"
   fi
 fi
 
@@ -1516,7 +1561,11 @@ CONF
 # boot before Docker sets up its own.
 # The hPanel of Hostinger has its own firewall in front of the server as well.
 
-step "Firewall: Ports 22, 80 und 443"
+if hostinger; then
+  step "Firewall: INPUT schließen (SSH ${SSH_PORTS[*]}, 80, 443, Docker-Ports, danach REJECT)"
+else
+  step "Firewall: Ports 22, 80 und 443"
+fi
 FW_CHANGED=0
 DRY_SHIFT=0
 
@@ -1604,7 +1653,8 @@ open_ports() {
 # close_input TOOL (profile hostinger): append the missing ACCEPT rules (ensure_accept;
 # hostinger_rules, then hostinger_ports), then the final REJECT, unless the last rule
 # of INPUT is an unconditional REJECT or DROP already (hostinger_final_pos; new ACCEPT
-# rules go before the first REJECT, as on Oracle). Only inserts and
+# rules go right before it, accept_limit, never above a REJECT or DROP with a
+# condition). Only inserts and
 # appends, never deletes. Before the REJECT is appended, every ACCEPT rule must be
 # there (hostinger_missing), otherwise the script stops without appending it.
 close_input() {
@@ -1860,6 +1910,8 @@ sshd_restore_dropin() {
 sshd_check_failed() {
   local ok=1 why
   if [[ $SSHD_CHANGED != 1 ]]; then
+    # The drop-in is unchanged and stays (no restore by cleanup).
+    SSHD_PENDING=0
     case ${2:-config} in
       rundir) why="Die Konfiguration von sshd wurde nicht geprüft: ohne das Laufzeitverzeichnis /run/sshd scheitern sshd -t und sshd -T. Ursache ist das System (z. B. /run nicht beschreibbar oder voll), nicht die Konfiguration." ;;
       error) why="sshd selbst meldet einen Fehler (z. B. Syntaxfehler in einer Datei von sshd_config oder sshd_config.d, fehlender Host-Schlüssel); die Meldung von sshd steht darüber bzw. zeigt sudo sshd -t." ;;
@@ -2070,11 +2122,11 @@ GSSAPIAuthentication no
 HostbasedAuthentication no
 AllowUsers ${ADMIN_USER} ${DEPLOY_USER}"
 fi
+# From before writing until the reload, any end of the run (abort, error: cleanup on
+# EXIT; INT, HUP, TERM: on_signal) puts the previous drop-in back.
+dry || SSHD_PENDING=1
 if put "$SSHD_CONF" 0644 <<<"$SSHD_CONTENT"; then
   SSHD_CHANGED=1
-  # From here until the reload, an interruption (INT, HUP, TERM) puts the previous
-  # drop-in back (on_signal).
-  dry || SSHD_PENDING=1
 fi
 # The checks only read and run on every real run, also when the drop-in is unchanged:
 # another file (a later drop-in, a Match block, a package update) can have changed the
@@ -2144,14 +2196,17 @@ fi
 # Profile hostinger: reloaded on every run once the checks passed, also with an
 # unchanged drop-in, so that a drop-in left by an earlier, interrupted run takes effect
 # only after these checks and never later by surprise (reboot at 04:00).
+# The checks passed: from now on the drop-in stays, whatever happens.
+SSHD_PENDING=0
 if [[ $SSHD_CHANGED == 1 ]] || hostinger; then
   if dry || systemctl is-active --quiet ssh; then
+    SSHD_RELOADING=1
     run systemctl reload ssh
+    SSHD_RELOADING=0
   else
     info "ssh.service läuft gerade nicht (Socket-Aktivierung); die Einstellungen gelten beim nächsten Start."
   fi
 fi
-SSHD_PENDING=0
 
 # ---------------------------------------------------------------------------
 # 5. fail2ban
@@ -2755,7 +2810,7 @@ Auf deinem eigenen Rechner:
    oder in der Firewall im hPanel.
 
 Firewall-Regeln später ändern: eigene Regel vor das REJECT einfügen und mit
-PROFIL=hostinger ONLY_SAVE_FIREWALL=1 bash setup-server.sh speichern. Nie
+PROFIL=hostinger ONLY_SAVE_FIREWALL=1 bash /root/setup-server.sh speichern. Nie
 netfilter-persistent save, reload oder restart von Hand aufrufen.
 TEXT
   exit 0

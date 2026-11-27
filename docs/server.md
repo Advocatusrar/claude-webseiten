@@ -328,7 +328,9 @@ allein gibt so noch keine Root-Rechte.
 2. **Commit wählen und Prüfsumme auf eurem Rechner berechnen.** Im Repository auf
    GitHub den Commit von `main` nehmen, der das Skript in der geprüften Fassung enthält
    (40-stelliger Hash). In eurem Klon:
-   `git fetch origin && git show COMMIT:deploy/setup-server.sh | sha256sum`.
+   `git fetch origin && git cat-file -p COMMIT:deploy/setup-server.sh | sha256sum`
+   (das ist genau der Inhalt der Datei in diesem Commit, wie ihn `curl` in Schritt 5
+   lädt).
    Die Prüfsumme notieren.
 3. **hPanel absichern:** Zwei-Faktor-Anmeldung für das hPanel einschalten, und das
    root-Passwort (für die Web-Konsole) im hPanel auf ein langes, nur hier verwendetes
@@ -336,7 +338,18 @@ allein gibt so noch keine Root-Rechte.
    auf dem Server, damit hPanel und Server übereinstimmen.
 4. **Web-Konsole öffnen:** im hPanel den VPS wählen und das Browser-Terminal öffnen
    (Login als root). Das Skript in dieser Konsole starten, nicht über SSH von eurem
-   Rechner (sonst warnt es). Diese Konsole bleibt offen, bis Schritt 10 geklappt hat.
+   Rechner (sonst warnt es). Diese Konsole bleibt offen, bis Schritt 11 geklappt hat.
+   Darin zuerst `tmux` starten, damit ein geschlossener oder abgestürzter Browser-Tab
+   den Lauf (und damit apt und dpkg) nicht mittendrin abbricht:
+
+   ```sh
+   command -v tmux || apt-get install -y tmux   # auf Ubuntu 24.04 Server meist schon da
+   tmux new -s haertung
+   ```
+
+   Ist der Tab weg: Web-Konsole neu öffnen und `tmux attach -t haertung`. Alle
+   folgenden Befehle auf dem Server laufen in dieser tmux-Sitzung. (`screen` geht
+   genauso: `screen -S haertung`, zurück mit `screen -r haertung`.)
 5. **Skript auf den Server holen** (in der Web-Konsole, als root):
 
    ```sh
@@ -351,7 +364,21 @@ allein gibt so noch keine Root-Rechte.
    und `git -C claude-webseiten checkout COMMIT`, oder vor dem ersten Lauf
    `scp deploy/setup-server.sh root@SERVER:/root/` von eurem Rechner (root darf sich bis
    zum Lauf noch mit Passwort anmelden). Immer einen festen Commit nehmen, nie `main`.
-6. **Testlauf** (ändert nichts):
+6. **Anmeldungen der letzten 30 Tage ansehen** (nur lesend):
+
+   ```sh
+   journalctl -q --since "-30 days" -t sshd -t sshd-session | grep ' Accepted ' |
+     awk '{ for (i = 1; i <= NF; i++) if ($i == "Accepted") print $(i + 3), $(i + 5), $(i + 1) }' |
+     sort | uniq -c
+   ```
+
+   Spalten: Anzahl, Benutzer, Absenderadresse, Verfahren. Erwartet ist root von
+   `169.254.0.1` mit `password` (Web-Konsole). Jede andere Zeile (root von einer anderen
+   Adresse, etwa mit `publickey`, oder ein anderer Benutzer) ist nach dem Lauf
+   gesperrt. Funktionen im hPanel wie der Docker-Manager könnten sich so anmelden;
+   vorher klären, wer das ist. Der Testlauf in Schritt 7 meldet dasselbe als Warnung
+   (nur Anzahl und Adressen).
+7. **Testlauf** (ändert nichts):
 
    ```sh
    PROFIL=hostinger ADMIN_USER=name ADMIN_PUBKEY='ssh-ed25519 AAAA... name@rechner' DRY_RUN=1 bash setup-server.sh
@@ -368,35 +395,41 @@ allein gibt so noch keine Root-Rechte.
      der Compose-Datei `restart: unless-stopped`).
    - „Journal: Keine Anmeldung von root … gefunden“: Erst prüfen, dass die Web-Konsole
      wirklich funktioniert.
-7. **Echter Lauf:** derselbe Befehl ohne `DRY_RUN=1`. Bevor er SSH ändert, fragt er
+   - „Journal: … Anmeldungen als root NICHT von 169.254.0.1 …“ oder „… anderer
+     Benutzer …“: siehe Schritt 6.
+8. **Echter Lauf:** derselbe Befehl ohne `DRY_RUN=1`. Bevor er SSH ändert, fragt er
    nach dem Passwort für `ADMIN_USER` (für sudo). Er endet mit „Änderungen in diesem
    Lauf: …“ und der Abnahmeliste.
-8. **Zweite Anmeldung testen, bevor ihr irgendetwas schließt.** Auf eurem Rechner in
+9. **Zweite Anmeldung testen, bevor ihr irgendetwas schließt.** Auf eurem Rechner in
    einem neuen Fenster: `ssh name@SERVER`, dann `sudo -v` (fragt nach dem Passwort aus
-   Schritt 7). Gegenproben: `ssh root@SERVER` und
+   Schritt 8). Gegenproben: `ssh root@SERVER` und
    `ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password name@SERVER`
    werden mit „Permission denied“ abgewiesen.
    Klappt der Login mit dem Schlüssel nicht: in der noch offenen Web-Konsole
    `rm /etc/ssh/sshd_config.d/10-haertung.conf && systemctl reload ssh`. Damit gilt
    wieder die SSH-Konfiguration von Hostinger; Ursache suchen und das Skript erneut
    starten.
-9. **Dienste prüfen** (auf eurem Rechner): `curl -I http://SERVER` und
+10. **Dienste prüfen** (auf eurem Rechner): `curl -I http://SERVER` und
    `curl -I http://SERVER:32768` antworten wie vor dem Lauf (Traefik bzw. die andere
    App), über IPv6 ebenso (`curl -6 -I …`, falls der VPS IPv6 hat). Auf dem Server:
    `sudo iptables -S INPUT`, `sudo ip6tables -S INPUT`, `sudo fail2ban-client status sshd`,
    `sudo docker info | grep -i 'live restore'` (zeigt `Live Restore Enabled: true`).
-10. **Zweite Web-Konsole öffnen**, die erste noch nicht schließen: Der Login als root
-    muss weiter klappen. Erst wenn Schritt 8 (einschließlich `sudo -v`) und dieser
+11. **Zweite Web-Konsole öffnen**, die erste noch nicht schließen: Der Login als root
+    muss weiter klappen. Erst wenn Schritt 9 (einschließlich `sudo -v`) und dieser
     Schritt geklappt haben, die erste Konsole schließen.
-11. **Firewall im hPanel** zusätzlich einrichten: eingehend TCP 22 (bzw. euren SSH-Port),
+12. **Funktionen im hPanel prüfen:** den Docker-Manager und die anderen Funktionen
+    des VPS, die ihr nutzt, einmal aufrufen (Container anzeigen, Logs). Gehen sie nicht
+    mehr, melden sie sich vermutlich per SSH an (siehe Schritt 6); dann im Journal
+    nachsehen (`journalctl -t sshd -t sshd-session --since "-1 hour"`) und klären.
+13. **Firewall im hPanel** zusätzlich einrichten: eingehend TCP 22 (bzw. euren SSH-Port),
     80 und 443 erlauben (und 32768, solange die andere App von außen erreichbar sein
     soll), den Rest verwerfen. Sie filtert vor dem Server und ist die einzige Stelle, an
     der sich Docker-Ports wie 32768 ohne Eingriff in Docker beschränken lassen. Prüfen,
     dass sie Antworten auf Verbindungen des Servers durchlässt (zustandsbehaftet, sonst
     scheitern apt und DNS), ICMP nicht sperrt und die Web-Konsole (`169.254.0.1`) nicht
-    betrifft. Danach Schritt 8 bis 10 wiederholen.
-12. **Optional, in einer ruhigen Stunde:** einmal `sudo reboot` und danach Schritt 8 bis
-    10 wiederholen. Das prüft, dass die Firewall-Regeln beim Start geladen werden und die
+    betrifft. Danach Schritt 9 bis 12 wiederholen.
+14. **Optional, in einer ruhigen Stunde:** einmal `sudo reboot` und danach Schritt 9 bis
+    12 wiederholen. Das prüft, dass die Firewall-Regeln beim Start geladen werden und die
     Container wieder starten. Ein zweiter Lauf des Skripts meldet „Änderungen in diesem
     Lauf: 0“.
 
@@ -556,7 +589,7 @@ einfügen, z. B. für einen Dienst des Servers, den ein Container braucht:
 speichern:
 
 ```sh
-sudo PROFIL=hostinger ONLY_SAVE_FIREWALL=1 bash setup-server.sh
+sudo PROFIL=hostinger ONLY_SAVE_FIREWALL=1 bash /root/setup-server.sh
 ```
 
 Das prüft, dass `INPUT` noch mit `REJECT` endet, davor die nötigen Regeln stehen und
@@ -606,6 +639,15 @@ Seite des Netzes, nicht aus dem Internet. Versuche von dort werden weiter protok
 Lauscht sshd nicht auf 22, überwacht der Jail die Ports laut `sshd -T`.
 
 ### Risiken und Grenzen
+
+- **fail2ban vor Schritt 5 des Skripts:** apt installiert fail2ban in Schritt 1 und
+  startet es mit den Voreinstellungen von Ubuntu (Jail `sshd` aktiv, ohne
+  `169.254.0.1` in `ignoreip`). Bis das Skript in Schritt 5 seine `jail.local` schreibt,
+  und dauerhaft, wenn es vorher abbricht (z. B. in Schritt 4a, weil `ADMIN_USER` kein
+  Passwort hat), kann fail2ban die Web-Konsole nach fünf Fehlversuchen für zehn Minuten
+  sperren. Deshalb das root-Passwort beim Login in die Web-Konsole nicht mehrfach falsch
+  eingeben und ein abgebrochenes Skript zügig erneut starten. Entsperren von Hand:
+  `sudo fail2ban-client set sshd unbanip 169.254.0.1`.
 
 - **Die Ausnahme für `169.254.0.1` verlässt sich auf das interne Netz von Hostinger.**
   Wer diese Adresse im Netz des VPS verwenden kann (Hostinger selbst, oder ein Fehler
