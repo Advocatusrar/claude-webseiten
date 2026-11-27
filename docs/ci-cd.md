@@ -109,7 +109,11 @@ Settings → Rules → Rulesets → New ruleset → New branch ruleset:
 | `DEPLOY_ENABLED` | `true`                       | schaltet Veröffentlichen und Deploy ein (setzt `PUBLISH_ENABLED` nicht voraus); **erst nach dem Aufbau von Live und Staging setzen**, sonst schlägt der Deploy-Job fehl |
 
 Das Veröffentlichen läuft nie bei Pull Requests und nie bei Aktionen von Dependabot
-(`github.actor`), nur nach einem Push auf `main` oder einem manuellen Start auf `main`. `SITE_URL` ist Pflicht, sobald
+(`github.actor`), nur nach einem Push auf `main` oder einem manuellen Start auf `main`. Weil
+GitHub Ausdrücke ohne Beachtung der Groß- und Kleinschreibung vergleicht (ein Branch
+`Main` würde `main` entsprechen), prüft zusätzlich jeweils der erste Schritt der Jobs
+„Publish image“ und „Deploy to production“ in der Shell exakt auf `refs/heads/main` und
+auf einen Akteur ungleich `dependabot[bot]`. `SITE_URL` ist Pflicht, sobald
 eine der beiden Variablen `true` ist.
 
 | Ereignis                | `PUBLISH_ENABLED` | `DEPLOY_ENABLED` | Ergebnis                                  |
@@ -155,8 +159,11 @@ Pipeline und die Freigabe in GitHub.
 
 Ist `SITE_URL` nicht gesetzt, schlägt der Job „Build Docker image“ gleich im ersten
 Schritt mit „SITE_URL is not set“ fehl. Enthält `SITE_URL` `example.org`, bricht der
-Build mit `CHECK_LIVE=1` ab. Zum Ausschalten `PUBLISH_ENABLED` löschen oder auf etwas
-anderes als `true` setzen.
+Build mit `CHECK_LIVE=1` ab.
+
+GitHub vergleicht Variablenwerte ohne Beachtung der Groß- und Kleinschreibung: `TRUE`
+oder `True` schalten also ebenfalls ein. Zum Ausschalten die Variable löschen oder auf
+`false` setzen.
 
 ### 4. Environment `production` (Settings → Environments → New environment)
 
