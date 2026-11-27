@@ -34,11 +34,13 @@ Datei: [`.github/workflows/ci-cd.yml`](../.github/workflows/ci-cd.yml).
 - **Kein Start von Hand.** Auch der erste Start auf dem Server läuft über die Pipeline:
   `DEPLOY_ENABLED` und die Freigabe des Environments `production` in GitHub. `deploy.sh`
   prüft den Zustand und rollt bei Fehlern zurück.
-- **`DEPLOY_ENABLED` bis zum Aufbau von Live und Staging nicht setzen.** Auf dem Server
-  liegen noch kein `deploy.sh` und keine Website (`setup-server.sh` legt sie nicht mehr
-  an). Der Deploy-Job würde nach jedem Merge nach `main` fehlschlagen. Wer vorher einen
-  grünen Lauf mit veröffentlichtem Image sehen will, setzt nur `PUBLISH_ENABLED` (siehe
-  Abschnitt 3).
+- **`DEPLOY_ENABLED` erst setzen, wenn der Server vorbereitet ist.** `setup-server.sh`
+  legt weder `deploy.sh` noch die Website an. Auf dem Oracle-Server folgt das mit dem
+  Aufbau von Live und Staging; auf dem Hostinger-VPS bereitet ihr `/opt/website` von Hand
+  vor, ohne etwas zu starten ([`server.md`](server.md), „Variante Hostinger-VPS“). Ohne
+  vorbereiteten Server würde der Deploy-Job nach jedem Merge nach `main` fehlschlagen.
+  Wer vorher einen grünen Lauf mit veröffentlichtem Image sehen will, setzt nur
+  `PUBLISH_ENABLED` (siehe Abschnitt 3).
 - **Rollback statt Hoffnung.** Wird das neue Image auf dem Server nicht gesund, startet
   `deploy.sh` automatisch das vorige.
 
@@ -106,7 +108,7 @@ Settings → Rules → Rulesets → New ruleset → New branch ruleset:
 | `DEPLOY_HOST`    | `203.0.113.10`               | Server                                        |
 | `DEPLOY_USER`    | `deploy`                     | Benutzer auf dem Server                       |
 | `PUBLISH_ENABLED` | `true`                      | schaltet nur das Veröffentlichen des getesteten Images nach GHCR ein, ohne Deploy (Abschnitt 3) |
-| `DEPLOY_ENABLED` | `true`                       | schaltet Veröffentlichen und Deploy ein (setzt `PUBLISH_ENABLED` nicht voraus); **erst nach dem Aufbau von Live und Staging setzen**, sonst schlägt der Deploy-Job fehl |
+| `DEPLOY_ENABLED` | `true`                       | schaltet Veröffentlichen und Deploy ein (setzt `PUBLISH_ENABLED` nicht voraus); **erst setzen, wenn der Server vorbereitet ist** (Oracle: nach dem Aufbau von Live und Staging; Hostinger-VPS: nach den Schritten 1 bis 9 in `server.md`, „Variante Hostinger-VPS“), sonst schlägt der Deploy-Job fehl |
 
 Das Veröffentlichen läuft nie bei Pull Requests und nie bei Aktionen von Dependabot
 (`github.actor`), nur nach einem Push auf `main` oder einem manuellen Start auf `main`. Weil
