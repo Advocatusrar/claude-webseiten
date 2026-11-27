@@ -658,6 +658,23 @@ fixture() {
       hostinger_v4 | iptables-restore
       iptables -A INPUT -s 192.0.2.66/32 -j REJECT --reject-with icmp-port-unreachable
       ;;
+    # The same REJECT for one address, and a final unconditional REJECT after it.
+    hostinger_condfinal)
+      hostinger_v4 | iptables-restore
+      iptables -A INPUT -s 192.0.2.66/32 -j REJECT --reject-with icmp-port-unreachable
+      iptables -A INPUT -j REJECT --reject-with icmp-port-unreachable
+      ;;
+    # Two DROP rules with a condition (one address, one port), no final rule.
+    hostinger_conddrop)
+      hostinger_v4 | iptables-restore
+      iptables -A INPUT -s 192.0.2.99/32 -j DROP
+      iptables -A INPUT -p tcp -m tcp --dport 23 -j DROP
+      ;;
+    # Oracle's rules with a REJECT for one address right before the final REJECT.
+    oracle_condreject)
+      oracle_v4 | iptables-restore
+      iptables -I INPUT 6 -s 192.0.2.66/32 -j REJECT --reject-with icmp-port-unreachable
+      ;;
   esac
   case ${SC_V6:-reject} in
     reject) oracle_v6 | ip6tables-restore ;;
@@ -675,6 +692,16 @@ fixture() {
     hostinger_condreject)
       hostinger_v6 | ip6tables-restore
       ip6tables -A INPUT -s 2001:db8::66/128 -j REJECT --reject-with icmp6-port-unreachable
+      ;;
+    hostinger_condfinal)
+      hostinger_v6 | ip6tables-restore
+      ip6tables -A INPUT -s 2001:db8::66/128 -j REJECT --reject-with icmp6-port-unreachable
+      ip6tables -A INPUT -j REJECT --reject-with icmp6-port-unreachable
+      ;;
+    hostinger_conddrop)
+      hostinger_v6 | ip6tables-restore
+      ip6tables -A INPUT -s 2001:db8::99/128 -j DROP
+      ip6tables -A INPUT -p tcp -m tcp --dport 23 -j DROP
       ;;
   esac
   # NAT rules in both families (like Docker's masquerading): restoring the table filter
@@ -5091,6 +5118,91 @@ t_h_only_save_rundir() { # SCENARIO
   return $((1 - ok))
 }
 
+# The first COUNT rules of INPUT of FAMILY before run 1 of SCENARIO (fixture: REJECT or
+# DROP rules with a condition, e.g. for one address) are, after run RUN, still rules 1 to
+# COUNT, unchanged and in their order: no new rule went above them, so what they block
+# stays blocked. The classes of all rules after run RUN are WANT
+# (t_h_fw_classes).
+t_h_fw_cond_first() { # SCENARIO FAMILY RUN COUNT WANT
+  local ok=1 a before after
+  have_run "$1" "$3" || return 1
+  a=$(art "$1")
+  before=$(grep '^-A INPUT ' "$a/$2_0" | head -n "$4")
+  if [[ $(grep -cE -- '^-A INPUT (-s [^ ]+|-p tcp -m tcp --dport [0-9]+) -j (REJECT|DROP)( |$)' <<<"$before") != "$4" ]]; then
+    no "fixture: the first $4 rules of $2 INPUT before the run are not REJECT or DROP rules with a condition:" "$(cat "$a/$2_0")"
+  fi
+  after=$(grep '^-A INPUT ' "$a/$2_$3" | head -n "$4")
+  [[ $after == "$before" ]] || no "$2: the rules from before are not the first $4 rules after run $3 (< before, > after):" "$(diff <(printf '%s\n' "$before") <(printf '%s\n' "$after"))"
+  t_h_fw_classes "$1" "$2" "$3" "$5" || ok=0
+  return $((1 - ok))
+}
+
+# The dry run DRY (same fixture as the real run REAL) shows the positions the real run
+# uses: applying the commands it prints for TOOL ("TOOL -I INPUT N RULE", "TOOL -A INPUT
+# RULE", in order) to INPUT of FAMILY as it was before gives exactly INPUT after run 1 of
+# REAL. The dry run exits 0 and changes nothing.
+t_h_dry_positions() { # DRY REAL FAMILY
+  local ok=1 a b tool out
+  have_run "$1" 1 || return 1
+  have_run "$2" 1 || return 1
+  a=$(art "$1") b=$(art "$2")
+  if [[ $3 == v4 ]]; then tool=iptables; else tool=ip6tables; fi
+  [[ $(rc_of "$1" 1) == 0 ]] || no "dry run: expected exit code 0, got: $(rc_of "$1" 1)"
+  assert_unchanged "$1" 1
+  [[ "$(cat "$a/$3_0")" == "$(cat "$b/$3_0")" ]] || no "fixture: dry run and real run start from different $3 INPUT"
+  grep -qE "\[Testlauf\] $tool (-I INPUT [0-9]+|-A INPUT) " "$a/out1" || no "the dry run shows no $tool command for INPUT"
+  out=$(
+    python3 -I - "$a/$3_0" "$a/out1" "$b/$3_1" "$tool" <<'PY'
+import re
+import shlex
+import sys
+
+rules = [l.rstrip("\n") for l in open(sys.argv[1]) if l.startswith("-A INPUT ")]
+tool = sys.argv[4]
+pat = re.compile(r"^\s*\[Testlauf\] " + re.escape(tool) + r" (.*)$")
+for line in open(sys.argv[2]):
+    m = pat.match(line.rstrip("\n"))
+    if not m:
+        continue
+    args = shlex.split(m.group(1))
+    if args[:2] == ["-I", "INPUT"] and len(args) > 2 and args[2].isdigit():
+        rules.insert(int(args[2]) - 1, "-A INPUT " + " ".join(args[3:]))
+    elif args[:2] == ["-A", "INPUT"]:
+        rules.append("-A INPUT " + " ".join(args[2:]))
+real = [l.rstrip("\n") for l in open(sys.argv[3]) if l.startswith("-A INPUT ")]
+if rules != real:
+    print("INPUT the dry run describes:")
+    print("\n".join(rules))
+    print("INPUT after the real run:")
+    print("\n".join(real))
+    sys.exit(1)
+PY
+  ) || no "$tool: the positions in the dry run differ from the real run:" "$out"
+  return $((1 - ok))
+}
+
+# Profile oracle unchanged (fixture oracle_condreject: Oracle's rules with a REJECT for
+# one address right before the final REJECT): the missing ACCEPT rules for 80 and 443 go
+# before the first REJECT, i.e. above the conditional one, as before commit 13944d0;
+# exit 0; run 2 changes no rule.
+t_oracle_condreject() { # SCENARIO
+  local ok=1 a f p80 p443 pc d
+  have_run "$1" 2 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 1) == 0 ]] || no "run 1: expected exit code 0, got: $(rc_of "$1" 1)" "$(grep '^Abbruch' "$a/err1")"
+  f="$a/v4_1"
+  p80=$(grep -nxF -- "$(fw_rule 80)" "$f" | head -1 | cut -d: -f1)
+  p443=$(grep -nxF -- "$(fw_rule 443)" "$f" | head -1 | cut -d: -f1)
+  pc=$(grep -nF -- '-s 192.0.2.66/32 -j REJECT' "$f" | head -1 | cut -d: -f1)
+  if [[ -z $p80 || -z $p443 || -z $pc ]] || ((p80 > pc || p443 > pc)); then
+    no "ACCEPT for 80 (line ${p80:-none}) and 443 (line ${p443:-none}) not before the conditional REJECT (line ${pc:-none}):" "$(cat "$f")"
+  fi
+  [[ $(grep -c -- '-j REJECT' "$f") == 2 ]] || no "not exactly the two REJECT rules from before:" "$(cat "$f")"
+  [[ $(rc_of "$1" 2) == 0 ]] || no "run 2: expected exit code 0, got: $(rc_of "$1" 2)"
+  d=$(diff "$a/fw1" "$a/fw2") || no "run 2 changed firewall rules:" "$d"
+  return $((1 - ok))
+}
+
 # prepare_ssh_keys DIR: throwaway SSH keys for ADMIN_PUBKEY, made for this run with
 # ssh-keygen (no passphrase) and removed with the work directory: ed25519, other (a
 # second ed25519), ecdsa256, ecdsa384, ecdsa521, rsa2048, rsa1024 (DIR/NAME and NAME.pub).
@@ -5291,6 +5403,12 @@ hostinger_scenarios() {
   scenario h_apt_container "${HA[@]}" SC_APT_FW=container_v4
   # A REJECT with a condition only
   scenario h_condreject "${HA[@]}" SC_FW=hostinger_condreject SC_V6=hostinger_condreject SC_RUNS=2
+  # ... and where the ACCEPT rules go (commit 13944d0)
+  scenario h_dry_condreject "${HA[@]}" SC_FW=hostinger_condreject SC_V6=hostinger_condreject SC_DRY_RUN=1
+  scenario h_condfinal "${HA[@]}" SC_FW=hostinger_condfinal SC_V6=hostinger_condfinal SC_RUNS=2
+  scenario h_dry_condfinal "${HA[@]}" SC_FW=hostinger_condfinal SC_V6=hostinger_condfinal SC_DRY_RUN=1
+  scenario h_conddrop "${HA[@]}" SC_FW=hostinger_conddrop SC_V6=hostinger_conddrop SC_RUNS=2
+  scenario oracle_condreject SC_FW=oracle_condreject SC_RUNS=2
   # ufw removed by apt (dpkg confirms)
   scenario h_ufw_removed "${HA[@]}" SC_APT_RM_UFW=1
   # AuthenticationMethods for root from the web console
@@ -5511,6 +5629,25 @@ hostinger_checks() {
     done
   done
   check "hostinger: conditional REJECT: run 2 changes nothing" t_h_rerun h_condreject
+  # Positions of the ACCEPT rules (commit 13944d0)
+  for s in v4 v6; do
+    for r in 1 2; do
+      check "hostinger: REJECT for one address, no final rule ($s, run $r): it stays rule 1 above the new ACCEPT rules, REJECT appended last" \
+        t_h_fw_cond_first h_condreject "$s" "$r" 1 "other lo est icmp dhcp tcp22 tcp80 tcp443 tcp32768 reject"
+      check "hostinger: REJECT for one address before the final REJECT ($s, run $r): ACCEPT rules right before the final REJECT, below the conditional one" \
+        t_h_fw_cond_first h_condfinal "$s" "$r" 1 "other lo est icmp dhcp tcp22 tcp80 tcp443 tcp32768 reject"
+      check "hostinger: two DROP rules with a condition, no final rule ($s, run $r): ACCEPT rules after both, REJECT last" \
+        t_h_fw_cond_first h_conddrop "$s" "$r" 2 "other other lo est icmp dhcp tcp22 tcp80 tcp443 tcp32768 reject"
+    done
+    check "hostinger dry run, REJECT for one address, no final rule ($s): the commands it shows give the INPUT of the real run" \
+      t_h_dry_positions h_dry_condreject h_condreject "$s"
+    check "hostinger dry run, REJECT for one address before the final REJECT ($s): insert positions as in the real run" \
+      t_h_dry_positions h_dry_condfinal h_condfinal "$s"
+  done
+  check "hostinger: REJECT for one address before the final REJECT: run 2 changes nothing" t_h_rerun h_condfinal
+  check "hostinger: two conditional DROP rules: run 2 changes nothing" t_h_rerun h_conddrop
+  check "profile oracle unchanged: ACCEPT for 80/443 still before the first REJECT (also one for a single address), run 2 changes nothing" \
+    t_oracle_condreject oracle_condreject
   check "hostinger ufw: apt removed it (dpkg confirms): note at the end, no warning" t_h_ufw_removed h_ufw_removed removed
   check "hostinger ufw: dpkg still has it after the packages: no claim it was removed, warning" t_h_ufw_removed h_fresh kept
   check "hostinger SSH: Match for root from $H_CONSOLE with AuthenticationMethods publickey: abort, drop-in rolled back" \
