@@ -380,6 +380,8 @@ PY
 # - SC_NEEDRESTART=1: needrestart is configured (/etc/needrestart with conf.d).
 # - SC_APT_PREFS: content of /etc/apt/preferences ("\n" separates lines).
 # - SC_NFP_DEFAULT: content of /etc/default/netfilter-persistent ("\n" separates lines).
+# - SC_JOURNAL: what the journalctl stub prints (sshd lines, "\n" separates lines).
+# - SC_SSHD_BUSY=1: an older drop-in 10-haertung.conf that cannot be replaced.
 hostinger_fixture() {
   local art=$1
   printf '%s\n' '# Hostinger image (test fixture)' 'PermitRootLogin yes' 'PasswordAuthentication yes' \
@@ -448,6 +450,14 @@ EOF
     printf '%s\n' '# needrestart.conf (test fixture)' "\$nrconf{restart} = 'i';" >/etc/needrestart/needrestart.conf
   else
     rm -rf /etc/needrestart
+  fi
+  if [[ -n ${SC_JOURNAL:-} ]]; then printf '%b\n' "$SC_JOURNAL" >"$art/state/journal"; fi
+  # An older drop-in of the script that cannot be replaced (bind mount on the file:
+  # renaming another file onto it fails), while it can still be written in place.
+  if [[ ${SC_SSHD_BUSY:-0} == 1 ]]; then
+    printf '%s\n' '# Older drop-in (test fixture)' 'PasswordAuthentication no' >/etc/ssh/sshd_config.d/10-haertung.conf
+    chmod 644 /etc/ssh/sshd_config.d/10-haertung.conf
+    mount --bind /etc/ssh/sshd_config.d/10-haertung.conf /etc/ssh/sshd_config.d/10-haertung.conf
   fi
   if [[ -n ${SC_NFP_DEFAULT:-} ]]; then
     printf '%b\n' "$SC_NFP_DEFAULT" >/etc/default/netfilter-persistent
@@ -955,6 +965,8 @@ run_setup() {
     STUB_PASSWD="${SC_PASSWD:-fail}"
     STUB_APT_RM_UFW="${SC_APT_RM_UFW:-}"
     STUB_SSHD_SIGNAL="${SC_SSHD_SIGNAL:-}"
+    STUB_RELOAD_FAIL="${SC_RELOAD_FAIL:-}"
+    STUB_RELOAD_SIGNAL="${SC_RELOAD_SIGNAL:-}"
   )
   if [[ -n ${SC_DRY_RUN+x} ]]; then envs+=(DRY_RUN="$SC_DRY_RUN"); fi
   if [[ -n ${SC_ADMIN_USER+x} ]]; then envs+=(ADMIN_USER="$SC_ADMIN_USER"); fi
@@ -1381,7 +1393,13 @@ case \$verb in
   is-active) [[ -e \$STUB_STATE/active.\${units[0]} ]] ;;
   enable) for u in "\${units[@]}"; do touch "\$STUB_STATE/enabled.\$u"; [[ \$now == 1 ]] && touch "\$STUB_STATE/active.\$u"; done; exit 0 ;;
   start|restart) for u in "\${units[@]}"; do touch "\$STUB_STATE/active.\$u"; done ;;
-  reload) [[ -e \$STUB_STATE/active.\${units[0]} ]] ;;
+  # STUB_RELOAD_FAIL=UNIT: "reload UNIT" fails (exit 1). STUB_RELOAD_SIGNAL=SIG: during
+  # "reload ssh" the caller gets signal SIG (closed web console tab while ssh reloads).
+  reload)
+    if [[ -n \${STUB_RELOAD_SIGNAL:-} && \${units[0]} == ssh ]]; then kill -s "\$STUB_RELOAD_SIGNAL" "\$PPID"; fi
+    if [[ \${STUB_RELOAD_FAIL:-} == "\${units[0]}" ]]; then echo "systemctl (test stub): reload \${units[0]} failed" >&2; exit 1; fi
+    [[ -e \$STUB_STATE/active.\${units[0]} ]]
+    ;;
   *) exit 0 ;;
 esac
 EOF
@@ -5091,6 +5109,133 @@ t_h_restart_policy() { # SCENARIO
   return $((1 - ok))
 }
 
+# Journal of the last 30 days (fixture SC_JOURNAL, dry run SCENARIO): a warning gives the
+# number of logins as root not from the web console (3) and their distinct source
+# addresses (203.0.113.50, 198.51.100.60), one the number of logins of users other than
+# root, ADMIN_USER and deploy (2) and their addresses (192.0.2.10); the console logins of
+# root are counted (2-mal). Nothing else of the log shows: no user name, no port, no key
+# fingerprint, no failed attempt, no address of ADMIN_USER or deploy.
+t_h_journal() { # SCENARIO
+  local ok=1 a out all s
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)"
+  out=$(
+    python3 -I - "$a/err1" <<'PY'
+import re
+import sys
+
+root = other = None
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    if "WARNUNG:" not in line or "Journal:" not in line:
+        continue
+    m = re.search(r"Journal: (\d+) .*?von: (.*?)\. [A-ZÄÖÜ]", line)
+    if not m:
+        continue
+    entry = (int(m.group(1)), m.group(2).split())
+    if "root" in line.split("von:")[0] and "anderer" not in line:
+        root = entry
+    elif "anderer" in line:
+        other = entry
+problems = []
+if root is None:
+    problems.append("no warning about root logins not from the web console")
+elif root[0] != 3 or sorted(root[1]) != sorted(["203.0.113.50", "198.51.100.60"]):
+    problems.append("root logins: %r, expected 3 from 203.0.113.50 198.51.100.60 (each once)" % (root,))
+if other is None:
+    problems.append("no warning about logins of other users")
+elif other[0] != 2 or other[1] != ["192.0.2.10"]:
+    problems.append("other users: %r, expected 2 from 192.0.2.10" % (other,))
+print("\n".join(problems))
+sys.exit(1 if problems else 0)
+PY
+  ) || no "$out" "$(grep 'Journal' "$a/err1")"
+  grep -q '2-mal' "$a/out1" || no "the console logins of root are not counted (2-mal):" "$(grep 'Journal' "$a/out1")"
+  all=$(cat "$a/out1" "$a/err1")
+  for s in alice 'port 400' 'port 510' SHA256:TESTFPR 203.0.113.99 192.0.2.11 192.0.2.12 ssh2; do
+    ! grep -qF -- "$s" <<<"$all" || no "the output shows '$s' from the journal:" "$(grep -F -- "$s" <<<"$all" | head -3)"
+  done
+  return $((1 - ok))
+}
+
+# Journal with only logins of root from the web console (dry run SCENARIO): no warning
+# that names the journal.
+t_h_journal_quiet() { # SCENARIO
+  local ok=1 w
+  have_run "$1" 1 || return 1
+  w=$(grep 'WARNUNG:' "$(art "$1")/err1" | grep -F 'Journal')
+  [[ -z $w ]] || no "warning about the journal although only the web console logged in:" "$w"
+  grep -q '1-mal' "$(art "$1")/out1" || no "fixture: the console login is not counted"
+  return $((1 - ok))
+}
+
+# The drop-in cannot be replaced (fixture SC_SSHD_BUSY): writing it fails after the run
+# marked the drop-in as pending. Exit != 0, the handler on exit says the drop-in was put
+# back ("Abbruch vor dem Neuladen von SSH", naming it), sshd_config.d as before (content,
+# mode), ssh not reloaded, sshd -t never ran.
+t_h_dropin_write_fail() { # SCENARIO
+  local ok=1 a rc d
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  rc=$(rc_of "$1" 1)
+  [[ $rc =~ ^[0-9]+$ && $rc -ne 0 ]] || no "expected exit code != 0, got: $rc"
+  grep -qF "$SSHD_DROPIN" <<<"$(grep 'ließ sich nicht schreiben' "$a/err1")" || no "fixture: writing $SSHD_DROPIN did not fail:" "$(cat "$a/err1")"
+  grep -qF "$SSHD_DROPIN" <<<"$(grep 'Abbruch vor dem Neuladen von SSH' "$a/err1")" ||
+    no "no message of the exit handler that $SSHD_DROPIN was put back:" "$(tail -4 "$a/err1")"
+  d=$(diff <(cut -d' ' -f1,2,3,4 "$a/sshd_state0") <(cut -d' ' -f1,2,3,4 "$a/sshd_state_r1")) ||
+    no "/etc/ssh/sshd_config.d not as before (name mode owner sha256):" "$d"
+  ! grep -qE '^systemctl [a-z-]*(reload|restart)[a-z-]* ssh' "$a/log1" || no "ssh was reloaded"
+  ! grep -qxF 'sshd -t' "$a/log1" || no "sshd -t ran although the drop-in could not be written"
+  return $((1 - ok))
+}
+
+# "systemctl reload ssh" fails (fixture SC_RELOAD_FAIL=ssh) after all checks passed: exit
+# != 0; the drop-in on disk is the one the run wrote and checked (it has the console
+# exception), no message claims it was put back.
+t_h_reload_fail() { # SCENARIO
+  local ok=1 a rc f
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  rc=$(rc_of "$1" 1)
+  [[ $rc =~ ^[0-9]+$ && $rc -ne 0 ]] || no "expected exit code != 0, got: $rc"
+  grep -qxE 'systemctl reload ssh(\.service)?' "$a/log1" || no "fixture: ssh reload not attempted"
+  f="$(upper "$1" etc)${SSHD_DROPIN#/etc}"
+  grep -qx "Match User root Address $H_CONSOLE" "$f" 2>/dev/null || no "$SSHD_DROPIN is not the checked drop-in of this run:" "$(cat "$f" 2>/dev/null)"
+  ! grep -qE 'zurückgesetzt' "$a/err1" || no "a message claims the drop-in was put back:" "$(grep 'zurückgesetzt' "$a/err1")"
+  return $((1 - ok))
+}
+
+# A signal SIG during "systemctl reload ssh" (fixture SC_RELOAD_SIGNAL): exit 130, a
+# message that names the drop-in and the reload, the drop-in on disk is the checked one of
+# this run (not put back), no message claims it was reset.
+t_h_reload_signal() { # SCENARIO
+  local ok=1 a rc f m
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  rc=$(rc_of "$1" 1)
+  [[ $rc == 130 ]] || no "expected exit code 130, got: $rc" "$(tail -3 "$a/err1")"
+  m=$(grep 'Abgebrochen (Signal)' "$a/err1")
+  { grep -qF "$SSHD_DROPIN" <<<"$m" && grep -qF 'reload' <<<"$m"; } || no "the message does not name the drop-in and the reload:" "$m"
+  f="$(upper "$1" etc)${SSHD_DROPIN#/etc}"
+  grep -qx "Match User root Address $H_CONSOLE" "$f" 2>/dev/null || no "$SSHD_DROPIN is not the checked drop-in of this run:" "$(cat "$f" 2>/dev/null)"
+  ! grep -qE 'zurückgesetzt' "$a/err1" || no "a message claims the drop-in was put back:" "$(grep 'zurückgesetzt' "$a/err1")"
+  return $((1 - ok))
+}
+
+# Run 2 of SCENARIO fails a check with the drop-in unchanged: the drop-in stays exactly as
+# after run 1 (inode, mode, times, content), and no message says it was put back.
+t_h_unchanged_dropin_kept() { # SCENARIO
+  local ok=1 a d s1
+  have_run "$1" 2 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 2) != 0 ]] || no "fixture: run 2 did not fail"
+  s1=$(snap_path "$1" 1 "$SSHD_DROPIN")
+  [[ -n $s1 ]] || no "fixture: no drop-in after run 1"
+  d=$(diff <(printf '%s\n' "$s1") <(snap_path "$1" 2 "$SSHD_DROPIN")) || no "run 2 touched the unchanged drop-in:" "$d"
+  ! grep -qE 'zurückgesetzt|Abbruch vor dem Neuladen' "$a/err2" || no "run 2 claims to have put the drop-in back:" "$(grep -E 'zurückgesetzt|Abbruch vor dem Neuladen' "$a/err2")"
+  return $((1 - ok))
+}
+
 # Rules files not written by the script, iptables-persistent installed, the drop-in for
 # --noflush missing (SCENARIO): the checks stop the run before any change (no apt-get
 # full-upgrade either) and the message names /etc/iptables/rules.v4.
@@ -5477,6 +5622,23 @@ hostinger_scenarios() {
   scenario h_only_save_noflag "${H[@]}" SC_FW=hostinger_closed SC_V6=hostinger_closed SC_ONLY_SAVE=1 SC_NFP=noflag \
     "SC_DPKG=$dpkg_nfp"
   scenario h_only_save_rundir "${H[@]}" SC_FW=hostinger_closed SC_V6=hostinger_closed SC_ONLY_SAVE=1 SC_RUN_SSHD=missing
+  # Final review (commit af799db): journal, drop-in on any end before the reload
+  scenario h_journal "${HA[@]}" SC_DRY_RUN=1 "SC_JOURNAL=$(printf '%s\n' \
+    "Nov 20 08:00:01 vps sshd[101]: Accepted password for root from $H_CONSOLE port 51001 ssh2" \
+    "Nov 21 08:00:01 vps sshd-session[102]: Accepted password for root from $H_CONSOLE port 51002 ssh2" \
+    "Nov 22 09:00:01 vps sshd[103]: Accepted publickey for root from 203.0.113.50 port 40001 ssh2: ED25519 SHA256:TESTFPR1" \
+    "Nov 23 09:00:01 vps sshd[104]: Accepted publickey for root from 203.0.113.50 port 40002 ssh2: ED25519 SHA256:TESTFPR1" \
+    "Nov 24 09:00:01 vps sshd[105]: Accepted password for root from 198.51.100.60 port 40003 ssh2" \
+    "Nov 24 10:00:01 vps sshd[106]: Accepted publickey for alice from 192.0.2.10 port 40004 ssh2: RSA SHA256:TESTFPR2" \
+    "Nov 25 10:00:01 vps sshd[107]: Accepted password for alice from 192.0.2.10 port 40005 ssh2" \
+    "Nov 25 11:00:01 vps sshd[108]: Accepted publickey for $H_ADMIN from 192.0.2.11 port 40006 ssh2: ED25519 SHA256:TESTFPR3" \
+    "Nov 25 12:00:01 vps sshd[109]: Accepted publickey for deploy from 192.0.2.12 port 40007 ssh2: ED25519 SHA256:TESTFPR4" \
+    "Nov 26 12:00:01 vps sshd[110]: Failed password for root from 203.0.113.99 port 40008 ssh2")"
+  scenario h_journal_console "${HA[@]}" SC_DRY_RUN=1 \
+    "SC_JOURNAL=Nov 20 08:00:01 vps sshd[101]: Accepted password for root from $H_CONSOLE port 51001 ssh2"
+  scenario h_dropin_busy "${HA[@]}" SC_SSHD_BUSY=1
+  scenario h_reload_fail "${HA[@]}" SC_RELOAD_FAIL=ssh
+  scenario h_reload_signal "${HA[@]}" SC_RELOAD_SIGNAL=HUP
 }
 
 hostinger_checks() {
@@ -5723,6 +5885,19 @@ hostinger_checks() {
   check "hostinger ONLY_SAVE_FIREWALL=1 with a plugin that ignores NOFLUSH: abort before any change" \
     t_aborts_because h_only_save_noflag 'IPTABLES_RESTORE_NOFLUSH'
   check "hostinger ONLY_SAVE_FIREWALL=1 without /run/sshd: creates it, saves the rules" t_h_only_save_rundir h_only_save_rundir
+
+  # Final review (commit af799db)
+  check "hostinger journal: warning with count and distinct addresses of root logins not from $H_CONSOLE and of other users, no other log details" \
+    t_h_journal h_journal
+  check "hostinger journal: only the web console logged in: no warning" t_h_journal_quiet h_journal_console
+  check "hostinger: writing the drop-in fails: the exit handler puts the previous one back and says so, no reload, no sshd -t" \
+    t_h_dropin_write_fail h_dropin_busy
+  check "hostinger: systemctl reload ssh fails after the checks: exit != 0, the checked drop-in stays, no claim it was reset" \
+    t_h_reload_fail h_reload_fail
+  check "hostinger: signal during systemctl reload ssh: exit 130, message names the drop-in and the reload, the checked drop-in stays" \
+    t_h_reload_signal h_reload_signal
+  check "hostinger: a check fails in run 2 with the drop-in unchanged: the drop-in stays as it is (inode, times, content), no claim it was put back" \
+    t_h_unchanged_dropin_kept h_rerun_denyusers
 }
 
 main() {
