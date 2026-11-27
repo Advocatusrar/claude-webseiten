@@ -409,6 +409,13 @@ allein gibt so noch keine Root-Rechte.
    `rm /etc/ssh/sshd_config.d/10-haertung.conf && systemctl reload ssh`. Damit gilt
    wieder die SSH-Konfiguration von Hostinger; Ursache suchen und das Skript erneut
    starten.
+   Meldet das Skript „systemctl reload ssh ist gescheitert“, hat es die SSH-Datei
+   geprüft (`sshd -t`, `sshd -T`) und stehen lassen; sie gilt beim nächsten Start oder
+   Neustart von ssh, auch beim Neustart des Servers um 04:00. Die Web-Konsole offen
+   lassen, die Ursache mit `systemctl status ssh --no-pager` (und
+   `journalctl -u ssh -n 50 --no-pager`) ansehen, beheben und das Skript erneut
+   starten. Soll die neue Datei vorerst nicht gelten, mit dem Befehl oben zurück zur
+   Konfiguration von Hostinger.
 10. **Dienste prüfen** (auf eurem Rechner): `curl -I http://SERVER` und
    `curl -I http://SERVER:32768` antworten wie vor dem Lauf (Traefik bzw. die andere
    App), über IPv6 ebenso (`curl -6 -I …`, falls der VPS IPv6 hat). Auf dem Server:

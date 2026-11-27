@@ -2201,7 +2201,22 @@ SSHD_PENDING=0
 if [[ $SSHD_CHANGED == 1 ]] || hostinger; then
   if dry || systemctl is-active --quiet ssh; then
     SSHD_RELOADING=1
-    run systemctl reload ssh
+    if ! run systemctl reload ssh; then
+      SSHD_RELOADING=0
+      # The drop-in passed sshd -t and sshd -T and stays; it takes effect at the next
+      # start or restart of ssh.
+      {
+        echo "Abbruch: systemctl reload ssh ist gescheitert. Die geprüfte Datei $SSHD_CONF (sshd -t und sshd -T ohne Befund) bleibt und gilt beim nächsten Start oder Neustart von ssh (auch beim Neustart des Servers, etwa um 04:00)."
+        echo "Die Web-Konsole offen lassen. Ursache ansehen: systemctl status ssh --no-pager (und journalctl -u ssh -n 50 --no-pager)."
+        if hostinger; then
+          echo "Zurück zur SSH-Konfiguration von Hostinger, falls nötig (in der Web-Konsole): rm $SSHD_CONF && systemctl reload ssh"
+        else
+          echo "Zurück zur vorherigen SSH-Konfiguration, falls nötig: sudo rm $SSHD_CONF && sudo systemctl reload ssh"
+        fi
+        echo "Danach das Skript erneut starten."
+      } >&2
+      exit 1
+    fi
     SSHD_RELOADING=0
   else
     info "ssh.service läuft gerade nicht (Socket-Aktivierung); die Einstellungen gelten beim nächsten Start."
