@@ -261,6 +261,37 @@ COMMIT
 RULES
 }
 
+# h_nfp_plugins ok|noflag|"": the plugins 15-ip4tables and 25-ip6tables of
+# netfilter-persistent in /usr/share/netfilter-persistent/plugins.d as synthetic
+# stand-ins (not copies of the package): "ok" reads IPTABLES_RESTORE_NOFLUSH or
+# IP6TABLES_RESTORE_NOFLUSH and then restores with --noflush, "noflag" never does (an
+# older plugin); "" none at all.
+h_nfp_plugins() { # ok|noflag|""
+  local dir=/usr/share/netfilter-persistent/plugins.d f var tool fam
+  rm -rf /usr/share/netfilter-persistent
+  [[ -n $1 ]] || return 0
+  install -d "$dir"
+  for f in 15-ip4tables 25-ip6tables; do
+    if [[ $f == 15-ip4tables ]]; then
+      var=IPTABLES_RESTORE_NOFLUSH tool=iptables fam=4
+    else
+      var=IP6TABLES_RESTORE_NOFLUSH tool=ip6tables fam=6
+    fi
+    {
+      printf '#!/bin/sh\n# Synthetic stand-in for the netfilter-persistent plugin %s (test fixture).\n' "$f"
+      if [[ $1 == ok ]]; then
+        # shellcheck disable=SC2016 # shell code of the plugin
+        printf 'noflush=""\n[ "${%s:-}" = yes ] && noflush=--noflush\n' "$var"
+      else
+        printf 'noflush=""\n'
+      fi
+      # shellcheck disable=SC2016 # shell code of the plugin
+      printf '[ "$1" = start ] && %s-restore $noflush < /etc/iptables/rules.v%s\nexit 0\n' "$tool" "$fam"
+    } >"$dir/$f"
+    chmod 755 "$dir/$f"
+  done
+}
+
 # hostinger_fixture ARTDIR: the rest of a Hostinger VPS (SC_HOSTINGER=1), see the
 # scenarios of the profile hostinger in main.
 # - sshd: root logs in with a password (PermitRootLogin yes in sshd_config and in
@@ -274,6 +305,9 @@ RULES
 # - SC_H_EXISTING=1: H_ADMIN exists already (bash, not in sudo), with ~/.ssh mode
 #   SC_H_SSH_MODE (default 755) and authorized_keys (content SC_H_OLDKEYS, "\n" separates
 #   lines; mode SC_H_KEYS_MODE, default 644); ARTDIR/h_keys0 keeps the file.
+# - SC_NFP=ok: the plugins of iptables-persistent are there (synthetic stand-ins that,
+#   like those of the package, read IPTABLES_RESTORE_NOFLUSH or IP6TABLES_RESTORE_NOFLUSH;
+#   the scenario lists iptables-persistent as installed in SC_DPKG).
 # - SC_SS=hostinger: ss lists sshd on 22, Hostinger's Traefik on 80 and 443 (host
 #   network), docker-proxy on 32768, systemd-resolved on loopback and the DHCP client;
 #   SC_SS=other: the same and a service on 0.0.0.0:8080.
@@ -339,6 +373,7 @@ EOF
     rm -f /etc/docker/daemon.json
   fi
 
+  h_nfp_plugins "${SC_NFP:-}"
   useradd --system --shell /usr/sbin/nologin "$H_SYSUSER"
   useradd --create-home --shell /usr/sbin/nologin "$H_NOLOGIN"
   groupadd "$H_GROUP"
@@ -4194,9 +4229,10 @@ t_h_key_fpr_shown() { # SCENARIO KEYFILE
 
 # Run 2 of SCENARIO: runs 1 and 2 exit 0, run 1 reports changes, run 2 reports 0 changes,
 # changes no file and no firewall rule and runs no modifying command (package updates
-# excepted).
+# excepted) apart from exactly one "systemctl reload ssh": the profile hostinger reloads
+# ssh on every run once its checks passed.
 t_h_rerun() { # SCENARIO
-  local ok=1 a d calls r
+  local ok=1 a d calls r n
   have_run "$1" 2 || return 1
   a=$(art "$1")
   for r in 1 2; do
@@ -4206,7 +4242,9 @@ t_h_rerun() { # SCENARIO
   grep -qE 'Änderungen in diesem Lauf: 0([^0-9]|$)' "$a/out2" || no "run 2 does not report 0 changes:" "$(grep 'Änderungen' "$a/out2")"
   d=$(diff "$a/snap1" "$a/snap2") || no "run 2 changed files:" "$d"
   d=$(diff "$a/fw1" "$a/fw2") || no "run 2 changed firewall rules:" "$d"
-  calls=$(modifying_calls "$a/log2" rerun)
+  n=$(grep -cxE 'systemctl reload ssh(\.service)?' "$a/log2")
+  ((n == 1)) || no "run 2: $n reloads of ssh, expected exactly 1 (the profile hostinger reloads ssh on every run)"
+  calls=$(modifying_calls "$a/log2" rerun | grep -vxE 'systemctl reload ssh(\.service)?')
   [[ -z $calls ]] || no "run 2 ran modifying commands:" "$calls"
   return $((1 - ok))
 }
@@ -4390,7 +4428,8 @@ hostinger_scenarios() {
   scenario h_existing_samekey "${HA[@]}" SC_H_EXISTING=1 SC_H_SSH_MODE=700 SC_H_KEYS_MODE=600 \
     "SC_H_OLDKEYS=$(awk '{ print $1, $2 }' <<<"$ed") same key, other comment\n"
   # Rules saved before (netfilter-persistent save: all tables)
-  scenario h_rules_old "${HA[@]}" SC_RUNS=2 SC_RULES_SAVED=1
+  scenario h_rules_old "${HA[@]}" SC_RUNS=2 SC_RULES_SAVED=1 SC_NFP=ok \
+    "SC_DPKG=$dpkg"$'\n'"iptables-persistent=install ok installed"
   # daemon.json from before
   scenario h_dj_merge "${HA[@]}" SC_RUNS=2 \
     'SC_DAEMON_JSON={\n  "dns": ["192.0.2.53"],\n  "log-driver": "json-file",\n  "log-opts": {"max-size": "50m"},\n  "features": {"buildkit": true}\n}'
