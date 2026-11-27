@@ -5190,18 +5190,26 @@ t_h_dropin_write_fail() { # SCENARIO
 }
 
 # "systemctl reload ssh" fails (fixture SC_RELOAD_FAIL=ssh) after all checks passed: exit
-# != 0; the drop-in on disk is the one the run wrote and checked (it has the console
-# exception), no message claims it was put back.
+# code 1; the drop-in on disk is the one the run wrote and checked (it has the console
+# exception), no message claims it was put back; the script's own abort message names the
+# drop-in, the command to go back to Hostinger's configuration ("rm FILE && systemctl
+# reload ssh"), "systemctl status ssh" to see the cause, and to keep the web console open.
 t_h_reload_fail() { # SCENARIO
-  local ok=1 a rc f
+  local ok=1 a rc f ab
   have_run "$1" 1 || return 1
   a=$(art "$1")
   rc=$(rc_of "$1" 1)
-  [[ $rc =~ ^[0-9]+$ && $rc -ne 0 ]] || no "expected exit code != 0, got: $rc"
+  [[ $rc == 1 ]] || no "expected exit code 1, got: $rc"
   grep -qxE 'systemctl reload ssh(\.service)?' "$a/log1" || no "fixture: ssh reload not attempted"
   f="$(upper "$1" etc)${SSHD_DROPIN#/etc}"
   grep -qx "Match User root Address $H_CONSOLE" "$f" 2>/dev/null || no "$SSHD_DROPIN is not the checked drop-in of this run:" "$(cat "$f" 2>/dev/null)"
   ! grep -qE 'zurückgesetzt' "$a/err1" || no "a message claims the drop-in was put back:" "$(grep 'zurückgesetzt' "$a/err1")"
+  ab=$(sed -n '/^Abbruch/,$p' "$a/err1")
+  [[ -n $ab ]] || no "no abort message of the script (only: $(tail -2 "$a/err1"))"
+  grep -qF -- "$SSHD_DROPIN" <<<"$(head -n 1 <<<"$ab")" || no "the abort message does not name $SSHD_DROPIN:" "$ab"
+  grep -qF -- "rm $SSHD_DROPIN && systemctl reload ssh" <<<"$ab" || no "the abort message lacks the rollback command 'rm $SSHD_DROPIN && systemctl reload ssh':" "$ab"
+  grep -qF -- 'systemctl status ssh' <<<"$ab" || no "the abort message does not point to systemctl status ssh:" "$ab"
+  grep -qE -- 'Web-Konsole offen' <<<"$ab" || no "the abort message does not say to keep the web console open:" "$ab"
   return $((1 - ok))
 }
 
@@ -5892,7 +5900,7 @@ hostinger_checks() {
   check "hostinger journal: only the web console logged in: no warning" t_h_journal_quiet h_journal_console
   check "hostinger: writing the drop-in fails: the exit handler puts the previous one back and says so, no reload, no sshd -t" \
     t_h_dropin_write_fail h_dropin_busy
-  check "hostinger: systemctl reload ssh fails after the checks: exit != 0, the checked drop-in stays, no claim it was reset" \
+  check "hostinger: systemctl reload ssh fails after the checks: exit 1, the checked drop-in stays, message names it, the rollback command, systemctl status ssh and the web console" \
     t_h_reload_fail h_reload_fail
   check "hostinger: signal during systemctl reload ssh: exit 130, message names the drop-in and the reload, the checked drop-in stays" \
     t_h_reload_signal h_reload_signal
