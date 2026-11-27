@@ -310,6 +310,17 @@ describe('release condition: only push or manual start on main, never Dependabot
   });
 });
 
+describe('release condition with branch names that differ from main only in case', () => {
+  // GitHub compares strings ignoring case (docs: Actions -> Expressions, "GitHub ignores case
+  // when comparing strings"), so github.ref == 'refs/heads/main' also holds for a branch
+  // named "Main". A manual start runs on any branch, so such a branch must not release.
+  it.each(['refs/heads/Main', 'refs/heads/MAIN'])('manual start on %s does not release', (ref) => {
+    const scenario = { ...BASE, event: 'workflow_dispatch', ref };
+    expect(releaseEnv(scenario)).toBe('false');
+    expect(publishRuns(scenario)).toBe(false);
+  });
+});
+
 describe('RELEASE and the condition of the publish job stay equivalent', () => {
   const variants: Scenario[] = [
     { ...BASE, actor: 'Dependabot[bot]' },
