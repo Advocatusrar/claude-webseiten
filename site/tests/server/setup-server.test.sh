@@ -69,6 +69,10 @@ H_CONSOLE=169.254.0.1
 H_PUBLIC=198.51.100.7
 # The fail2ban addresses that are never banned in the profile hostinger, exactly these.
 H_IGNOREIP='127.0.0.1/8 ::1 169.254.0.1'
+# SHA-512 crypt hash of a synthetic password ("synthetic-test-password-only", made with
+# openssl passwd -6); only ever set inside the sandbox (passwd stub, fixtures).
+# shellcheck disable=SC2016 # a crypt hash, nothing to expand
+H_PW_HASH='$6$setupservertest$5J.CGOtIy8l2kv7qPYYnmc3puNItuTEJuFdbtn0NMen02GS/EBVpGFcU4hmVCGvp0e0TjBQq7E8r6aWsqXmyi1'
 
 # ===========================================================================
 # Inside the sandbox (called as: unshare -m -n ... bash THIS __inner ARTDIR)
@@ -290,23 +294,42 @@ hostinger_fixture() {
   rm -f /usr/bin/docker
   cat >/usr/bin/docker <<'EOF'
 #!/bin/bash
-# docker (test stub): logs its calls, never talks to a daemon.
+# docker (test stub): logs its calls, never talks to a daemon. "docker info --format F":
+#   {{.LiveRestoreEnabled}}  STUB_STATE/docker_lr if there is one, else what daemon.json
+#                            says (as after "systemctl reload docker")
+#   {{.Swarm.LocalNodeState}}  STUB_STATE/docker_swarm, default inactive
+#   {{.DockerRootDir}}       /srv/docker-test (fixture, not the host's /var/lib/docker)
 { printf 'docker'; printf ' %s' "$@"; printf '\n'; } >>"${STUB_LOG:-/dev/null}"
-case ${1:-} in
-  --version) echo "Docker version 27.0.0-test, build test" ;;
-  info)
-    python3 -I -c 'import json
+state=${STUB_STATE:-/nonexistent}
+case "${1:-} ${2:-}" in
+  "--version "*) echo "Docker version 27.0.0-test, build test" ;;
+  "info --format")
+    case ${3:-} in
+      *LiveRestoreEnabled*)
+        if [[ -f $state/docker_lr ]]; then
+          cat "$state/docker_lr"
+        else
+          python3 -I -c 'import json
 try:
     v = json.load(open("/etc/docker/daemon.json")).get("live-restore") is True
 except (OSError, ValueError, AttributeError):
     v = False
 print("true" if v else "false")'
+        fi
+        ;;
+      *Swarm.LocalNodeState*) if [[ -f $state/docker_swarm ]]; then cat "$state/docker_swarm"; else echo inactive; fi ;;
+      *DockerRootDir*) echo /srv/docker-test ;;
+      *) echo "docker (test stub): unexpected format: ${3:-}" >&2; exit 99 ;;
+    esac
     ;;
   *) echo "docker (test stub): unexpected call: $*" >&2; exit 99 ;;
 esac
 EOF
   chmod 755 /usr/bin/docker
   touch "$art/state/enabled.docker" "$art/state/active.docker"
+  # Docker's root directory with the containers' files (read by the script for the
+  # restart policies); empty unless a scenario adds containers.
+  install -d -m 710 /srv/docker-test/containers
   if [[ -n ${SC_DAEMON_JSON:-} ]]; then
     mkdir -p /etc/docker
     printf '%b\n' "$SC_DAEMON_JSON" >/etc/docker/daemon.json
@@ -749,6 +772,7 @@ run_setup() {
     STUB_UFW="${SC_UFW:-inactive}"
     STUB_APT_FW="${SC_APT_FW:-}"
     STUB_APT_SSHD_MATCH="${SC_APT_SSHD_MATCH:-}"
+    STUB_PASSWD="${SC_PASSWD:-fail}"
   )
   if [[ -n ${SC_DRY_RUN+x} ]]; then envs+=(DRY_RUN="$SC_DRY_RUN"); fi
   if [[ -n ${SC_ADMIN_USER+x} ]]; then envs+=(ADMIN_USER="$SC_ADMIN_USER"); fi
@@ -774,7 +798,15 @@ run_setup() {
       exit 99
     fi
     echo "$got" >"$art/loginuid$n"
-    exec "${pre[@]}" env -i "${envs[@]}" bash "$art/setup-server.sh"
+    # Terminal: by default none (stdin /dev/null, as when started by a service or with
+    # input from a file). SC_TTY=1: stdin is a terminal (script(1) gives the run a pty,
+    # stdout and stderr still go to the files), as in the web console of the hPanel.
+    if [[ ${SC_TTY:-0} == 1 ]]; then
+      cmd="$(printf '%q ' "${pre[@]}" env -i "${envs[@]}" bash "$art/setup-server.sh")"
+      cmd+=" >$(printf '%q' "$art/out$n") 2>$(printf '%q' "$art/err$n")"
+      exec env SHELL=/bin/bash script -qec "$cmd" /dev/null </dev/null >/dev/null 2>"$art/script_err$n"
+    fi
+    exec "${pre[@]}" env -i "${envs[@]}" bash "$art/setup-server.sh" </dev/null
   ) >"$art/out$n" 2>"$art/err$n" || rc=$?
   if [[ -f $art/loginuid$n ]]; then echo "$rc" >"$art/rc$n"; fi
 }
@@ -1318,6 +1350,29 @@ fi
 exec "$real" "$@"
 EOF
   } >"$dir/iptables"
+  # passwd: "passwd USER" (set a password; the script asks only on a terminal) stands for
+  # the operator typing one: STUB_PASSWD=set gives USER the synthetic password (H_PW_HASH),
+  # anything else fails like passwd after Ctrl-D. Everything else (passwd -S) is the real
+  # passwd.
+  {
+    printf '#!/bin/bash\n%s\n' "$log"
+    printf 'hash=%q\n' "$H_PW_HASH"
+    cat <<'EOF'
+if [[ $# -eq 1 && $1 != -* ]]; then
+  if [[ ${STUB_PASSWD:-fail} == set ]]; then exec /usr/sbin/usermod -p "$hash" -- "$1"; fi
+  echo "passwd: Authentication token manipulation error (test stub)" >&2
+  exit 10
+fi
+exec /usr/bin/passwd "$@"
+EOF
+  } >"$dir/passwd"
+  # journalctl: STUB_STATE/journal if there is one (never the host's journal).
+  cat >"$dir/journalctl" <<EOF
+#!/bin/bash
+$log
+if [[ -f \${STUB_STATE:-/nonexistent}/journal ]]; then cat "\$STUB_STATE/journal"; fi
+exit 0
+EOF
   cat >"$dir/fail2ban-client" <<EOF
 #!/bin/bash
 $log
@@ -1453,6 +1508,8 @@ modifying_calls() { # LOGFILE MODE
       else if (c == "fail2ban-client" && ($2 == "-t" || $2 == "-d")) ro = 1
       else if (c == "docker" && ($2 == "--version" || $2 == "info")) ro = 1
       else if (c == "dockerd" && ($2 == "--help" || $2 == "--validate")) ro = 1
+      else if (c == "passwd" && $2 == "-S") ro = 1
+      else if (c == "journalctl") ro = 1
       else if (mode == "rerun" && (c == "apt-get" || c == "debconf-set-selections")) ro = 1
       if (!ro) print }' "$1"
 }
@@ -3630,16 +3687,16 @@ h_key_count() { # FILE KEY
 # h_rule_class FAMILY LINE: class of one line of "iptables -S INPUT" (FAMILY v4) or
 # "ip6tables -S INPUT" (v6) in the profile hostinger: lo, est (RELATED,ESTABLISHED), icmp
 # (all of ICMP or ICMPv6), dhcp (DHCP client: udp 67 -> 68; IPv6 udp 547 -> 546 from a
-# link-local address), tcp22, tcp80, tcp443 (new connections from anywhere, on any
-# interface), reject (unconditional REJECT), f2b (jump into a chain of fail2ban), other.
-# Nothing for a line that is no rule.
+# link-local address), tcpN and udpN (connections to port N from anywhere, on any
+# interface; tcp22 and the like, and the ports of docker-proxy), reject (unconditional
+# REJECT), f2b (jump into a chain of fail2ban), other. Nothing for a line that is no rule.
 h_rule_class() { # FAMILY LINE
   local fam=$1 l=$2
   local re_est='^-A INPUT -m (state|conntrack) --(state|ctstate) (RELATED,ESTABLISHED|ESTABLISHED,RELATED) -j ACCEPT$'
   local re_icmp6='^-A INPUT -p (ipv6-icmp|icmpv6) -j ACCEPT$'
   local re_dhcp4='^-A INPUT( .*)? -p udp (.* )?--sport 67 (.* )?--dport 68 -j ACCEPT$'
   local re_dhcp6='^-A INPUT -s fe80::/10( .*)? -p udp (.* )?--sport 547 (.* )?--dport 546 -j ACCEPT$'
-  local re_tcp='^-A INPUT -p tcp (.* )?--dport (22|80|443) -j ACCEPT$'
+  local re_port='^-A INPUT -p (tcp|udp) (.* )?--dport ([0-9]+) -j ACCEPT$'
   local re_reject='^-A INPUT( -m comment --comment [^ ]+)? -j REJECT( --reject-with [^ ]+)?$'
   [[ $l == "-A INPUT "* ]] || return 0
   if [[ $l == "-A INPUT -i lo -j ACCEPT" ]]; then
@@ -3650,8 +3707,8 @@ h_rule_class() { # FAMILY LINE
     echo icmp
   elif [[ $fam == v4 && $l =~ $re_dhcp4 && $l != *" -i "* ]] || [[ $fam == v6 && $l =~ $re_dhcp6 ]]; then
     echo dhcp
-  elif [[ $l =~ $re_tcp && $l != *" -s "* && $l != *" -i "* ]]; then
-    echo "tcp${BASH_REMATCH[2]}"
+  elif [[ $l =~ $re_port && $l != *" -s "* && $l != *" -i "* && $l != *"--sport"* ]]; then
+    echo "${BASH_REMATCH[1]}${BASH_REMATCH[3]}"
   elif [[ $l =~ $re_reject ]]; then
     echo reject
   elif [[ $l == *" -j f2b-"* ]]; then
@@ -3663,12 +3720,13 @@ h_rule_class() { # FAMILY LINE
 
 # INPUT of FAMILY (v4, v6) after run RUN of SCENARIO; before run 1 it was open and empty
 # (policy ACCEPT, no rule). Afterwards: policy still ACCEPT, the rules lo, est, icmp,
-# dhcp, tcp22, tcp80, tcp443 (h_rule_class) in this order, each exactly once, and an
+# dhcp, tcp22, tcp80, tcp443 and tcp32768 (the port docker-proxy listens on in the
+# fixture, SC_SS=hostinger) (h_rule_class) in this order, each exactly once, and an
 # unconditional REJECT as the very last rule; nothing else (no "-i docker0 -j ACCEPT" or
 # the like). With "f2b" a jump into fail2ban's chain at the top is expected as well (put
 # there between the runs). Run RUN exited with 0.
 t_h_fw_input() { # SCENARIO FAMILY RUN [f2b]
-  local ok=1 a f l classes want="lo est icmp dhcp tcp22 tcp80 tcp443 reject"
+  local ok=1 a f l classes want="lo est icmp dhcp tcp22 tcp80 tcp443 tcp32768 reject"
   have_run "$1" "$3" || return 1
   a=$(art "$1")
   f="$a/$2_0"
@@ -4298,9 +4356,11 @@ prepare_keys() {
 # Scenarios of the profile hostinger (PROFIL=hostinger), and the profile oracle next to
 # it. H: a Hostinger VPS (hostinger_fixture, hostinger_v4/v6: Docker installed and
 # running with docker-ce from Docker's repository, ufw installed and inactive, INPUT open,
-# Docker's chains and a DNAT for 32768, root with password), run as root from the web
-# console or an SSH login as root (audit login UID 0, no SUDO_USER); nobody else has a
-# key. HA: the same with ADMIN_USER=H_ADMIN and ADMIN_PUBKEY=the ed25519 key.
+# Docker's chains and a DNAT for 32768, docker-proxy listening on 32768, root with
+# password), run as root in the web console (audit login UID 0, no SUDO_USER, a terminal:
+# SC_TTY=1), where the operator types a password for ADMIN_USER when the script asks for
+# one (SC_PASSWD=set); nobody else has a key. HA: the same with ADMIN_USER=H_ADMIN and
+# ADMIN_PUBKEY=the ed25519 key.
 hostinger_scenarios() {
   local k=$WORK/sshkeys ed other dpkg b64
   local -a H HA
@@ -4308,7 +4368,7 @@ hostinger_scenarios() {
   other=$(<"$k/other.pub")
   dpkg=$(printf '%s\n' 'docker-ce=install ok installed' 'docker-ce-cli=install ok installed' \
     'containerd.io=install ok installed' 'docker-compose-plugin=install ok installed' 'ufw=install ok installed')
-  H=(SC_PROFIL=hostinger SC_HOSTINGER=1 SC_LOGINUID=0 SC_KEY=none SC_HIDE_DOCKER=0
+  H=(SC_PROFIL=hostinger SC_HOSTINGER=1 SC_LOGINUID=0 SC_KEY=none SC_HIDE_DOCKER=0 SC_TTY=1 SC_PASSWD=set
     SC_FW=hostinger SC_V6=hostinger "SC_DPKG=$dpkg" SC_SS=hostinger)
   HA=("${H[@]}" "SC_ADMIN_USER=$H_ADMIN" "SC_ADMIN_PUBKEY=$ed")
   # PROFIL
@@ -4412,9 +4472,9 @@ hostinger_checks() {
     t_h_sshd h_fresh
   check "hostinger: fail2ban values as in profile oracle (fail2ban-client -d)" t_f2b_effective h_fresh 2
   check "hostinger: fail2ban ignoreip exactly $H_IGNOREIP" t_h_f2b_ignoreip h_fresh
-  check "hostinger firewall IPv4 on empty INPUT: lo, RELATED/ESTABLISHED, ICMP, DHCP client, tcp 22/80/443 in this order, REJECT last, policy ACCEPT" \
+  check "hostinger firewall IPv4 on empty INPUT: lo, RELATED/ESTABLISHED, ICMP, DHCP client, tcp 22/80/443, docker-proxy port 32768 in this order, REJECT last, policy ACCEPT" \
     t_h_fw_input h_fresh v4 1
-  check "hostinger firewall IPv6 on empty INPUT: lo, RELATED/ESTABLISHED, ICMPv6, DHCPv6 client (link-local), tcp 22/80/443 in this order, REJECT last, policy ACCEPT" \
+  check "hostinger firewall IPv6 on empty INPUT: lo, RELATED/ESTABLISHED, ICMPv6, DHCPv6 client (link-local), tcp 22/80/443, docker-proxy port 32768 in this order, REJECT last, policy ACCEPT" \
     t_h_fw_input h_fresh v6 1
   check "hostinger firewall IPv4 after run 2: no duplicates, same order" t_h_fw_input h_fresh v4 2
   check "hostinger firewall IPv6 after run 2: no duplicates, same order" t_h_fw_input h_fresh v6 2
