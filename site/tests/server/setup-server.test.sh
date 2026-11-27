@@ -28,7 +28,9 @@
 #   hostinger_v4/v6 build a Hostinger VPS (Docker running, docker is a stub that never
 #   talks to a daemon, dockerd only answers --help and --validate; INPUT open, Docker's
 #   chains and a DNAT for 32768; root with password). ADMIN_PUBKEY gets throwaway keys made
-#   with ssh-keygen for this run (prepare_ssh_keys).
+#   with ssh-keygen for this run (prepare_ssh_keys). Runs have no terminal (stdin
+#   /dev/null) unless SC_TTY=1, which gives them a pty with script(1); passwd, apt-mark,
+#   journalctl and systemctl show are stubs, iptables-persistent's plugins synthetic.
 # Nothing on the host changes; the temporary directory is removed at the end.
 #
 # Usage (as root): bash site/tests/server/setup-server.test.sh
@@ -71,6 +73,10 @@ H_PUBLIC=198.51.100.7
 H_IGNOREIP='127.0.0.1/8 ::1 169.254.0.1'
 # SHA-512 crypt hash of a synthetic password ("synthetic-test-password-only", made with
 # openssl passwd -6); only ever set inside the sandbox (passwd stub, fixtures).
+# Versions of Docker's packages in the fixture of the profile hostinger (dpkg-query stub).
+H_V_DOCKER='5:27.3.1-1~ubuntu.24.04~noble'
+H_V_CONTAINERD='1.7.22-1'
+H_V_COMPOSE='2.29.7-1~ubuntu.24.04~noble'
 # shellcheck disable=SC2016 # a crypt hash, nothing to expand
 H_PW_HASH='$6$setupservertest$5J.CGOtIy8l2kv7qPYYnmc3puNItuTEJuFdbtn0NMen02GS/EBVpGFcU4hmVCGvp0e0TjBQq7E8r6aWsqXmyi1'
 
@@ -261,6 +267,35 @@ COMMIT
 RULES
 }
 
+# h_closed_input TOOL: INPUT as the profile hostinger leaves it (rules for loopback,
+# replies, ICMP, DHCP client, tcp 22/80/443, final REJECT), plus an own rule of the
+# operator before the REJECT (tcp 5432 from a Docker bridge), as after adding one by hand.
+h_closed_input() { # TOOL
+  local tool=$1 rule
+  local -a r
+  while IFS= read -r rule; do
+    read -r -a r <<<"$rule"
+    "$tool" -A INPUT "${r[@]}"
+  done < <(
+    echo "-i lo -j ACCEPT"
+    echo "-m state --state RELATED,ESTABLISHED -j ACCEPT"
+    if [[ $tool == iptables ]]; then
+      echo "-p icmp -j ACCEPT"
+      echo "-p udp -m udp --sport 67 --dport 68 -j ACCEPT"
+    else
+      echo "-p ipv6-icmp -j ACCEPT"
+      echo "-s fe80::/10 -d fe80::/10 -p udp -m udp --sport 547 --dport 546 -j ACCEPT"
+    fi
+    for p in 22 80 443; do echo "-p tcp -m state --state NEW -m tcp --dport $p -j ACCEPT"; done
+    echo "-i br-test -p tcp -m tcp --dport 5432 -j ACCEPT"
+    if [[ $tool == iptables ]]; then
+      echo "-j REJECT --reject-with icmp-port-unreachable"
+    else
+      echo "-j REJECT --reject-with icmp6-port-unreachable"
+    fi
+  )
+}
+
 # h_nfp_plugins ok|noflag|"": the plugins 15-ip4tables and 25-ip6tables of
 # netfilter-persistent in /usr/share/netfilter-persistent/plugins.d as synthetic
 # stand-ins (not copies of the package): "ok" reads IPTABLES_RESTORE_NOFLUSH or
@@ -308,9 +343,22 @@ h_nfp_plugins() { # ok|noflag|""
 # - SC_NFP=ok: the plugins of iptables-persistent are there (synthetic stand-ins that,
 #   like those of the package, read IPTABLES_RESTORE_NOFLUSH or IP6TABLES_RESTORE_NOFLUSH;
 #   the scenario lists iptables-persistent as installed in SC_DPKG).
-# - SC_SS=hostinger: ss lists sshd on 22, Hostinger's Traefik on 80 and 443 (host
-#   network), docker-proxy on 32768, systemd-resolved on loopback and the DHCP client;
-#   SC_SS=other: the same and a service on 0.0.0.0:8080.
+# - SC_SS=hostinger: ss lists sshd on 22 (SC_SS_SSHD_PORT), Hostinger's Traefik on 80 and
+#   443 (host network), docker-proxy on 32768, systemd-resolved on loopback and the DHCP
+#   client; SC_SS=other: the same and a service on 0.0.0.0:8080; SC_SS=multi: the same and
+#   docker-proxy on tcp 8443 and udp 51820 (all addresses), on 203.0.113.20:8081 and
+#   [2001:db8::20]:8082 (one address each), on 127.0.0.1:5000 and another service on
+#   0.0.0.0:9000; SC_SS_EXTRA: one more tcp line as ss prints it.
+#   SC_SS=none (or unset): ss lists nothing.
+# - SC_H_PW=1 (with SC_H_EXISTING): H_ADMIN has a password already (H_PW_HASH).
+# - SC_SWARM, SC_DOCKER_LR: what docker info says for Swarm.LocalNodeState and
+#   LiveRestoreEnabled (default inactive, and live-restore as daemon.json has it).
+# - SC_CONTAINERS=1: Docker's root directory holds two running containers, traefik
+#   (restart policy unless-stopped) and webapp (no restart policy).
+# - SC_SSH_SOCKET: what "systemctl show ssh.socket -p Listen --value" prints.
+# - SC_NEEDRESTART=1: needrestart is configured (/etc/needrestart with conf.d).
+# - SC_APT_PREFS: content of /etc/apt/preferences ("\n" separates lines).
+# - SC_NFP_DEFAULT: content of /etc/default/netfilter-persistent ("\n" separates lines).
 hostinger_fixture() {
   local art=$1
   printf '%s\n' '# Hostinger image (test fixture)' 'PermitRootLogin yes' 'PasswordAuthentication yes' \
@@ -364,6 +412,30 @@ EOF
   # Docker's root directory with the containers' files (read by the script for the
   # restart policies); empty unless a scenario adds containers.
   install -d -m 710 /srv/docker-test/containers
+  if [[ ${SC_CONTAINERS:-0} == 1 ]]; then
+    install -d /srv/docker-test/containers/aaa111 /srv/docker-test/containers/bbb222
+    printf '%s\n' '{"Name": "/traefik", "State": {"Running": true}}' >/srv/docker-test/containers/aaa111/config.v2.json
+    printf '%s\n' '{"RestartPolicy": {"Name": "unless-stopped"}}' >/srv/docker-test/containers/aaa111/hostconfig.json
+    printf '%s\n' '{"Name": "/webapp", "State": {"Running": true}}' >/srv/docker-test/containers/bbb222/config.v2.json
+    printf '%s\n' '{"RestartPolicy": {"Name": "no"}}' >/srv/docker-test/containers/bbb222/hostconfig.json
+  fi
+  if [[ -n ${SC_SWARM:-} ]]; then echo "$SC_SWARM" >"$art/state/docker_swarm"; fi
+  if [[ -n ${SC_DOCKER_LR:-} ]]; then echo "$SC_DOCKER_LR" >"$art/state/docker_lr"; fi
+  if [[ -n ${SC_SSH_SOCKET:-} ]]; then printf '%s\n' "$SC_SSH_SOCKET" >"$art/state/ssh_socket_listen"; fi
+  if [[ ${SC_NEEDRESTART:-0} == 1 ]]; then
+    install -d /etc/needrestart/conf.d
+    printf '%s\n' '# needrestart.conf (test fixture)' "\$nrconf{restart} = 'i';" >/etc/needrestart/needrestart.conf
+  else
+    rm -rf /etc/needrestart
+  fi
+  if [[ -n ${SC_NFP_DEFAULT:-} ]]; then
+    printf '%b\n' "$SC_NFP_DEFAULT" >/etc/default/netfilter-persistent
+  fi
+  if [[ -n ${SC_APT_PREFS:-} ]]; then
+    printf '%b\n' "$SC_APT_PREFS" >/etc/apt/preferences
+    chmod 644 /etc/apt/preferences
+  fi
+  chmod -R a+rX "$art/state"
   if [[ -n ${SC_DAEMON_JSON:-} ]]; then
     mkdir -p /etc/docker
     printf '%b\n' "$SC_DAEMON_JSON" >/etc/docker/daemon.json
@@ -379,6 +451,7 @@ EOF
   groupadd "$H_GROUP"
   if [[ ${SC_H_EXISTING:-0} == 1 ]]; then
     useradd --create-home --shell /bin/bash "$H_ADMIN"
+    if [[ ${SC_H_PW:-0} == 1 ]]; then usermod -p "$H_PW_HASH" "$H_ADMIN"; fi
     install -d -o "$H_ADMIN" -g "$H_ADMIN" -m "${SC_H_SSH_MODE:-755}" "/home/$H_ADMIN/.ssh"
     printf '%b' "${SC_H_OLDKEYS:-}" >"/home/$H_ADMIN/.ssh/authorized_keys"
     chown "$H_ADMIN:$H_ADMIN" "/home/$H_ADMIN/.ssh/authorized_keys"
@@ -386,12 +459,13 @@ EOF
     cp -p "/home/$H_ADMIN/.ssh/authorized_keys" "$art/h_keys0"
   fi
 
+  local sp=${SC_SS_SSHD_PORT:-22}
   case ${SC_SS:-} in
-    "") ;;
-    hostinger | other)
+    "" | none) ;;
+    hostinger | other | multi)
       printf '%s\n' \
-        'LISTEN 0 4096 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=801,fd=3))' \
-        'LISTEN 0 4096 [::]:22 [::]:* users:(("sshd",pid=801,fd=4))' \
+        "LISTEN 0 4096 0.0.0.0:$sp 0.0.0.0:* users:((\"sshd\",pid=801,fd=3))" \
+        "LISTEN 0 4096 [::]:$sp [::]:* users:((\"sshd\",pid=801,fd=4))" \
         'LISTEN 0 4096 0.0.0.0:80 0.0.0.0:* users:(("traefik",pid=1201,fd=7))' \
         'LISTEN 0 4096 [::]:80 [::]:* users:(("traefik",pid=1201,fd=8))' \
         'LISTEN 0 4096 0.0.0.0:443 0.0.0.0:* users:(("traefik",pid=1201,fd=9))' \
@@ -403,10 +477,22 @@ EOF
       if [[ $SC_SS == other ]]; then
         echo 'LISTEN 0 128 0.0.0.0:8080 0.0.0.0:* users:(("python3",pid=1500,fd=3))' >>"$art/state/ss_tcp"
       fi
+      if [[ $SC_SS == multi ]]; then
+        printf '%s\n' \
+          'LISTEN 0 4096 0.0.0.0:8443 0.0.0.0:* users:(("docker-proxy",pid=1310,fd=4))' \
+          'LISTEN 0 4096 127.0.0.1:5000 0.0.0.0:* users:(("docker-proxy",pid=1320,fd=4))' \
+          'LISTEN 0 4096 203.0.113.20:8081 0.0.0.0:* users:(("docker-proxy",pid=1340,fd=4))' \
+          'LISTEN 0 4096 [2001:db8::20]:8082 [::]:* users:(("docker-proxy",pid=1350,fd=4))' \
+          'LISTEN 0 128 0.0.0.0:9000 0.0.0.0:* users:(("node",pid=1600,fd=20))' >>"$art/state/ss_tcp"
+      fi
+      if [[ -n ${SC_SS_EXTRA:-} ]]; then printf '%s\n' "$SC_SS_EXTRA" >>"$art/state/ss_tcp"; fi
       printf '%s\n' \
         'UNCONN 0 0 127.0.0.53%lo:53 0.0.0.0:* users:(("systemd-resolve",pid=501,fd=14))' \
         'UNCONN 0 0 203.0.113.20%eth0:68 0.0.0.0:* users:(("systemd-network",pid=480,fd=22))' \
         >"$art/state/ss_udp"
+      if [[ $SC_SS == multi ]]; then
+        echo 'UNCONN 0 0 0.0.0.0:51820 0.0.0.0:* users:(("docker-proxy",pid=1330,fd=4))' >>"$art/state/ss_udp"
+      fi
       chmod 644 "$art/state/ss_tcp" "$art/state/ss_udp"
       ;;
     *)
@@ -567,6 +653,11 @@ fixture() {
     # The final REJECT of the Oracle rules with a comment in front of the target.
     oracle_comment) oracle_v4 | sed -E 's/^-A INPUT -j REJECT/-A INPUT -m comment --comment final-reject -j REJECT/' | iptables-restore ;;
     hostinger) hostinger_v4 | iptables-restore ;;
+    hostinger_closed) hostinger_v4 | iptables-restore && h_closed_input iptables ;;
+    hostinger_condreject)
+      hostinger_v4 | iptables-restore
+      iptables -A INPUT -s 192.0.2.66/32 -j REJECT --reject-with icmp-port-unreachable
+      ;;
   esac
   case ${SC_V6:-reject} in
     reject) oracle_v6 | ip6tables-restore ;;
@@ -580,6 +671,11 @@ fixture() {
       ip6tables -A INPUT -p tcp -m state --state NEW -m tcp --dport 443 -j ACCEPT
       ;;
     hostinger) hostinger_v6 | ip6tables-restore ;;
+    hostinger_closed) hostinger_v6 | ip6tables-restore && h_closed_input ip6tables ;;
+    hostinger_condreject)
+      hostinger_v6 | ip6tables-restore
+      ip6tables -A INPUT -s 2001:db8::66/128 -j REJECT --reject-with icmp6-port-unreachable
+      ;;
   esac
   # NAT rules in both families (like Docker's masquerading): restoring the table filter
   # must leave them as they are. $art/nat_fixture records that they were set.
@@ -808,12 +904,16 @@ run_setup() {
     STUB_APT_FW="${SC_APT_FW:-}"
     STUB_APT_SSHD_MATCH="${SC_APT_SSHD_MATCH:-}"
     STUB_PASSWD="${SC_PASSWD:-fail}"
+    STUB_APT_RM_UFW="${SC_APT_RM_UFW:-}"
+    STUB_SSHD_SIGNAL="${SC_SSHD_SIGNAL:-}"
   )
   if [[ -n ${SC_DRY_RUN+x} ]]; then envs+=(DRY_RUN="$SC_DRY_RUN"); fi
   if [[ -n ${SC_ADMIN_USER+x} ]]; then envs+=(ADMIN_USER="$SC_ADMIN_USER"); fi
   if [[ -n ${SC_SUDO_USER+x} ]]; then envs+=(SUDO_USER="$SC_SUDO_USER"); fi
   if [[ -n ${SC_PROFIL+x} ]]; then envs+=(PROFIL="$SC_PROFIL"); fi
   if [[ -n ${SC_ADMIN_PUBKEY+x} ]]; then envs+=(ADMIN_PUBKEY="$SC_ADMIN_PUBKEY"); fi
+  if [[ -n ${SC_ONLY_SAVE+x} ]]; then envs+=(ONLY_SAVE_FIREWALL="$SC_ONLY_SAVE"); fi
+  if [[ -n ${SC_SSH_CONNECTION+x} ]]; then envs+=(SSH_CONNECTION="$SC_SSH_CONNECTION"); fi
   if [[ ${SC_AS:-root} == nobody ]]; then
     pre=(setpriv --reuid=nobody --regid=nogroup --clear-groups --)
   fi
@@ -877,7 +977,7 @@ post_checks() {
 # web console (sshdT_WHO_con); sshd -t; account, groups, ~/.ssh and authorized_keys of the
 # admin user; sudo -l for it; iptables-restore --test of the saved rules files.
 h_post_checks() {
-  local art=$1 who u rc h f
+  local art=$1 who u rc h f tool
   for who in admin root deploy; do
     if [[ $who == admin ]]; then u=${SC_ADMIN_USER:-$H_ADMIN}; else u=$who; fi
     /usr/sbin/sshd -T -C "user=$u,host=public.invalid,addr=$H_PUBLIC" >"$art/sshdT_${who}_pub" 2>&1 || true
@@ -906,6 +1006,32 @@ h_post_checks() {
       fi
       echo "rc=$rc" >>"$art/rules_test_$f"
     fi
+  done
+  # needrestart: the values the drop-in of the script gives override_rc, evaluated by perl
+  # (needrestart's configuration is perl); "SERVICE=VALUE" for some service names.
+  f=/etc/needrestart/conf.d/50-setup-server-docker.conf
+  if [[ -f $f ]]; then
+    perl -e 'our %nrconf; my $f = shift; do $f; die "error in $f: $@\n" if $@;
+      for my $svc (@ARGV) { my $v = "unset";
+        for my $re (keys %{ $nrconf{override_rc} || {} }) { if ($svc =~ $re) { $v = $nrconf{override_rc}{$re}; last } }
+        print "$svc=$v\n" }' "$f" docker.service containerd.service ssh.service fail2ban.service \
+      >"$art/nr_eval" 2>&1 || echo "rc=$?" >>"$art/nr_eval"
+  fi
+  # Loading the rules files the way netfilter-persistent does with the drop-in of the
+  # script (TOOL-restore --noflush), on the firewall as it is after the runs plus a
+  # foreign rule at the top of INPUT: afterwards INPUT must be exactly the file's rules,
+  # everything else (FORWARD, Docker's chains, nat) as before. Last of all post checks,
+  # because it changes the rules.
+  for tool in iptables ip6tables; do
+    if [[ $tool == iptables ]]; then f=/etc/iptables/rules.v4; else f=/etc/iptables/rules.v6; fi
+    [[ -f $f ]] || continue
+    "$tool" -I INPUT 1 -p tcp -m tcp --dport 6666 -j ACCEPT
+    save_family "$tool" >"$art/nf_${tool}_before"
+    rc=0
+    "$tool-restore" --noflush <"$f" >"$art/nf_${tool}_load" 2>&1 || rc=$?
+    echo "rc=$rc" >>"$art/nf_${tool}_load"
+    save_family "$tool" >"$art/nf_${tool}_after"
+    "$tool" -S INPUT >"$art/nf_${tool}_input"
   done
 }
 
@@ -1033,6 +1159,21 @@ inner() {
       snapshot "$art" >"$art/snap$i"
       dump_fw >"$art/fw$i"
     fi
+    sshd_state >"$art/sshd_state_r$i"
+    # Profile hostinger: the operator sets the password of the admin user (passwd as
+    # root) after run 1 stopped for want of one.
+    # ... or locks it (passwd -l), or removes the drop-in of netfilter-persistent.
+    if ((i == 1)) && [[ ${SC_H_LOCKPW_BETWEEN:-0}${SC_H_RMNFP_BETWEEN:-0} != 00 ]]; then
+      cp "$art/snap1" "$art/snap1_pre"
+      if [[ ${SC_H_LOCKPW_BETWEEN:-0} == 1 ]]; then usermod -L "$H_ADMIN"; fi
+      if [[ ${SC_H_RMNFP_BETWEEN:-0} == 1 ]]; then rm -f /etc/systemd/system/netfilter-persistent.service.d/10-noflush.conf; fi
+      snapshot "$art" >"$art/snap$i"
+    fi
+    if ((i == 1)) && [[ ${SC_H_SETPW_BETWEEN:-0} == 1 ]]; then
+      cp "$art/snap1" "$art/snap1_pre"
+      usermod -p "$H_PW_HASH" "$H_ADMIN"
+      snapshot "$art" >"$art/snap$i"
+    fi
     if ((i == 1)) && [[ ${SC_H_BETWEEN:-0} == 1 ]]; then
       h_between_runs
       snapshot "$art" >"$art/snap$i"
@@ -1082,8 +1223,13 @@ write_stubs() {
 #!/bin/bash
 $log
 # Installing docker-ce provides the docker command and, like the real package, the
-# group docker (inside the sandbox).
+# group docker (inside the sandbox). A preferences file given with
+# "-o Dir::Etc::Preferences=FILE" is appended to STUB_STATE/apt-prefs.RUN, after a line
+# "== apt-get ARGS" (the file of the script lives only as long as its run).
 for a in "\$@"; do
+  if [[ \$a == Dir::Etc::Preferences=* && -n \${STUB_STATE:-} ]]; then
+    { printf '== apt-get'; printf ' %s' "\$@"; printf '\n'; cat -- "\${a#*=}" 2>&1; } >>"\$STUB_STATE/apt-prefs.\${STUB_RUN:-0}"
+  fi
   if [[ \$a == docker-ce ]]; then
     printf '#!/bin/sh\necho "Docker version 0.0.0-test"\n' >/usr/bin/docker
     chmod 755 /usr/bin/docker
@@ -1101,6 +1247,14 @@ done
 #                         meanwhile)
 #   unreadable_v4         from now on the iptables stub fails to read rules (-S, -L,
 #                         -C), as if iptables were broken after the package update
+#   forward_v4            the policy of FORWARD set to ACCEPT (Docker had DROP)
+#   docker_v6             the rule of Docker's chain DOCKER-USER deleted (IPv6)
+#   fwjump_v6             the jump from FORWARD into DOCKER-USER deleted (IPv6)
+#   container_v4          a rule for a new container added to the chain DOCKER, as Docker
+#                         does when a container starts
+# STUB_APT_RM_UFW=1: the same apt run removes ufw (dpkg-query then no longer finds it,
+# STUB_STATE/dpkg_removed), as the real apt does because of "ufw: Breaks
+# iptables-persistent".
 # STUB_STATE/after_apt.v4 and .v6 then hold all tables of each family as they are right
 # after this change (without comments and counters).
 # STUB_APT_SSHD_MATCH: the same apt run (a package update) adds a Match block for ubuntu
@@ -1122,8 +1276,13 @@ case " \$* " in
           /usr/sbin/iptables -t nat -A POSTROUTING -s 172.18.0.0/16 ! -o br-test -j MASQUERADE
         ;;
       unreadable_v4) : >"\$STUB_STATE/ipt_unreadable" ;;
+      forward_v4) /usr/sbin/iptables -P FORWARD ACCEPT ;;
+      docker_v6) /usr/sbin/ip6tables -D DOCKER-USER -j RETURN ;;
+      fwjump_v6) /usr/sbin/ip6tables -D FORWARD -j DOCKER-USER ;;
+      container_v4) /usr/sbin/iptables -A DOCKER -d 172.17.0.3/32 ! -i docker0 -o docker0 -p tcp -m tcp --dport 8080 -j ACCEPT ;;
       *) echo "apt-get (test stub): unknown STUB_APT_FW '\$STUB_APT_FW'" >&2; exit 99 ;;
     esac
+    if [[ \${STUB_APT_RM_UFW:-} == 1 ]]; then echo ufw >>"\$STUB_STATE/dpkg_removed"; fi
     if [[ \${STUB_APT_RUNDIR:-} == file ]]; then
       rm -rf /run/sshd && : >/run/sshd && echo "rundir file" >>"\$STUB_STATE/apt_hooks"
     fi
@@ -1168,6 +1327,8 @@ for a in "\$@"; do
 done
 case \$verb in
   is-enabled) [[ -e \$STUB_STATE/enabled.\${units[0]} ]] ;;
+  # "show ssh.socket -p Listen --value": STUB_STATE/ssh_socket_listen (fixture SC_SSH_SOCKET).
+  show) if [[ \${units[0]} == ssh.socket && -f \$STUB_STATE/ssh_socket_listen ]]; then cat "\$STUB_STATE/ssh_socket_listen"; fi ;;
   is-active) [[ -e \$STUB_STATE/active.\${units[0]} ]] ;;
   enable) for u in "\${units[@]}"; do touch "\$STUB_STATE/enabled.\$u"; [[ \$now == 1 ]] && touch "\$STUB_STATE/active.\$u"; done; exit 0 ;;
   start|restart) for u in "\${units[@]}"; do touch "\$STUB_STATE/active.\$u"; done ;;
@@ -1215,9 +1376,10 @@ $log
 if [[ \${1:-} == --print-architecture ]]; then echo arm64; exit 0; fi
 exec /usr/bin/dpkg "\$@"
 EOF
-  # Package states from STUB_DPKG, lines "PACKAGE=STATUS" (for example
-  # "rsyslog=install ok installed"). Every other package is unknown, so no conflicting
-  # package (docker.io, podman-docker, ...) is installed.
+  # Package states from STUB_DPKG, lines "PACKAGE=STATUS" or "PACKAGE=STATUS|VERSION" (for
+  # example "rsyslog=install ok installed"; version default 0.0-test). Every other package
+  # is unknown, so no conflicting package (docker.io, podman-docker, ...) is installed;
+  # so is a package listed in STUB_STATE/dpkg_removed (removed by the apt-get stub).
   {
     printf '#!/bin/bash\n%s\n' "$log"
     cat <<'EOF'
@@ -1231,10 +1393,17 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
-status=""
+status="" version=0.0-test
 while IFS= read -r line; do
   if [[ -n $line && ${line%%=*} == "$pkg" ]]; then status=${line#*=}; fi
 done <<<"${STUB_DPKG:-}"
+if [[ $status == *"|"* ]]; then
+  version=${status#*|}
+  status=${status%%|*}
+fi
+if [[ -n $status && -f ${STUB_STATE:-/nonexistent}/dpkg_removed ]] && grep -qxF -- "$pkg" "$STUB_STATE/dpkg_removed"; then
+  status=""
+fi
 if [[ -z $status ]]; then
   echo "dpkg-query: no packages found matching $pkg" >&2
   exit 1
@@ -1245,9 +1414,10 @@ if [[ -n $fmt ]]; then
   out=${fmt//'${Status}'/$status}
   out=${out//'${db:Status-Want}'/$want}
   out=${out//'${db:Status-Status}'/$state}
+  out=${out//'${Version}'/$version}
   printf '%s' "${out//'${Package}'/$pkg}"
 else
-  printf '%s\t%s\n' "$pkg" "0.0-test"
+  printf '%s\t%s\n' "$pkg" "$version"
 fi
 EOF
   } >"$dir/dpkg-query"
@@ -1298,9 +1468,16 @@ case \${1:-} in
   *) echo "dockerd (test stub): refused: \$*" >&2; exit 99 ;;
 esac
 EOF
+  # STUB_SSHD_SIGNAL=SIG: at the first "sshd -t" of a run (the drop-in is written, ssh
+  # not reloaded yet) the script gets signal SIG, as if the web console tab were closed
+  # (HUP) or someone pressed Ctrl-C (INT) or killed it (TERM).
   cat >"$dir/sshd" <<EOF
 #!/bin/bash
 $log
+if [[ -n \${STUB_SSHD_SIGNAL:-} && \${1:-} == -t && -n \${STUB_STATE:-} && ! -e \$STUB_STATE/signal_sent ]]; then
+  : >"\$STUB_STATE/signal_sent"
+  kill -s "\$STUB_SSHD_SIGNAL" "\$PPID"
+fi
 if [[ \${SSHD_T_FAIL:-0} == 1 && \${1:-} == -t ]]; then
   echo "test stub: forced sshd -t failure" >&2
   exit 255
@@ -1316,7 +1493,8 @@ EOF
   done
   # Logged so that the tests see a restored (replaced) rule set. The input is appended to
   # STUB_STATE/NAME.in.RUN (RUN: number of the run), so that the tests can compare it
-  # with what the script saved before. STUB_RESTORE (both families):
+  # with what the script saved before; the input of a call with --test (loads nothing) to
+  # STUB_STATE/NAME.test.RUN instead. STUB_RESTORE (both families):
   #   fail  the restore fails (exit 1) and changes nothing
   #   noop  it reports success (exit 0) but changes nothing, so INPUT stays as it is
   for name in iptables-restore ip6tables-restore; do
@@ -1325,6 +1503,9 @@ EOF
 $log
 keep=/dev/null
 if [[ -n \${STUB_STATE:-} ]]; then keep="\$STUB_STATE/$name.in.\${STUB_RUN:-0}"; fi
+for a in "\$@"; do
+  if [[ \$a == --test || \$a == -t ]] && [[ -n \${STUB_STATE:-} ]]; then keep="\$STUB_STATE/$name.test.\${STUB_RUN:-0}"; fi
+done
 input=\$(cat; echo .)
 input=\${input%.}
 printf '%s' "\$input" >>"\$keep"
@@ -1337,8 +1518,10 @@ esac
 printf '%s' "\$input" | /usr/sbin/$name "\$@"
 EOF
   done
-  # Logged as well; the output is appended to STUB_STATE/NAME.out.RUN. STUB_IPT_SAVE
-  # (both families): "fail" fails (exit 1, no output), "empty" prints nothing (exit 0).
+  # Logged as well; the output of the first call of a run is kept in
+  # STUB_STATE/NAME.out.RUN (the copy taken before the packages; the profile hostinger
+  # saves again later for its rules files). STUB_IPT_SAVE (both families): "fail" fails
+  # (exit 1, no output), "empty" prints nothing (exit 0).
   for name in iptables-save ip6tables-save; do
     cat >"$dir/$name" <<EOF
 #!/bin/bash
@@ -1351,7 +1534,7 @@ case \${STUB_IPT_SAVE:-} in
 esac
 set -o pipefail
 keep=/dev/null
-if [[ -n \${STUB_STATE:-} ]]; then keep="\$STUB_STATE/$name.out.\${STUB_RUN:-0}"; fi
+if [[ -n \${STUB_STATE:-} && ! -e \$STUB_STATE/$name.out.\${STUB_RUN:-0} ]]; then keep="\$STUB_STATE/$name.out.\${STUB_RUN:-0}"; fi
 /usr/sbin/$name "\$@" | tee -a "\$keep"
 EOF
   done
@@ -1387,7 +1570,7 @@ EOF
   } >"$dir/iptables"
   # passwd: "passwd USER" (set a password; the script asks only on a terminal) stands for
   # the operator typing one: STUB_PASSWD=set gives USER the synthetic password (H_PW_HASH),
-  # anything else fails like passwd after Ctrl-D. Everything else (passwd -S) is the real
+  # signal-SIG sends SIG to the script, anything else fails like passwd after Ctrl-D. Everything else (passwd -S) is the real
   # passwd.
   {
     printf '#!/bin/bash\n%s\n' "$log"
@@ -1395,12 +1578,20 @@ EOF
     cat <<'EOF'
 if [[ $# -eq 1 && $1 != -* ]]; then
   if [[ ${STUB_PASSWD:-fail} == set ]]; then exec /usr/sbin/usermod -p "$hash" -- "$1"; fi
+  # signal-SIG: the script gets SIG while passwd asks (closed tab, Ctrl-C).
+  if [[ ${STUB_PASSWD:-} == signal-* ]]; then kill -s "${STUB_PASSWD#signal-}" "$PPID"; exit 1; fi
   echo "passwd: Authentication token manipulation error (test stub)" >&2
   exit 10
 fi
 exec /usr/bin/passwd "$@"
 EOF
   } >"$dir/passwd"
+  # apt-mark (pins or holds that would last): only logs its calls.
+  cat >"$dir/apt-mark" <<EOF
+#!/bin/bash
+$log
+exit 0
+EOF
   # journalctl: STUB_STATE/journal if there is one (never the host's journal).
   cat >"$dir/journalctl" <<EOF
 #!/bin/bash
@@ -3723,7 +3914,8 @@ h_key_count() { # FILE KEY
 # "ip6tables -S INPUT" (v6) in the profile hostinger: lo, est (RELATED,ESTABLISHED), icmp
 # (all of ICMP or ICMPv6), dhcp (DHCP client: udp 67 -> 68; IPv6 udp 547 -> 546 from a
 # link-local address), tcpN and udpN (connections to port N from anywhere, on any
-# interface; tcp22 and the like, and the ports of docker-proxy), reject (unconditional
+# interface; tcp22 and the like, and the ports of docker-proxy), tcpN@ADDRESS (the same,
+# only to ADDRESS: docker-proxy bound to one address), reject (unconditional
 # REJECT), f2b (jump into a chain of fail2ban), other. Nothing for a line that is no rule.
 h_rule_class() { # FAMILY LINE
   local fam=$1 l=$2
@@ -3732,6 +3924,7 @@ h_rule_class() { # FAMILY LINE
   local re_dhcp4='^-A INPUT( .*)? -p udp (.* )?--sport 67 (.* )?--dport 68 -j ACCEPT$'
   local re_dhcp6='^-A INPUT -s fe80::/10( .*)? -p udp (.* )?--sport 547 (.* )?--dport 546 -j ACCEPT$'
   local re_port='^-A INPUT -p (tcp|udp) (.* )?--dport ([0-9]+) -j ACCEPT$'
+  local re_dport='^-A INPUT -d ([^ ]+) -p (tcp|udp) (.* )?--dport ([0-9]+) -j ACCEPT$'
   local re_reject='^-A INPUT( -m comment --comment [^ ]+)? -j REJECT( --reject-with [^ ]+)?$'
   [[ $l == "-A INPUT "* ]] || return 0
   if [[ $l == "-A INPUT -i lo -j ACCEPT" ]]; then
@@ -3744,6 +3937,8 @@ h_rule_class() { # FAMILY LINE
     echo dhcp
   elif [[ $l =~ $re_port && $l != *" -s "* && $l != *" -i "* && $l != *"--sport"* ]]; then
     echo "${BASH_REMATCH[1]}${BASH_REMATCH[3]}"
+  elif [[ $l =~ $re_dport && $l != *" -s "* && $l != *" -i "* && $l != *"--sport"* ]]; then
+    echo "${BASH_REMATCH[2]}${BASH_REMATCH[4]}@${BASH_REMATCH[1]}"
   elif [[ $l =~ $re_reject ]]; then
     echo reject
   elif [[ $l == *" -j f2b-"* ]]; then
@@ -4320,6 +4515,582 @@ t_oracle_pubkey_ignored() { # SCENARIO KEYFILE
   return $((1 - ok))
 }
 
+# --- tests: profile hostinger, review fixes (commit 0f864a5) -------------------------
+
+# INPUT of FAMILY after run RUN of SCENARIO has exactly the rule classes WANT
+# (h_rule_class, separated by blanks, in this order); run RUN exited with 0.
+t_h_fw_classes() { # SCENARIO FAMILY RUN WANT
+  local ok=1 a f l classes
+  have_run "$1" "$3" || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" "$3") == 0 ]] || no "run $3: expected exit code 0, got: $(rc_of "$1" "$3")" "$(grep '^Abbruch' "$a/err$3")"
+  f="$a/$2_$3"
+  classes=$(while IFS= read -r l; do h_rule_class "$2" "$l"; done <"$f" | tr '\n' ' ')
+  classes=${classes% }
+  [[ $classes == "$4" ]] || no "$2: classes of the INPUT rules after run $3: '$classes', expected '$4'" "$(cat "$f")"
+  return $((1 - ok))
+}
+
+# docker-proxy listeners (fixture SC_SS=multi: tcp 32768, tcp 8443, udp 51820 on all
+# addresses, tcp 8081 on 203.0.113.20, tcp 8082 on 2001:db8::20; docker-proxy on
+# 127.0.0.1:5000 and node on 0.0.0.0:9000 do not count): after run RUN, INPUT of FAMILY
+# has the base rules, then an ACCEPT for each port of all addresses and, only in its own
+# family and only to that address (-d), for the port bound to one address, in any order,
+# each once, then REJECT as the last rule; no rule for 5000 or 9000.
+t_h_fw_dproxy() { # SCENARIO FAMILY RUN
+  local ok=1 a f l classes base="lo est icmp dhcp tcp22 tcp80 tcp443" mid want
+  have_run "$1" "$3" || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" "$3") == 0 ]] || no "run $3: expected exit code 0, got: $(rc_of "$1" "$3")" "$(grep '^Abbruch' "$a/err$3")"
+  if [[ $2 == v4 ]]; then want="tcp32768 tcp8081@203.0.113.20/32 tcp8443 udp51820 "; else want="tcp32768 tcp8082@2001:db8::20/128 tcp8443 udp51820 "; fi
+  f="$a/$2_$3"
+  classes=$(while IFS= read -r l; do h_rule_class "$2" "$l"; done <"$f" | tr '\n' ' ')
+  classes=${classes% }
+  if [[ $classes != "$base "*" reject" ]]; then
+    no "$2: INPUT does not start with '$base' and end with reject: '$classes'"
+  else
+    mid=${classes#"$base "}
+    mid=${mid%" reject"}
+    [[ $(tr ' ' '\n' <<<"$mid" | LC_ALL=C sort | tr '\n' ' ') == "$want" ]] ||
+      no "$2: rules for docker-proxy '$mid', expected (any order, each once): $want"
+  fi
+  ! grep -qE -- '--dport (5000|9000)( |$)' "$f" || no "$2: ACCEPT for a port that is no docker-proxy listener:" "$(grep -E -- '--dport (5000|9000)' "$f")"
+  return $((1 - ok))
+}
+
+# The admin user had no password and stdin was no terminal (run 1 of SCENARIO): at the end
+# of step 4a the run asks passwd -S, does not prompt (no "passwd USER"), and stops naming
+# the password, before anything of SSH is touched: no sshd -t (step 4 never started),
+# sshd_config.d as before, ssh not reloaded, no jail.local. With "prompt" a terminal was
+# there: "passwd USER" was called (and failed). The user and its key are in place.
+t_h_nopw_abort() { # SCENARIO [prompt]
+  local ok=1 a rc d p=/etc/fail2ban/jail.local
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  rc=$(rc_of "$1" 1)
+  [[ $rc =~ ^[0-9]+$ && $rc -ne 0 ]] || no "run 1: expected exit code != 0, got: $rc"
+  grep -qiE 'passwort' <<<"$(grep '^Abbruch' "$a/err1")" || no "the abort message does not name the password:" "$(cat "$a/err1")"
+  grep -qxF "passwd -S $H_ADMIN" "$a/log1" || no "passwd -S $H_ADMIN was not asked"
+  if [[ ${2:-} == prompt ]]; then
+    grep -qxF "passwd $H_ADMIN" "$a/log1" || no "on a terminal the script did not run passwd $H_ADMIN"
+  else
+    ! grep -qxF "passwd $H_ADMIN" "$a/log1" || no "without a terminal the script ran passwd $H_ADMIN"
+  fi
+  ! grep -qxF 'sshd -t' "$a/log1" || no "the run reached the SSH step (sshd -t) without a password"
+  d=$(diff "$a/sshd_state0" "$a/sshd_state_r1") || no "/etc/ssh/sshd_config.d after run 1 is not as before:" "$d"
+  ! grep -qE '^systemctl [a-z-]*(reload|restart)[a-z-]* ssh' "$a/log1" || no "ssh was reloaded in run 1"
+  [[ -z $(snap_path "$1" 1 "$p") ]] || no "run 1 went on after the abort ($p written)"
+  [[ -n $(snap_path "$1" 1 "/home/$H_ADMIN/.ssh/authorized_keys") ]] || no "the key of $H_ADMIN is not in place after run 1"
+  return $((1 - ok))
+}
+
+# Run 2 of SCENARIO after the operator set the password between the runs (no terminal):
+# exit 0, no passwd prompt, the drop-in written and ssh reloaded.
+t_h_pw_then_ok() { # SCENARIO
+  local ok=1 a
+  have_run "$1" 2 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 2) == 0 ]] || no "run 2: expected exit code 0, got: $(rc_of "$1" 2)" "$(grep '^Abbruch' "$a/err2")"
+  ! grep -qxF "passwd $H_ADMIN" "$a/log2" || no "run 2 prompted for a password although one was set"
+  [[ -n $(snap_path "$1" 2 "$SSHD_DROPIN") ]] || no "$SSHD_DROPIN missing after run 2"
+  grep -qxE 'systemctl reload ssh(\.service)?' "$a/log2" || no "run 2 did not reload ssh"
+  return $((1 - ok))
+}
+
+# Run 1 of SCENARIO on a terminal, no password yet: passwd USER was called (the operator
+# typed one) after the user was created and before the SSH step (sshd -t) and the reload
+# of ssh; exit 0. With "none": a password was there already and stdin was no terminal: no
+# prompt, exit 0. In every run passwd -S is asked before sshd -t.
+t_h_pw_prompt() { # SCENARIO [none]
+  local ok=1 a p t r u f n
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)" "$(grep '^Abbruch' "$a/err1")"
+  p=$(grep -nxF "passwd $H_ADMIN" "$a/log1" | head -1 | cut -d: -f1)
+  t=$(grep -nxF 'sshd -t' "$a/log1" | head -1 | cut -d: -f1)
+  r=$(grep -nxE 'systemctl reload ssh(\.service)?' "$a/log1" | head -1 | cut -d: -f1)
+  if [[ ${2:-} == none ]]; then
+    [[ -z $p ]] || no "the script prompted for a password although one was set"
+  else
+    u=$(grep -nE "^useradd( .*)? $H_ADMIN\$" "$a/log1" | head -1 | cut -d: -f1)
+    if [[ -z $p || -z $t || -z $r || -z $u ]] || ((p < u || p > t || p > r)); then
+      no "passwd $H_ADMIN (log line ${p:-none}) not after useradd (line ${u:-none}) and before sshd -t (line ${t:-none}) and the reload of ssh (line ${r:-none})"
+    fi
+  fi
+  [[ -n $r ]] || no "ssh was not reloaded"
+  for f in "$a"/log[0-9]*; do
+    n=$(grep -nxF "passwd -S $H_ADMIN" "$f" | head -1 | cut -d: -f1)
+    t=$(grep -nxF 'sshd -t' "$f" | head -1 | cut -d: -f1)
+    if [[ -z $n || -z $t ]] || ((n > t)); then no "${f##*/}: passwd -S $H_ADMIN (line ${n:-none}) not before sshd -t (line ${t:-none})"; fi
+  done
+  return $((1 - ok))
+}
+
+# The password of H_ADMIN was locked between run 1 and run 2 (no terminal): run 1 exit 0;
+# run 2 stops naming the password, changes no file, does not reload ssh, never gets to
+# sshd -t.
+t_h_pw_rerun_abort() { # SCENARIO
+  local ok=1 a rc d
+  have_run "$1" 2 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 1) == 0 ]] || no "run 1: expected exit code 0, got: $(rc_of "$1" 1)" "$(grep '^Abbruch' "$a/err1")"
+  rc=$(rc_of "$1" 2)
+  [[ $rc =~ ^[0-9]+$ && $rc -ne 0 ]] || no "run 2: expected exit code != 0, got: $rc"
+  grep -qiE 'passwort' <<<"$(grep '^Abbruch' "$a/err2")" || no "run 2: the abort message does not name the password:" "$(cat "$a/err2")"
+  d=$(diff "$a/snap1" "$a/snap2") || no "run 2 changed files:" "$d"
+  ! grep -qE '^systemctl [a-z-]*(reload|restart)[a-z-]* ssh' "$a/log2" || no "run 2 reloaded ssh"
+  ! grep -qxF 'sshd -t' "$a/log2" || no "run 2 reached the SSH step"
+  return $((1 - ok))
+}
+
+# ssh reloaded on every run of the profile hostinger (run 2 of SCENARIO, drop-in
+# unchanged): exactly one "systemctl reload ssh", after sshd -t and the sshd -T -C checks
+# for root from the web console; exit 0.
+t_h_reload_every_run() { # SCENARIO
+  local ok=1 a t c r
+  have_run "$1" 2 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 2) == 0 ]] || no "run 2: expected exit code 0, got: $(rc_of "$1" 2)"
+  [[ "$(snap_path "$1" 1 "$SSHD_DROPIN")" == "$(snap_path "$1" 2 "$SSHD_DROPIN")" ]] || no "fixture: run 2 changed the drop-in"
+  [[ $(grep -cxE 'systemctl reload ssh(\.service)?' "$a/log2") == 1 ]] || no "run 2: not exactly one reload of ssh"
+  t=$(grep -nxF 'sshd -t' "$a/log2" | head -1 | cut -d: -f1)
+  c=$(grep -nE "^sshd -T -C user=root,.*addr=$H_CONSOLE\$" "$a/log2" | tail -1 | cut -d: -f1)
+  r=$(grep -nxE 'systemctl reload ssh(\.service)?' "$a/log2" | head -1 | cut -d: -f1)
+  if [[ -z $t || -z $c || -z $r ]] || ((r < t || r < c)); then
+    no "run 2: reload (line ${r:-none}) not after sshd -t (line ${t:-none}) and the check of root from $H_CONSOLE (line ${c:-none})"
+  fi
+  return $((1 - ok))
+}
+
+# A drop-in from another file makes the checks fail before run 2 (fixture
+# SC_BETWEEN_SSHD_LATE): run 2 aborts and does not reload ssh, although the profile reloads
+# on every run.
+t_h_rerun_no_reload() { # SCENARIO REGEX
+  local ok=1 a rc
+  have_run "$1" 2 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 1) == 0 ]] || no "run 1: expected exit code 0, got: $(rc_of "$1" 1)"
+  rc=$(rc_of "$1" 2)
+  [[ $rc =~ ^[0-9]+$ && $rc -ne 0 ]] || no "run 2: expected exit code != 0, got: $rc"
+  grep -qiE -- "$2" <<<"$(grep '^Abbruch' "$a/err2")" || no "run 2: abort message does not name /$2/:" "$(cat "$a/err2")"
+  ! grep -qE '^systemctl [a-z-]*(reload|restart)[a-z-]* ssh' "$a/log2" || no "run 2 reloaded ssh after a failed check"
+  return $((1 - ok))
+}
+
+# A signal SIG reached the script in run 1 of SCENARIO. at=sshd: between writing the
+# drop-in and the reload (at the first sshd -t): exit 130, a message that the drop-in was
+# put back, sshd_config.d exactly as before the run (also an older drop-in: content,
+# mode), ssh not reloaded, the run stops (no jail.local). at=passwd: while passwd asked
+# (before the SSH step): exit 130, "Abgebrochen (Signal)", sshd -t never ran, sshd_config.d
+# as before, no reload.
+t_h_signal() { # SCENARIO sshd|passwd
+  local ok=1 a rc d
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  rc=$(rc_of "$1" 1)
+  [[ $rc == 130 ]] || no "expected exit code 130 (signal), got: $rc" "$(tail -3 "$a/err1")"
+  grep -q 'Abgebrochen (Signal)' "$a/err1" || no "no message about the signal:" "$(tail -3 "$a/err1")"
+  if [[ $2 == sshd ]]; then
+    [[ -e $a/state/signal_sent ]] || no "fixture: the sshd stub did not send the signal"
+    grep -qF "$SSHD_DROPIN" <<<"$(grep 'Abgebrochen (Signal)' "$a/err1")" || no "the message does not say that $SSHD_DROPIN was put back"
+  else
+    grep -qxF "passwd $H_ADMIN" "$a/log1" || no "fixture: passwd was not called"
+    ! grep -qxF 'sshd -t' "$a/log1" || no "the run went on to the SSH step after the signal"
+  fi
+  d=$(diff "$a/sshd_state0" "$a/sshd_state_r1") || no "/etc/ssh/sshd_config.d is not as before the run (name mode owner sha256):" "$d"
+  ! grep -qE '^systemctl [a-z-]*(reload|restart)[a-z-]* ssh' "$a/log1" || no "ssh was reloaded"
+  [[ -z $(snap_path "$1" 1 /etc/fail2ban/jail.local) ]] || no "the run went on after the signal (jail.local written)"
+  return $((1 - ok))
+}
+
+# docker info reports live-restore off after the reload (fixture SC_DOCKER_LR=false):
+# abort naming live-restore, after daemon.json was written and docker reloaded, before
+# any package update (no apt-get full-upgrade or install), Docker not restarted.
+t_h_lr_abort() { # SCENARIO
+  local ok=1 a rc hits
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  rc=$(rc_of "$1" 1)
+  [[ $rc =~ ^[0-9]+$ && $rc -ne 0 ]] || no "expected exit code != 0, got: $rc"
+  grep -q 'live-restore' <<<"$(grep '^Abbruch' "$a/err1")" || no "the abort message does not name live-restore:" "$(cat "$a/err1")"
+  grep -qxE 'systemctl reload docker(\.service)?' "$a/log1" || no "docker was not reloaded (the abort came too early)"
+  [[ -n $(snap_path "$1" 1 /etc/docker/daemon.json) ]] || no "daemon.json was not written"
+  ! grep -qE '^apt-get .* (full-upgrade|install)( |$)' "$a/log1" || no "packages were updated after the failed live-restore check:" "$(grep -E '^apt-get' "$a/log1")"
+  hits=$(h_docker_hits "$a/log1")
+  [[ -z $hits ]] || no "Docker restarted, stopped or started:" "$hits"
+  return $((1 - ok))
+}
+
+# Docker's packages pinned for the apt runs of run 1 of SCENARIO: every apt-get
+# full-upgrade and install got "-o Dir::Etc::Preferences=FILE" with FILE in the run's
+# TMPDIR, and FILE (as the apt-get stub saw it) pins each installed Docker package
+# (PKG=VERSION...) to its version with priority 1001 and no other package (apart from
+# the content of /etc/apt/preferences, PREFS, if given, which comes first). Nothing
+# lasting: no apt-mark, nothing in /etc/apt/preferences.d, /etc/apt/preferences as before,
+# the run's TMPDIR empty afterwards. apt-cache accepts FILE.
+t_h_docker_pin() { # SCENARIO "PKG=VERSION ..." [PREFS]
+  local ok=1 a n=0 l file got want pv pkg ver prefs out triples
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)" "$(grep '^Abbruch' "$a/err1")"
+  while IFS= read -r l; do
+    n=$((n + 1))
+    file=$(grep -oE 'Dir::Etc::Preferences=[^ ]+' <<<"$l" | head -1)
+    file=${file#*=}
+    [[ $file == "$a/tmp/"* ]] || no "apt-get without a preferences file in the run's TMPDIR: $l"
+  done < <(grep -E '^apt-get .* (full-upgrade|install)( |$)' "$a/log1")
+  ((n >= 2)) || no "fixture: fewer than 2 apt-get full-upgrade/install calls in run 1"
+  prefs="$a/state/apt-prefs.1"
+  if [[ ! -s $prefs ]]; then
+    no "the apt-get stub saw no preferences file"
+  else
+    [[ $(grep -c '^== apt-get' "$prefs") == "$n" ]] || no "preferences file given to $(grep -c '^== apt-get' "$prefs") of $n apt-get calls"
+    want=""
+    for pv in $2; do
+      pkg=${pv%%=*} ver=${pv#*=}
+      want+="Package: $pkg|Pin: version $ver|Pin-Priority: 1001"$'\n'
+    done
+    # shellcheck disable=SC2016 # awk program
+    triples='/^Package:/ { p = $0 } /^Pin:/ { v = $0 } /^Pin-Priority:/ { if (p != "") print p "|" v "|" $0; p = "" }'
+    if [[ -n ${3:-} ]]; then want+="$(printf '%b\n' "$3" | awk "$triples")"$'\n'; fi
+    got=$(grep -v '^== apt-get' "$prefs" | awk "$triples" | LC_ALL=C sort -u)
+    [[ $got == "$(printf '%s' "$want" | LC_ALL=C sort -u)" ]] ||
+      no "pins in the preferences file (got < > expected):" "$(diff <(printf '%s\n' "$got") <(printf '%s' "$want" | LC_ALL=C sort -u))"
+    if [[ -n ${3:-} ]]; then
+      [[ $(sed -n '2,/^$/p' "$prefs" | head -n "$(printf '%b\n' "$3" | grep -c '')") == "$(printf '%b' "$3")" ]] ||
+        no "the preferences file does not start with the content of /etc/apt/preferences:" "$(head -8 "$prefs")"
+    fi
+    if command -v apt-cache >/dev/null 2>&1; then
+      sed '/^== apt-get/,$!d' "$prefs" | awk '/^== apt-get/ { n++ } n == 1 && !/^== apt-get/' >"$a/apt-prefs-first"
+      mkdir -p "$a/apt-prefs-parts-empty"
+      out=$(apt-cache -o "Dir::Etc::Preferences=$a/apt-prefs-first" -o "Dir::Etc::PreferencesParts=$a/apt-prefs-parts-empty" policy 2>&1 >/dev/null)
+      ! grep -qE '^(E|W):' <<<"$out" || no "apt-cache rejects the preferences file:" "$out"
+    fi
+  fi
+  ! grep -qE '^apt-mark( |$)' "$a/log1" || no "apt-mark was called"
+  [[ -z $(find "$(upper "$1" etc)/apt/preferences.d" -mindepth 1 2>/dev/null) ]] || no "files in /etc/apt/preferences.d"
+  [[ "$(snap_path "$1" 0 /etc/apt/preferences)" == "$(snap_path "$1" 1 /etc/apt/preferences)" ]] || no "/etc/apt/preferences changed"
+  [[ -z $(find "$a/tmp" -mindepth 1 2>/dev/null) ]] || no "temporary files left in the run's TMPDIR"
+  return $((1 - ok))
+}
+
+# Profile oracle (SCENARIO): no apt-get call gets a preferences file of the run.
+t_oracle_no_pin() { # SCENARIO
+  local ok=1 hits
+  have_run "$1" 1 || return 1
+  hits=$(grep -E '^apt-get .*Dir::Etc::Preferences' "$(art "$1")/log1")
+  [[ -z $hits ]] || no "apt-get with a preferences file in the profile oracle:" "$hits"
+  return $((1 - ok))
+}
+
+# The rules files after run RUN of SCENARIO replace only INPUT when loaded with
+# --noflush: each has exactly one flush line, "-F INPUT", after the chain lines and
+# before the first rule, and no -X or -Z. The systemd drop-in of netfilter-persistent
+# sets IPTABLES_RESTORE_NOFLUSH=yes and IP6TABLES_RESTORE_NOFLUSH=yes in [Service]
+# (mode 644); systemctl daemon-reload in run 1 after writing it, not in later runs. Loaded
+# with --noflush on the firewall after the runs plus a foreign INPUT rule (h_post_checks):
+# INPUT is exactly the file's rules, nothing outside INPUT changed.
+t_h_noflush() { # SCENARIO RUN
+  local ok=1 a fam tool f d dropin r first_a flush_n last_chain
+  have_run "$1" "$2" || return 1
+  a=$(art "$1")
+  for fam in v4 v6; do
+    if [[ $fam == v4 ]]; then tool=iptables; else tool=ip6tables; fi
+    f="$(upper "$1" etc)/iptables/rules.$fam"
+    [[ -f $f ]] || {
+      no "rules.$fam missing"
+      continue
+    }
+    flush_n=$(grep -cE '^-(F|X|Z)( |$)' "$f")
+    { [[ $flush_n == 1 ]] && grep -qx -- '-F INPUT' "$f"; } || no "rules.$fam: flush lines '$(grep -E '^-(F|X|Z)' "$f" | tr '\n' ' ')', expected exactly -F INPUT"
+    first_a=$(grep -nE '^-A ' "$f" | head -1 | cut -d: -f1)
+    r=$(grep -nx -- '-F INPUT' "$f" | head -1 | cut -d: -f1)
+    last_chain=$(grep -nE '^:' "$f" | tail -1 | cut -d: -f1)
+    if [[ -z $r || -z $first_a || -z $last_chain ]] || ((r > first_a || r < last_chain)); then
+      no "rules.$fam: -F INPUT (line ${r:-none}) not between the chain lines and the first rule (line ${first_a:-none})"
+    fi
+    grep -qx 'rc=0' "$a/nf_${tool}_load" 2>/dev/null || no "$tool-restore --noflush rejects rules.$fam:" "$(cat "$a/nf_${tool}_load" 2>/dev/null)"
+    grep -q -- '--dport 6666 ' "$a/nf_${tool}_before" || no "test: the foreign INPUT rule was not in place before the load"
+    d=$(diff <(grep '^-A INPUT ' "$f") <(grep '^-A INPUT ' "$a/nf_${tool}_input")) ||
+      no "$tool: INPUT after loading rules.$fam with --noflush is not the file's rules (< file, > INPUT):" "$d"
+    d=$(diff <(grep -v '^-A INPUT ' "$a/nf_${tool}_before") <(grep -v '^-A INPUT ' "$a/nf_${tool}_after")) ||
+      no "$tool: loading rules.$fam with --noflush changed something outside INPUT (FORWARD, Docker's chains, nat):" "$d"
+  done
+  dropin="$(upper "$1" etc)/systemd/system/netfilter-persistent.service.d/10-noflush.conf"
+  if [[ ! -f $dropin ]]; then
+    no "drop-in /etc/systemd/system/netfilter-persistent.service.d/10-noflush.conf missing"
+  else
+    [[ $(stat -c '%a %U' "$dropin") == "644 root" ]] || no "drop-in: mode and owner $(stat -c '%a %U' "$dropin"), expected 644 root"
+    grep -qw 'IPTABLES_RESTORE_NOFLUSH=yes' <<<"$(awk '/^\[/ { s = $0 } s == "[Service]" && /^Environment=/' "$dropin")" ||
+      no "drop-in: no Environment=IPTABLES_RESTORE_NOFLUSH=yes in [Service]:" "$(cat "$dropin")"
+    grep -qw 'IP6TABLES_RESTORE_NOFLUSH=yes' <<<"$(awk '/^\[/ { s = $0 } s == "[Service]" && /^Environment=/' "$dropin")" ||
+      no "drop-in: no Environment=IP6TABLES_RESTORE_NOFLUSH=yes in [Service]:" "$(cat "$dropin")"
+  fi
+  grep -qx 'systemctl daemon-reload' "$a/log1" || no "run 1 wrote the drop-in without systemctl daemon-reload"
+  for ((r = 2; r <= $2; r++)); do
+    ! grep -qx 'systemctl daemon-reload' "$a/log$r" || no "run $r ran systemctl daemon-reload again"
+  done
+  return $((1 - ok))
+}
+
+# ONLY_SAVE_FIREWALL=1 (fixture: INPUT closed as the profile leaves it, plus an own rule
+# for tcp 5432 before the REJECT): exit 0; rules.v4 and rules.v6 written with the rules
+# of INPUT (including the own rule) and "-F INPUT", the drop-in of netfilter-persistent;
+# no other file changed, no firewall rule changed, no modifying command apart from
+# systemctl daemon-reload and ip(6)tables-restore --test (no apt-get, useradd, sshd, ...).
+t_h_only_save() { # SCENARIO
+  local ok=1 a fam f d calls
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)" "$(cat "$a/err1")"
+  d=$(diff "$a/fw0" "$a/fw1") || no "firewall rules changed:" "$d"
+  for fam in v4 v6; do
+    f="$(upper "$1" etc)/iptables/rules.$fam"
+    if [[ ! -f $f ]]; then
+      no "rules.$fam not written"
+      continue
+    fi
+    grep -q -- '-i br-test -p tcp -m tcp --dport 5432 -j ACCEPT' "$f" || no "rules.$fam lacks the own rule for 5432"
+    [[ "$(grep '^-A INPUT ' "$f")" == "$(grep '^-A INPUT ' "$a/${fam}_0")" ]] || no "rules.$fam: rules of INPUT differ from those in effect"
+    grep -qx -- '-F INPUT' "$f" || no "rules.$fam lacks -F INPUT"
+  done
+  [[ -f $(upper "$1" etc)/systemd/system/netfilter-persistent.service.d/10-noflush.conf ]] || no "drop-in of netfilter-persistent not written"
+  d=$(diff <(grep -vE '(^|  )\./etc/u(/iptables(/|\||$)|/systemd(/system(/netfilter-persistent\.service\.d(/|\||$)|\||$)|\||$)|\|)' "$a/snap0") \
+    <(grep -vE '(^|  )\./etc/u(/iptables(/|\||$)|/systemd(/system(/netfilter-persistent\.service\.d(/|\||$)|\||$)|\||$)|\|)' "$a/snap1")) ||
+    no "files changed outside /etc/iptables and the drop-in:" "$d"
+  calls=$(modifying_calls "$a/log1" strict | grep -vxE 'systemctl daemon-reload|ip6?tables-restore --test')
+  [[ -z $calls ]] || no "modifying commands apart from saving:" "$calls"
+  return $((1 - ok))
+}
+
+# A key line for ADMIN_PUBKEY was in authorized_keys before, but commented out or with
+# options in front (fixture h_keys0): the key is added as a line of its own (first two
+# fields type and base64 part, not commented) exactly once; the lines from before are
+# kept in their order at the start; exit 0.
+t_h_key_own_line() { # SCENARIO KEY
+  local ok=1 a t b n0 own d
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  read -r t b _ <<<"$2"
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)" "$(grep '^Abbruch' "$a/err1")"
+  grep -qF -- "$b" "$a/h_keys0" || no "fixture: the key is not in authorized_keys before the run"
+  [[ $(awk -v t="$t" -v b="$b" '$1 == t && $2 == b' "$a/h_keys0" | grep -c '') == 0 ]] || no "fixture: the key is there as a line of its own already"
+  own=$(awk -v t="$t" -v b="$b" '$1 == t && $2 == b' "$a/h_keys" 2>/dev/null | grep -c '')
+  [[ $own == 1 ]] || no "$own lines with the key of its own (not commented, no options), expected 1:" "$(cat "$a/h_keys" 2>/dev/null)"
+  n0=$(grep -c '' "$a/h_keys0")
+  d=$(diff "$a/h_keys0" <(head -n "$n0" "$a/h_keys" 2>/dev/null)) || no "the lines from before are not kept at the start:" "$d"
+  return $((1 - ok))
+}
+
+# sshd listens on port 2222 (sshd -T; fixture Port 2222 and ss): INPUT of both families
+# opens tcp 2222 instead of 22 (no ACCEPT for 22), jail.local of fail2ban has
+# "port = 2222", sshd -T after the run says port 2222.
+t_h_ssh_port() { # SCENARIO
+  local ok=1 a fam jail
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  grep -qx 'port 2222' "$a/sshd_T" || no "fixture not in effect: sshd -T lacks 'port 2222'"
+  for fam in v4 v6; do
+    t_h_fw_classes "$1" "$fam" 1 "lo est icmp dhcp tcp2222 tcp80 tcp443 tcp32768 reject" || ok=0
+  done
+  jail="$(upper "$1" etc)/fail2ban/jail.local"
+  grep -qxE 'port[[:space:]]*=[[:space:]]*2222' "$jail" 2>/dev/null || no "jail.local has no port = 2222:" "$(grep -E '^port' "$jail" 2>/dev/null)"
+  return $((1 - ok))
+}
+
+# needrestart configured (fixture SC_NEEDRESTART=1): its drop-in 50-setup-server-docker.conf
+# (644 root) makes needrestart never restart docker.service or containerd.service
+# (override_rc 0, evaluated with perl), and leaves ssh.service and fail2ban.service alone.
+# Without needrestart (NONE scenario): no such file.
+t_h_needrestart() { # SCENARIO NONE_SCENARIO
+  local ok=1 a f
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  f="$(upper "$1" etc)/needrestart/conf.d/50-setup-server-docker.conf"
+  if [[ ! -f $f ]]; then
+    no "/etc/needrestart/conf.d/50-setup-server-docker.conf not written"
+  else
+    [[ $(stat -c '%a %U' "$f") == "644 root" ]] || no "mode and owner $(stat -c '%a %U' "$f"), expected 644 root"
+    for l in docker.service=0 containerd.service=0 ssh.service=unset fail2ban.service=unset; do
+      grep -qxF "$l" "$a/nr_eval" 2>/dev/null || no "needrestart (perl) does not give $l:" "$(cat "$a/nr_eval" 2>/dev/null)"
+    done
+  fi
+  have_run "$2" 1 || return 1
+  [[ ! -e $(upper "$2" etc)/needrestart/conf.d/50-setup-server-docker.conf ]] || no "$2 (no needrestart) has the needrestart file"
+  return $((1 - ok))
+}
+
+# The package installation changed Docker's structure in the table filter of TOOL (apt-get
+# stub HOOK: FORWARD policy, or a jump from FORWARD into a DOCKER chain; INPUT unchanged):
+# the run stops right after the packages, naming TOOL and FORWARD/Docker, restores nothing
+# (no TOOL-restore without --test; the table filter stays as the package installation left
+# it), saves no rules (no rules.v4/v6), and goes no further (no useradd, no sshd -t).
+t_h_fw_apt_docker_abort() { # SCENARIO HOOK TOOL
+  local ok=1 a fam n rc d ab
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  if [[ $3 == iptables ]]; then fam=4; else fam=6; fi
+  grep -qx "fw $2" "$a/state/apt_hooks" 2>/dev/null || no "fixture: the apt-get stub did not run hook $2"
+  rc=$(rc_of "$1" 1)
+  [[ $rc =~ ^[0-9]+$ && $rc -ne 0 ]] || no "expected exit code != 0, got: $rc"
+  ab=$(sed -n '/^Abbruch/,$p' "$a/err1")
+  grep -qF -- "$3" <<<"$ab" || no "the abort message does not name $3:" "$ab"
+  grep -qE 'FORWARD|Docker' <<<"$ab" || no "the abort message does not name FORWARD or Docker:" "$ab"
+  n=$(grep -E "^$3-restore( |\$)" "$a/log1" | grep -cvE -- '(--test|-t)( |$)')
+  ((n == 0)) || no "$n calls of $3-restore: something was restored"
+  d=$(diff <(h_table "$a/state/after_apt.v$fam" filter) <(h_table "$a/save${fam}_1" filter)) ||
+    no "IPv$fam: table filter after the run differs from right after the package installation (restored?):" "$d"
+  [[ -z $(find "$(upper "$1" etc)/iptables" -name 'rules.v*' 2>/dev/null) ]] || no "rules files written"
+  ! grep -qE '^(useradd|sshd -t)( |$)' "$a/log1" || no "the run went on after the abort"
+  return $((1 - ok))
+}
+
+# The package installation changed only rules inside Docker's chains (apt-get stub HOOK: a
+# rule of DOCKER-USER deleted, a container rule added): no abort, no restore (TOOL-restore
+# only with --test), exit 0, INPUT closed as usual, the changed Docker chain left as the
+# package installation left it.
+t_h_fw_apt_docker_ok() { # SCENARIO HOOK TOOL
+  local ok=1 a fam n d
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  if [[ $3 == iptables ]]; then fam=4; else fam=6; fi
+  grep -qx "fw $2" "$a/state/apt_hooks" 2>/dev/null || no "fixture: the apt-get stub did not run hook $2"
+  [[ "$(h_table "$a/state/after_apt.v$fam" filter | grep -v '^-A INPUT ')" != "$(h_table "$a/save${fam}_0" filter | grep -v '^-A INPUT ')" ]] ||
+    no "fixture: hook $2 did not change the table filter"
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)" "$(grep '^Abbruch' "$a/err1")"
+  n=$(grep -E "^$3-restore( |\$)" "$a/log1" | grep -cvE -- '(--test|-t)( |$)')
+  ((n == 0)) || no "$n calls of $3-restore without --test"
+  d=$(diff <(h_table "$a/state/after_apt.v$fam" filter | grep -v '^-A INPUT ') <(h_table "$a/save${fam}_1" filter | grep -v '^-A INPUT ')) ||
+    no "IPv$fam: Docker's chains not as the package installation left them:" "$d"
+  t_h_fw_input "$1" "v$fam" 1 || ok=0
+  return $((1 - ok))
+}
+
+# INPUT of FAMILY had only a REJECT with a condition (one address) before run 1: it does
+# not count as the end of INPUT. After run RUN the last rule is an unconditional REJECT
+# (exactly one), the conditional REJECT is still there once, and each of lo, est, icmp,
+# dhcp, tcp22, tcp80, tcp443 and tcp32768 is there once, before the final REJECT.
+t_h_fw_condreject() { # SCENARIO FAMILY RUN
+  local ok=1 a f l classes c last
+  have_run "$1" "$3" || return 1
+  a=$(art "$1")
+  [[ $(grep -c -- '-s .* -j REJECT' "$a/$2_0") == 1 && $(grep -c '^-A INPUT' "$a/$2_0") == 1 ]] ||
+    no "fixture: INPUT before the run does not hold exactly one conditional REJECT:" "$(cat "$a/$2_0")"
+  [[ $(rc_of "$1" "$3") == 0 ]] || no "run $3: expected exit code 0, got: $(rc_of "$1" "$3")" "$(grep '^Abbruch' "$a/err$3")"
+  f="$a/$2_$3"
+  classes=$(while IFS= read -r l; do h_rule_class "$2" "$l"; done <"$f" | tr '\n' ' ')
+  classes=${classes% }
+  last=${classes##* }
+  [[ $last == reject ]] || no "$2: the last rule is not an unconditional REJECT: '$classes'"
+  [[ $(grep -o 'reject' <<<"$classes" | grep -c '') == 1 ]] || no "$2: not exactly one unconditional REJECT: '$classes'"
+  [[ $(grep -c -- '-s .* -j REJECT' "$f") == 1 ]] || no "$2: the conditional REJECT is not there exactly once"
+  for c in lo est icmp dhcp tcp22 tcp80 tcp443 tcp32768; do
+    [[ $(tr ' ' '\n' <<<"$classes" | grep -cx "$c") == 1 ]] || no "$2: rule $c not there exactly once: '$classes'"
+  done
+  return $((1 - ok))
+}
+
+# ufw was installed and inactive. removed: the package installation removed it (dpkg-query
+# no longer finds it); the end of run 1 says that apt removed ufw, and no warning says it
+# is still installed. kept: dpkg still has ufw after the packages; the end of run 1 does
+# not claim it was removed, a warning says it is still installed (naming dpkg).
+t_h_ufw_removed() { # SCENARIO removed|kept
+  local ok=1 a tail_out w
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)" "$(grep '^Abbruch' "$a/err1")"
+  tail_out=$(sed -n '/^== Fertig/,$p' "$a/out1")
+  [[ -n $tail_out ]] || no "run 1 did not reach the end"
+  w=$(grep 'WARNUNG:' "$a/err1" | grep -iF 'ufw')
+  if [[ $2 == removed ]]; then
+    grep -q 'ufw' "$a/state/dpkg_removed" 2>/dev/null || no "fixture: the apt-get stub did not remove ufw"
+    grep -qE 'entfernt' <<<"$(grep -iE 'ufw' <<<"$tail_out")" || no "the end of the run does not say that apt removed ufw:" "$tail_out"
+    ! grep -qiE 'noch installiert' <<<"$w" || no "a warning says ufw is still installed:" "$w"
+  else
+    [[ ! -e $a/state/dpkg_removed ]] || no "fixture: ufw was removed"
+    ! grep -qE 'hat .*entfernt' <<<"$(grep -iE 'ufw' <<<"$tail_out")" || no "the end of the run claims apt removed ufw:" "$(grep -i ufw <<<"$tail_out")"
+    grep -qF 'dpkg' <<<"$w" || no "no warning that dpkg still has ufw:" "$(grep 'WARNUNG' "$a/err1")"
+  fi
+  return $((1 - ok))
+}
+
+# Started over SSH (SSH_CONNECTION) from ADDRESS: with "warn" a warning names ADDRESS
+# (root cannot log in from there afterwards), without it (the web console's address) no
+# warning names SSH_CONNECTION's address or "per SSH". Dry run, exit 0.
+t_h_sshconn() { # SCENARIO ADDRESS warn|quiet
+  local ok=1 a w
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)"
+  w=$(grep 'WARNUNG:' "$a/err1")
+  if [[ $3 == warn ]]; then
+    grep -qF -- "$2" <<<"$w" || no "no warning that names $2:" "$w"
+  else
+    ! grep -qiE 'per SSH' <<<"$w" || no "warning about the SSH connection from the web console:" "$(grep -i 'per SSH' <<<"$w")"
+  fi
+  return $((1 - ok))
+}
+
+# Running containers (fixture SC_CONTAINERS=1, read from Docker's files in the sandbox):
+# a warning names webapp (no restart policy) and not traefik (unless-stopped).
+t_h_restart_policy() { # SCENARIO
+  local ok=1 w
+  have_run "$1" 1 || return 1
+  w=$(grep 'WARNUNG:' "$(art "$1")/err1")
+  grep -q 'webapp' <<<"$w" || no "no warning that names webapp:" "$w"
+  ! grep -q 'traefik' <<<"$w" || no "a warning names traefik (restart policy unless-stopped)"
+  return $((1 - ok))
+}
+
+# Run 1 of SCENARIO exits 0, run 2 stops naming REGEX (its checks, before any change):
+# no file and no firewall rule changed in run 2, no modifying command in run 2.
+t_h_rerun_abort_unchanged() { # SCENARIO REGEX
+  local ok=1 a rc d calls
+  have_run "$1" 2 || return 1
+  a=$(art "$1")
+  [[ $(rc_of "$1" 1) == 0 ]] || no "run 1: expected exit code 0, got: $(rc_of "$1" 1)" "$(grep '^Abbruch' "$a/err1")"
+  rc=$(rc_of "$1" 2)
+  [[ $rc =~ ^[0-9]+$ && $rc -ne 0 ]] || no "run 2: expected exit code != 0, got: $rc"
+  grep -qE -- "$2" <<<"$(grep '^Abbruch' "$a/err2")" || no "run 2: the abort message does not name /$2/:" "$(cat "$a/err2")"
+  d=$(diff "$a/snap1" "$a/snap2") || no "run 2 changed files:" "$d"
+  d=$(diff "$a/fw1" "$a/fw2") || no "run 2 changed firewall rules:" "$d"
+  calls=$(modifying_calls "$a/log2" strict)
+  [[ -z $calls ]] || no "run 2 ran modifying commands:" "$calls"
+  return $((1 - ok))
+}
+
+# Rules files the script wrote in run 1 (its header, -F INPUT) and its drop-in for
+# netfilter-persistent are there, iptables-persistent is not installed (dpkg-query stub):
+# run 2 is not stopped by the check for foreign rules files.
+t_h_rules_own_ok() { # SCENARIO
+  local ok=1 a
+  have_run "$1" 2 || return 1
+  a=$(art "$1")
+  [[ -n $(snap_path "$1" 1 /etc/iptables/rules.v4) ]] || no "fixture: no rules.v4 after run 1"
+  [[ -n $(snap_path "$1" 1 /etc/systemd/system/netfilter-persistent.service.d/10-noflush.conf) ]] || no "fixture: no drop-in after run 1"
+  [[ $(rc_of "$1" 2) == 0 ]] || no "run 2: expected exit code 0, got: $(rc_of "$1" 2)" "$(grep '^Abbruch' "$a/err2")"
+  ! grep -q 'iptables-persistent ist aber noch nicht installiert' "$a/err2" || no "run 2 calls its own rules files foreign"
+  return $((1 - ok))
+}
+
+# ONLY_SAVE_FIREWALL=1 without /run/sshd (fixture SC_RUN_SSHD=missing): exit 0, /run/sshd
+# created (owner root, not writable by group or others), rules files written.
+t_h_only_save_rundir() { # SCENARIO
+  local ok=1 a p
+  have_run "$1" 1 || return 1
+  a=$(art "$1")
+  t_run_sshd_fixture "$1"
+  [[ $(rc_of "$1" 1) == 0 ]] || no "expected exit code 0, got: $(rc_of "$1" 1)" "$(cat "$a/err1")"
+  p="$(upper "$1" run)/sshd"
+  if [[ ! -d $p ]]; then
+    no "/run/sshd was not created"
+  elif [[ $(stat -c %U "$p") != root ]] || (($(stat -c '0%a' "$p") & 022)); then
+    no "/run/sshd: mode and owner $(stat -c '%a %U' "$p")"
+  fi
+  [[ -f $(upper "$1" etc)/iptables/rules.v4 && -f $(upper "$1" etc)/iptables/rules.v6 ]] || no "rules files not written"
+  return $((1 - ok))
+}
+
 # prepare_ssh_keys DIR: throwaway SSH keys for ADMIN_PUBKEY, made for this run with
 # ssh-keygen (no passphrase) and removed with the work directory: ed25519, other (a
 # second ed25519), ecdsa256, ecdsa384, ecdsa521, rsa2048, rsa1024 (DIR/NAME and NAME.pub).
@@ -4400,12 +5171,14 @@ prepare_keys() {
 # one (SC_PASSWD=set); nobody else has a key. HA: the same with ADMIN_USER=H_ADMIN and
 # ADMIN_PUBKEY=the ed25519 key.
 hostinger_scenarios() {
-  local k=$WORK/sshkeys ed other dpkg b64
+  local k=$WORK/sshkeys ed other dpkg dpkg_nfp b64
   local -a H HA
   ed=$(<"$k/ed25519.pub")
   other=$(<"$k/other.pub")
-  dpkg=$(printf '%s\n' 'docker-ce=install ok installed' 'docker-ce-cli=install ok installed' \
-    'containerd.io=install ok installed' 'docker-compose-plugin=install ok installed' 'ufw=install ok installed')
+  dpkg=$(printf '%s\n' "docker-ce=install ok installed|$H_V_DOCKER" "docker-ce-cli=install ok installed|$H_V_DOCKER" \
+    "containerd.io=install ok installed|$H_V_CONTAINERD" "docker-compose-plugin=install ok installed|$H_V_COMPOSE" \
+    'ufw=install ok installed')
+  dpkg_nfp="$dpkg"$'\n'"iptables-persistent=install ok installed"
   H=(SC_PROFIL=hostinger SC_HOSTINGER=1 SC_LOGINUID=0 SC_KEY=none SC_HIDE_DOCKER=0 SC_TTY=1 SC_PASSWD=set
     SC_FW=hostinger SC_V6=hostinger "SC_DPKG=$dpkg" SC_SS=hostinger)
   HA=("${H[@]}" "SC_ADMIN_USER=$H_ADMIN" "SC_ADMIN_PUBKEY=$ed")
@@ -4482,10 +5255,76 @@ hostinger_scenarios() {
   scenario h_ssh_late_allowroot "${HA[@]}" "SC_SSHD_LATE=AllowUsers root"
   # fail2ban: a foreign file exempts more addresses
   scenario h_f2b_ignoreip "${HA[@]}" "SC_F2B_JAIL_D=[sshd]\nignoreip = $H_IGNOREIP 0.0.0.0/0"
+  # Review fixes (commit 0f864a5)
+  # Password of the admin user before the sshd reload
+  scenario h_nopw "${HA[@]}" SC_TTY=0 SC_RUNS=2 SC_H_SETPW_BETWEEN=1
+  scenario h_pw_fail "${HA[@]}" SC_PASSWD=fail
+  scenario h_existing_pw "${HA[@]}" SC_TTY=0 SC_H_EXISTING=1 SC_H_PW=1 SC_H_SSH_MODE=700 SC_H_KEYS_MODE=600 \
+    "SC_H_OLDKEYS=$other\n"
+  # docker-proxy listeners
+  scenario h_dproxy_none "${HA[@]}" SC_SS=none
+  scenario h_dproxy_multi "${HA[@]}" SC_SS=multi SC_RUNS=2
+  # Docker: Swarm, live-restore not active after the reload, pins with /etc/apt/preferences
+  scenario h_swarm "${HA[@]}" SC_SWARM=active
+  scenario h_lr_off "${HA[@]}" SC_DOCKER_LR=false
+  scenario h_pin_prefs "${HA[@]}" 'SC_APT_PREFS=Package: linux-image-generic\nPin: release a=noble\nPin-Priority: 990'
+  # ONLY_SAVE_FIREWALL
+  scenario h_only_save "${H[@]}" SC_FW=hostinger_closed SC_V6=hostinger_closed SC_ONLY_SAVE=1
+  scenario h_only_save_open "${H[@]}" SC_ONLY_SAVE=1
+  scenario h_only_save_oracle SC_ONLY_SAVE=1
+  scenario h_only_save_bad "${H[@]}" SC_FW=hostinger_closed SC_V6=hostinger_closed SC_ONLY_SAVE=2
+  # Key present only as a commented line or with options in front
+  scenario h_key_commented "${HA[@]}" SC_H_EXISTING=1 SC_H_SSH_MODE=700 SC_H_KEYS_MODE=600 \
+    "SC_H_OLDKEYS=# $(awk '{ print $1, $2 }' <<<"$ed") old line\n"
+  scenario h_key_option "${HA[@]}" SC_H_EXISTING=1 SC_H_SSH_MODE=700 SC_H_KEYS_MODE=600 \
+    "SC_H_OLDKEYS=from=\"192.0.2.1\" $(awk '{ print $1, $2 }' <<<"$ed") restricted\n"
+  # SSH port from sshd -T; listeners sshd -T does not name
+  scenario h_port2222 "${HA[@]}" "SC_SSHD_EARLY=Port 2222" SC_SS_SSHD_PORT=2222
+  scenario h_port_extra "${HA[@]}" 'SC_SS_EXTRA=LISTEN 0 128 0.0.0.0:2200 0.0.0.0:* users:(("sshd",pid=900,fd=5))'
+  scenario h_port_socket "${HA[@]}" 'SC_SSH_SOCKET=[::]:2201 (Stream)'
+  # needrestart
+  scenario h_needrestart "${HA[@]}" SC_NEEDRESTART=1
+  # The package installation changes FORWARD or a Docker chain
+  scenario h_apt_forward "${HA[@]}" SC_APT_FW=forward_v4
+  scenario h_apt_fwjump "${HA[@]}" SC_APT_FW=fwjump_v6
+  scenario h_apt_dockerchain "${HA[@]}" SC_APT_FW=docker_v6
+  scenario h_apt_container "${HA[@]}" SC_APT_FW=container_v4
+  # A REJECT with a condition only
+  scenario h_condreject "${HA[@]}" SC_FW=hostinger_condreject SC_V6=hostinger_condreject SC_RUNS=2
+  # ufw removed by apt (dpkg confirms)
+  scenario h_ufw_removed "${HA[@]}" SC_APT_RM_UFW=1
+  # AuthenticationMethods for root from the web console
+  scenario h_ssh_root_methods "${HA[@]}" "SC_SSHD_EARLY=Match User root Address $H_CONSOLE\n    AuthenticationMethods publickey"
+  # Started over SSH from elsewhere or from the web console; running containers
+  scenario h_sshconn_remote "${HA[@]}" SC_DRY_RUN=1 "SC_SSH_CONNECTION=198.51.100.9 50022 203.0.113.20 22"
+  scenario h_sshconn_console "${HA[@]}" SC_DRY_RUN=1 "SC_SSH_CONNECTION=$H_CONSOLE 50022 203.0.113.20 22"
+  scenario h_containers "${HA[@]}" SC_DRY_RUN=1 SC_CONTAINERS=1
+  # Second review (commit eee9931)
+  # Password on every run; ssh reloaded on every run, only after the checks
+  scenario h_pw_locked "${HA[@]}" SC_TTY=0 SC_H_EXISTING=1 SC_H_PW=1 SC_H_SSH_MODE=700 SC_H_KEYS_MODE=600 \
+    "SC_H_OLDKEYS=$other\n" SC_RUNS=2 SC_H_LOCKPW_BETWEEN=1
+  scenario h_rerun_denyusers "${HA[@]}" SC_RUNS=2 "SC_BETWEEN_SSHD_LATE=DenyUsers $H_ADMIN"
+  # Signals between writing the drop-in and the reload, and during passwd
+  scenario h_sig_term "${HA[@]}" SC_SSHD_SIGNAL=TERM
+  scenario h_sig_hup_old "${HA[@]}" SC_SSHD_SIGNAL=HUP SC_SSHD_OLD=1
+  scenario h_sig_int_pw "${HA[@]}" SC_PASSWD=signal-INT
+  # Rules files before iptables-persistent is installed
+  scenario h_rules_foreign "${HA[@]}" SC_RULES_SAVED=1
+  scenario h_own_rules_nodropin "${HA[@]}" SC_RUNS=2 SC_H_RMNFP_BETWEEN=1
+  # netfilter-persistent must load with --noflush
+  scenario h_nfp_noflag "${HA[@]}" SC_NFP=noflag "SC_DPKG=$dpkg_nfp"
+  scenario h_nfp_missing "${HA[@]}" "SC_DPKG=$dpkg_nfp"
+  scenario h_nfp_default_no "${HA[@]}" SC_NFP=ok "SC_DPKG=$dpkg_nfp" \
+    'SC_NFP_DEFAULT=# defaults (test fixture)\nIPTABLES_RESTORE_NOFLUSH=no'
+  scenario h_nfp_default_yes "${HA[@]}" SC_DRY_RUN=1 SC_NFP=ok "SC_DPKG=$dpkg_nfp" \
+    'SC_NFP_DEFAULT=# IPTABLES_RESTORE_NOFLUSH=no\nexport IPTABLES_RESTORE_NOFLUSH="yes"\nIP6TABLES_RESTORE_NOFLUSH=yes'
+  scenario h_only_save_noflag "${H[@]}" SC_FW=hostinger_closed SC_V6=hostinger_closed SC_ONLY_SAVE=1 SC_NFP=noflag \
+    "SC_DPKG=$dpkg_nfp"
+  scenario h_only_save_rundir "${H[@]}" SC_FW=hostinger_closed SC_V6=hostinger_closed SC_ONLY_SAVE=1 SC_RUN_SSHD=missing
 }
 
 hostinger_checks() {
-  local k=$WORK/sshkeys s ed fresh_want merge_want
+  local k=$WORK/sshkeys s r ed fresh_want merge_want
   local -a parts ed_parts other_parts rsa1024_parts
   ed=$(<"$k/ed25519.pub")
   mapfile -t ed_parts < <(h_key_parts "$k/ed25519.pub")
@@ -4615,6 +5454,98 @@ hostinger_checks() {
   check "hostinger fail2ban: foreign jail.d/zz.local adds 0.0.0.0/0 to ignoreip: abort naming the file, fail2ban not restarted" \
     t_f2b_foreign_abort h_f2b_ignoreip 1 /etc/fail2ban/jail.d/zz.local \
     "['set', 'sshd', 'addignoreip', '127.0.0.1/8', '::1', '169.254.0.1', '0.0.0.0/0']"
+
+  # Review fixes (commit 0f864a5)
+  check "hostinger password: on a terminal without password the script runs passwd for $H_ADMIN after useradd, before the SSH step; passwd -S on every run" \
+    t_h_pw_prompt h_fresh
+  check "hostinger password: no password, no terminal: no prompt, abort naming the password before the SSH step, sshd_config.d untouched, no ssh reload" \
+    t_h_nopw_abort h_nopw
+  check "hostinger password: after passwd as root, the next run without terminal goes through (no prompt, drop-in, reload)" t_h_pw_then_ok h_nopw
+  check "hostinger password: terminal, passwd fails: abort before the SSH step, no ssh reload" t_h_nopw_abort h_pw_fail prompt
+  check "hostinger password: existing admin user with password, no terminal: no prompt, run goes through" t_h_pw_prompt h_existing_pw none
+  check "hostinger docker-proxy: no listener: no ACCEPT for a Docker port (IPv4)" \
+    t_h_fw_classes h_dproxy_none v4 1 "lo est icmp dhcp tcp22 tcp80 tcp443 reject"
+  check "hostinger docker-proxy: no listener: no ACCEPT for a Docker port (IPv6)" \
+    t_h_fw_classes h_dproxy_none v6 1 "lo est icmp dhcp tcp22 tcp80 tcp443 reject"
+  for s in v4 v6; do
+    for r in 1 2; do
+      check "hostinger docker-proxy: listeners tcp 32768, tcp 8443, udp 51820 accepted before REJECT, tcp 8081/8082 only to their address and family ($s, run $r), not 127.0.0.1:5000 or a non-Docker service on 9000" \
+        t_h_fw_dproxy h_dproxy_multi "$s" "$r"
+    done
+  done
+  check "hostinger docker-proxy: run 2 with three listeners changes nothing" t_h_rerun h_dproxy_multi
+  check "hostinger dry run: shows the fingerprint of ADMIN_PUBKEY" t_h_key_fpr_shown h_dry "$k/ed25519.pub"
+  check "hostinger Docker: packages pinned to their versions for the apt runs (per-run preferences file), nothing lasting" \
+    t_h_docker_pin h_fresh "docker-ce=$H_V_DOCKER docker-ce-cli=$H_V_DOCKER containerd.io=$H_V_CONTAINERD docker-compose-plugin=$H_V_COMPOSE"
+  check "hostinger Docker: pins after the content of /etc/apt/preferences, which stays as it is" \
+    t_h_docker_pin h_pin_prefs "docker-ce=$H_V_DOCKER docker-ce-cli=$H_V_DOCKER containerd.io=$H_V_CONTAINERD docker-compose-plugin=$H_V_COMPOSE" \
+    'Package: linux-image-generic\nPin: release a=noble\nPin-Priority: 990'
+  check "profile oracle: no preferences file for apt" t_oracle_no_pin fresh
+  check "hostinger Docker: Swarm active: abort before any change, naming Swarm" t_aborts_because h_swarm 'Swarm'
+  check "hostinger Docker: live-restore not active after the reload: abort before the package updates, Docker not restarted" t_h_lr_abort h_lr_off
+  check "hostinger rules files: only -F INPUT, systemd drop-in with NOFLUSH for both families, daemon-reload once; loaded with --noflush they replace only INPUT" \
+    t_h_noflush h_fresh 2
+  check "hostinger ONLY_SAVE_FIREWALL=1: saves INPUT (with the own rule) and the drop-in, changes nothing else" t_h_only_save h_only_save
+  check "hostinger ONLY_SAVE_FIREWALL=1 with open INPUT: abort before any change" t_aborts_because h_only_save_open 'INPUT'
+  check "ONLY_SAVE_FIREWALL=1 in the profile oracle: abort before any change" t_aborts_because h_only_save_oracle 'ONLY_SAVE_FIREWALL'
+  check "ONLY_SAVE_FIREWALL=2: abort before any change" t_aborts_because h_only_save_bad 'ONLY_SAVE_FIREWALL'
+  check "hostinger key check: the key only as a commented line: added as a line of its own, old line kept" t_h_key_own_line h_key_commented "$ed"
+  check "hostinger key check: the key only with options in front: added as a line of its own, old line kept" t_h_key_own_line h_key_option "$ed"
+  check "hostinger SSH port 2222 (sshd -T): tcp 2222 opened instead of 22, fail2ban port 2222" t_h_ssh_port h_port2222
+  check "hostinger SSH: sshd also listens on 2200 (not in sshd -T): abort before any change" t_aborts_because h_port_extra '2200'
+  check "hostinger SSH: ssh.socket listens on 2201 (not in sshd -T): abort before any change" t_aborts_because h_port_socket 'ssh\.socket'
+  check "hostinger needrestart: override for docker and containerd (perl evaluates 0), not for ssh; no file without needrestart" \
+    t_h_needrestart h_needrestart h_fresh
+  check "hostinger: package installation sets IPv4 FORWARD to ACCEPT: abort naming iptables and FORWARD, nothing restored, nothing saved" \
+    t_h_fw_apt_docker_abort h_apt_forward forward_v4 iptables
+  check "hostinger: package installation deletes the jump FORWARD -> DOCKER-USER (IPv6): abort naming ip6tables, nothing restored, nothing saved" \
+    t_h_fw_apt_docker_abort h_apt_fwjump fwjump_v6 ip6tables
+  check "hostinger: package installation deletes a rule inside DOCKER-USER (IPv6): no abort, no restore, INPUT closed" \
+    t_h_fw_apt_docker_ok h_apt_dockerchain docker_v6 ip6tables
+  check "hostinger: a container rule appears in DOCKER during the package installation (IPv4): no abort, no restore, INPUT closed" \
+    t_h_fw_apt_docker_ok h_apt_container container_v4 iptables
+  for s in v4 v6; do
+    for r in 1 2; do
+      check "hostinger: a conditional REJECT does not end INPUT ($s, run $r): unconditional REJECT appended last, all rules once" \
+        t_h_fw_condreject h_condreject "$s" "$r"
+    done
+  done
+  check "hostinger: conditional REJECT: run 2 changes nothing" t_h_rerun h_condreject
+  check "hostinger ufw: apt removed it (dpkg confirms): note at the end, no warning" t_h_ufw_removed h_ufw_removed removed
+  check "hostinger ufw: dpkg still has it after the packages: no claim it was removed, warning" t_h_ufw_removed h_fresh kept
+  check "hostinger SSH: Match for root from $H_CONSOLE with AuthenticationMethods publickey: abort, drop-in rolled back" \
+    t_h_sshd_rollback h_ssh_root_methods 'authenticationmethods' sshdT_root_con 'authenticationmethods publickey'
+  check "hostinger: started over SSH from 198.51.100.9: warning naming it" t_h_sshconn h_sshconn_remote 198.51.100.9 warn
+  check "hostinger: started over SSH from the web console: no such warning" t_h_sshconn h_sshconn_console "$H_CONSOLE" quiet
+  check "hostinger: running container without restart policy: warning names it, not the one with unless-stopped" \
+    t_h_restart_policy h_containers
+  check "hostinger: Docker never restarted, stopped or started in any scenario of the profile (with the new scenarios)" t_h_docker_never_restarted
+
+  # Second review (commit eee9931)
+  check "hostinger password locked between the runs (no terminal): run 2 stops before the SSH step, nothing changed, no ssh reload" \
+    t_h_pw_rerun_abort h_pw_locked
+  check "hostinger: ssh reloaded on every run, after sshd -t and the checks (run 2, drop-in unchanged)" t_h_reload_every_run h_fresh
+  check "hostinger: DenyUsers $H_ADMIN in another file before run 2: run 2 aborts without reloading ssh" \
+    t_h_rerun_no_reload h_rerun_denyusers 'DenyUsers'
+  check "hostinger signal TERM between writing the drop-in and the reload: exit 130, drop-in removed again, no reload" t_h_signal h_sig_term sshd
+  check "hostinger signal HUP between writing the drop-in and the reload, older drop-in there: old drop-in back (content, mode), no reload" \
+    t_h_signal h_sig_hup_old sshd
+  check "hostinger signal INT while passwd asks: exit 130, SSH untouched" t_h_signal h_sig_int_pw passwd
+  check "hostinger: foreign rules.v4/v6 while iptables-persistent is not installed: abort before any change" \
+    t_aborts_because h_rules_foreign 'rules\.v4.*iptables-persistent'
+  check "hostinger: own rules files with the drop-in, iptables-persistent not installed: run 2 not stopped" t_h_rules_own_ok h_fresh
+  check "hostinger: own rules files but the drop-in of netfilter-persistent removed before run 2: run 2 aborts, nothing changed" \
+    t_h_rerun_abort_unchanged h_own_rules_nodropin 'rules\.v4'
+  check "hostinger: plugin of netfilter-persistent without IPTABLES_RESTORE_NOFLUSH: abort before any change" \
+    t_aborts_because h_nfp_noflag 'IPTABLES_RESTORE_NOFLUSH'
+  check "hostinger: iptables-persistent installed but its plugins missing: abort before any change" \
+    t_aborts_because h_nfp_missing '15-ip4tables'
+  check "hostinger: /etc/default/netfilter-persistent sets IPTABLES_RESTORE_NOFLUSH=no: abort before any change" \
+    t_aborts_because h_nfp_default_no '/etc/default/netfilter-persistent'
+  check "hostinger: /etc/default/netfilter-persistent sets NOFLUSH to yes (quoted, export): dry run without abort" t_h_dry h_nfp_default_yes
+  check "hostinger ONLY_SAVE_FIREWALL=1 with a plugin that ignores NOFLUSH: abort before any change" \
+    t_aborts_because h_only_save_noflag 'IPTABLES_RESTORE_NOFLUSH'
+  check "hostinger ONLY_SAVE_FIREWALL=1 without /run/sshd: creates it, saves the rules" t_h_only_save_rundir h_only_save_rundir
 }
 
 main() {
